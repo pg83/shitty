@@ -30,9 +30,11 @@ namespace {
         bool hasItalic() const override;
         bool hasBoldItalic() const override;
         bool hasDoubleWidth() const override;
+        long regularFaceIndex() const override;
+        long doubleWidthFaceIndex() const override;
         FontGlyph glyph(const u32* codepoints, size_t count, FontStyle style, bool doubleWidth) override;
 
-        Font* createOptional(Composer& composer, StringView filename, FontKind kind, FontMetrics metrics);
+        Font* createOptional(Composer& composer, const FontFace& face, FontKind kind, FontMetrics metrics);
         Font* select(FontStyle style) const noexcept;
         FontGlyph fallback(Font* font, Font* base, const u32* codepoints, size_t count);
 
@@ -67,12 +69,12 @@ FontpackImpl::FontpackImpl(Composer& composer, StringView fontname, StringView d
     }
 }
 
-Font* FontpackImpl::createOptional(Composer& composer, StringView filename, FontKind kind, FontMetrics metrics) {
-    if (filename.empty()) {
+Font* FontpackImpl::createOptional(Composer& composer, const FontFace& face, FontKind kind, FontMetrics metrics) {
+    if (face.empty()) {
         return nullptr;
     }
     try {
-        return Font::create(composer, filename, kind, metrics);
+        return Font::create(composer, face, kind, metrics);
     } catch (Exception&) {
         return nullptr;
     }
@@ -100,6 +102,14 @@ bool FontpackImpl::hasBoldItalic() const {
 
 bool FontpackImpl::hasDoubleWidth() const {
     return doubleWidth_ != nullptr;
+}
+
+long FontpackImpl::regularFaceIndex() const {
+    return regular_->faceIndex();
+}
+
+long FontpackImpl::doubleWidthFaceIndex() const {
+    return doubleWidth_ == nullptr ? 0 : doubleWidth_->faceIndex();
 }
 
 Font* FontpackImpl::select(FontStyle style) const noexcept {

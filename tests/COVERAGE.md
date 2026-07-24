@@ -48,10 +48,18 @@ Covered now:
 - real child PTY startup with `TERM`, `SHITTY_VERSION`, initial winsize and
   resize-driven winsize update plus `SIGWINCH` delivery;
 - fontconfig family and generic-alias resolution to existing files, followed
-  by successful real FreeType loading and nonzero glyph metrics;
+  by successful real FreeType loading and nonzero glyph metrics, including
+  preservation of collection face indices through FreeType;
+- representative single-width and double-width advances for collection faces
+  instead of unrelated maximum-advance metrics;
 - real four-face fontconfig regular/bold/italic/bold-italic overlay loading;
-- rejection of scalable overlay faces whose width, height or baseline metrics
-  do not match the primary font;
+- scalable overlays retaining primary cell width despite distinct width
+  metrics, while rejecting height or baseline mismatches;
+- fixed-size overlays retaining primary cell width while matching strike height
+  and baseline;
+- multi-codepoint HarfBuzz shaping and intrinsic-color glyph rendering,
+  including a nonzero-index collection primary with a color ZWJ fallback and
+  fixed color-face mask placement at the legacy zero baseline;
 - missing/incompatible double-width font fallback while retaining a usable
   primary font and its metrics;
 - removal of the legacy `-fontpath` option so fontconfig is the only resolver;

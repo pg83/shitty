@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -57,12 +58,75 @@
 #include <unistd.h>
 #include <vector>
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
 namespace stl {}
 
 using namespace stl;
 
 namespace {
     extern "C" int openpty(int*, int*, char*, const termios*, const winsize*);
+
+    struct TestFaceMetrics {
+        bool valid = false;
+        long faceIndex = 0;
+        bool hasGlyph = false;
+        u16 advance = 0;
+        u16 maxAdvance = 0;
+        u16 height = 0;
+        u16 baseline = 0;
+    };
+
+    TestFaceMetrics inspectFace(const FontFace& font, FT_ULong codepoint) {
+        FT_Library library = nullptr;
+        FT_Face face = nullptr;
+        TestFaceMetrics metrics;
+
+        if (FT_Init_FreeType(&library)) {
+            return metrics;
+        }
+        Buffer filenameBuffer(font.filename);
+        if (FT_New_Face(library, filenameBuffer.cStr(), font.index, &face)) {
+            FT_Done_FreeType(library);
+            return metrics;
+        }
+
+        metrics.faceIndex = face->face_index;
+        if (face->num_fixed_sizes == 0 && face->units_per_EM > 0 && face->height != 0 &&
+            FT_Set_Pixel_Sizes(face, opts.fontsize, opts.fontsize) == 0) {
+            const double height = opts.fontsize * (double)(face->height) / face->units_per_EM + 1;
+            metrics.valid = true;
+            metrics.maxAdvance = (u16)(std::lround(opts.fontsize * (double)(face->max_advance_width) / face->units_per_EM));
+            metrics.height = (u16)(std::lround(height));
+            metrics.baseline = (u16)(std::lround(height * face->ascender / face->height));
+            metrics.hasGlyph = FT_Get_Char_Index(face, codepoint) != 0 &&
+                               FT_Load_Char(face, codepoint, FT_LOAD_DEFAULT) == 0 &&
+                               face->glyph->advance.x > 0;
+            if (metrics.hasGlyph) {
+                metrics.advance = (u16)(std::lround(face->glyph->advance.x / 64.0));
+            }
+        }
+
+        FT_Done_Face(face);
+        FT_Done_FreeType(library);
+        return metrics;
+    }
+
+    std::vector<std::string> splitFields(const std::string& request) {
+        std::vector<std::string> fields;
+        size_t offset = 0;
+        while (offset <= request.size()) {
+            const size_t separator = request.find('\0', offset);
+            if (separator == std::string::npos) {
+                fields.push_back(request.substr(offset));
+                break;
+            }
+            fields.push_back(request.substr(offset, separator - offset));
+            offset = separator + 1;
+        }
+        return fields;
+    }
 
     struct TestPty final: public Pty, public Listener {
         TestPty(Composer& composer, int fd);
@@ -1380,15 +1444,86 @@ int runTestMode(Composer& composer, TestModeInput& input, int controlFd, int arg
                 ObjPool::Ref fontPool = ObjPool::fromMemory();
                 const FontVariants variants = resolveFontconfig(fontPool.mutPtr(), StringView((const u8*)(family.data()), family.size()));
                 std::string encoded;
-                const StringView paths[] = {variants.regular, variants.bold, variants.italic, variants.boldItalic};
-                for (size_t index = 0; index < std::size(paths); ++index) {
+                const FontFace faces[] = {variants.regular, variants.bold, variants.italic, variants.boldItalic};
+                for (size_t index = 0; index < std::size(faces); ++index) {
                     if (index != 0) {
                         encoded.push_back('\0');
                     }
-                    const StringView path = paths[index];
-                    encoded.append((const char*)(path.data()), path.length());
+                    const FontFace& face = faces[index];
+                    encoded.append((const char*)(face.filename.data()), face.filename.length());
+                    encoded.push_back('\0');
+                    encoded += std::to_string(face.index);
                 }
                 writeAll(controlFd, "OK " + encodeHex(encoded) + "\n");
+            } else if (line.compare(0, 18, "FONT_FACE_METRICS ") == 0) {
+                const std::vector<std::string> fields = splitFields(decodeHex(line.substr(18)));
+                if (fields.size() != 3) {
+                    throw std::runtime_error("invalid font face metrics request");
+                }
+                const FontFace font{
+                    StringView((const u8*)(fields[0].data()), fields[0].size()),
+                    std::stoi(fields[1]),
+                };
+                const FT_ULong codepoint = std::stoul(fields[2]);
+                const TestFaceMetrics metrics = inspectFace(font, codepoint);
+                writeAll(controlFd, "OK " + std::to_string(metrics.valid) + " " + std::to_string(metrics.faceIndex) + " " + std::to_string(metrics.hasGlyph) + " " + std::to_string(metrics.advance) + " " + std::to_string(metrics.maxAdvance) + " " + std::to_string(metrics.height) + " " + std::to_string(metrics.baseline) + "\n");
+            } else if (line.compare(0, 19, "FONT_GLYPH_METRICS ") == 0) {
+                const std::vector<std::string> fields = splitFields(decodeHex(line.substr(19)));
+                if (fields.size() != 3) {
+                    throw std::runtime_error("invalid font glyph metrics request");
+                }
+                const FontFace font{
+                    StringView((const u8*)(fields[0].data()), fields[0].size()),
+                    std::stoi(fields[1]),
+                };
+                const u32 codepoint = std::stoul(fields[2]);
+                ObjPool::Ref fontPool = ObjPool::fromMemory();
+                Composer fontComposer(fontPool.mutPtr());
+                FontMetrics metrics;
+                Font* loaded = Font::create(fontComposer, font, FontKind::Primary, metrics);
+                const FontGlyph glyph = loaded->glyph(&codepoint, 1);
+                size_t nonzero = 0;
+                int firstRow = -1;
+                int lastRow = -1;
+                if (glyph.data != nullptr && !glyph.color) {
+                    const auto* pixels = (const u8*)(glyph.data);
+                    for (size_t offset = 0; offset < glyph.len; ++offset) {
+                        if (pixels[offset] == 0) {
+                            continue;
+                        }
+                        const int row = offset / metrics.width;
+                        ++nonzero;
+                        if (firstRow < 0) {
+                            firstRow = row;
+                        }
+                        lastRow = row;
+                    }
+                }
+                writeAll(controlFd, "OK " + std::to_string(metrics.width) + " " + std::to_string(metrics.height) + " " + std::to_string(metrics.baseline) + " " + std::to_string(glyph.color) + " " + std::to_string(glyph.len) + " " + std::to_string(nonzero) + " " + std::to_string(firstRow) + " " + std::to_string(lastRow) + "\n");
+            } else if (line.compare(0, 13, "FONT_OVERLAY ") == 0) {
+                const std::vector<std::string> fields = splitFields(decodeHex(line.substr(13)));
+                if (fields.size() != 4) {
+                    throw std::runtime_error("invalid font overlay request");
+                }
+                const FontFace primary{
+                    StringView((const u8*)(fields[0].data()), fields[0].size()),
+                    std::stoi(fields[1]),
+                };
+                const FontFace overlay{
+                    StringView((const u8*)(fields[2].data()), fields[2].size()),
+                    std::stoi(fields[3]),
+                };
+                bool compatible = false;
+                ObjPool::Ref fontPool = ObjPool::fromMemory();
+                Composer fontComposer(fontPool.mutPtr());
+                FontMetrics metrics;
+                try {
+                    Font::create(fontComposer, primary, FontKind::Primary, metrics);
+                    Font::create(fontComposer, overlay, FontKind::Overlay, metrics);
+                    compatible = true;
+                } catch (Exception&) {
+                }
+                writeAll(controlFd, "OK " + std::to_string(compatible) + " " + std::to_string(metrics.width) + " " + std::to_string(metrics.height) + " " + std::to_string(metrics.baseline) + "\n");
             } else if (line.compare(0, 10, "FONT_LOAD ") == 0) {
                 const std::string request = decodeHex(line.substr(10));
                 const size_t first = request.find('\0');
@@ -1400,7 +1535,7 @@ int runTestMode(Composer& composer, TestModeInput& input, int controlFd, int arg
                 const StringView fontname((const u8*)(request.data()), first);
                 const StringView dwfontname((const u8*)(request.data() + first + 1), request.size() - first - 1);
                 Fontpack* fonts = Fontpack::create(fontComposer, fontname, dwfontname);
-                writeAll(controlFd, "OK " + std::to_string(fonts->getPx()) + " " + std::to_string(fonts->getPy()) + " " + std::to_string(fonts->hasBold()) + " " + std::to_string(fonts->hasItalic()) + " " + std::to_string(fonts->hasBoldItalic()) + " " + std::to_string(fonts->hasDoubleWidth()) + "\n");
+                writeAll(controlFd, "OK " + std::to_string(fonts->getPx()) + " " + std::to_string(fonts->getPy()) + " " + std::to_string(fonts->hasBold()) + " " + std::to_string(fonts->hasItalic()) + " " + std::to_string(fonts->hasBoldItalic()) + " " + std::to_string(fonts->hasDoubleWidth()) + " " + std::to_string(fonts->regularFaceIndex()) + " " + std::to_string(fonts->doubleWidthFaceIndex()) + "\n");
             } else if (line.compare(0, 13, "RENDER_IMAGE ") == 0) {
                 const std::string request = decodeHex(line.substr(13));
                 const size_t first = request.find('\0');

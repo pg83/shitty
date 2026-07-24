@@ -13,6 +13,7 @@ namespace stl {
 }
 
 struct Composer;
+struct FontFace;
 
 struct FontGlyph {
     const void* data = nullptr;
@@ -37,6 +38,7 @@ struct FontMetrics {
 // bitmap remains valid until the next glyph() call on the same Font.
 struct Font {
     virtual FontGlyph glyph(const u32* codepoints, size_t count) = 0;
+    virtual long faceIndex() const = 0;
 
-    static Font* create(Composer& composer, stl::StringView filename, FontKind kind, FontMetrics& metrics);
+    static Font* create(Composer& composer, const FontFace& face, FontKind kind, FontMetrics& metrics);
 };

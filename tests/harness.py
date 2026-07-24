@@ -230,20 +230,90 @@ class Shitty:
         encoded = self._read_hex_response(
             "FONTCONFIG_RESOLVE " + os.fsencode(family).hex()
         ).split(b"\0")
+        if len(encoded) != 8:
+            raise RuntimeError("invalid fontconfig response")
+        result = {}
+        for offset, name in enumerate(
+            ("regular", "bold", "italic", "bold_italic")
+        ):
+            result[name] = os.fsdecode(encoded[2 * offset])
+            result[name + "_index"] = int(encoded[2 * offset + 1])
+        return result
+
+    def font_face_metrics(self, filename, index, codepoint):
+        request = b"\0".join(
+            (
+                os.fsencode(filename),
+                str(index).encode(),
+                str(codepoint).encode(),
+            )
+        )
+        self.stream.write(
+            b"FONT_FACE_METRICS " + request.hex().encode() + b"\n"
+        )
+        response = self._readline().split()
+        if len(response) != 8 or response[0] != "OK":
+            raise RuntimeError("invalid font face metrics response")
         return dict(zip(
-            ("regular", "bold", "italic", "bold_italic"),
-            (os.fsdecode(value) for value in encoded),
+            (
+                "valid", "face_index", "has_glyph", "advance",
+                "max_advance", "py", "baseline",
+            ),
+            map(int, response[1:]),
         ))
+
+    def font_glyph_metrics(self, filename, index, codepoint):
+        request = b"\0".join(
+            (
+                os.fsencode(filename),
+                str(index).encode(),
+                str(codepoint).encode(),
+            )
+        )
+        self.stream.write(
+            b"FONT_GLYPH_METRICS " + request.hex().encode() + b"\n"
+        )
+        response = self._readline().split()
+        if len(response) != 9 or response[0] != "OK":
+            raise RuntimeError("invalid font glyph metrics response")
+        return dict(zip(
+            (
+                "px", "py", "baseline", "color", "length", "nonzero",
+                "first_row", "last_row",
+            ),
+            map(int, response[1:]),
+        ))
+
+    def load_overlay(
+        self, primary_filename, primary_index, overlay_filename, overlay_index
+    ):
+        request = b"\0".join(
+            (
+                os.fsencode(primary_filename),
+                str(primary_index).encode(),
+                os.fsencode(overlay_filename),
+                str(overlay_index).encode(),
+            )
+        )
+        self.stream.write(b"FONT_OVERLAY " + request.hex().encode() + b"\n")
+        response = self._readline().split()
+        if len(response) != 5 or response[0] != "OK":
+            raise RuntimeError("invalid font overlay response")
+        values = tuple(map(int, response[1:]))
+        return dict(zip(("compatible", "px", "py", "baseline"), values))
 
     def load_font(self, family, double_width):
         request = b"\0".join(map(os.fsencode, (family, double_width)))
         self.stream.write(b"FONT_LOAD " + request.hex().encode() + b"\n")
         response = self._readline().split()
-        if len(response) != 7 or response[0] != "OK":
+        if len(response) != 9 or response[0] != "OK":
             raise RuntimeError("invalid font load response")
         values = tuple(map(int, response[1:]))
         return dict(zip(
-            ("px", "py", "bold", "italic", "bold_italic", "double_width"),
+            (
+                "px", "py", "bold", "italic", "bold_italic", "double_width",
+                "regular_face_index", "double_width_face_index",
+            ),
             values,
         ))
 

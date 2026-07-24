@@ -12,11 +12,28 @@ namespace stl {
     class ObjPool;
 }
 
+struct FontFace {
+    stl::StringView filename;
+    int index = 0;
+
+    bool empty() const {
+        return filename.empty();
+    }
+
+    bool operator==(const FontFace& other) const {
+        return filename == other.filename && index == other.index;
+    }
+
+    bool operator!=(const FontFace& other) const {
+        return !(*this == other);
+    }
+};
+
 struct FontVariants {
-    stl::StringView regular;
-    stl::StringView bold;
-    stl::StringView italic;
-    stl::StringView boldItalic;
+    FontFace regular;
+    FontFace bold;
+    FontFace italic;
+    FontFace boldItalic;
 };
 
 FontVariants resolveFontconfig(stl::ObjPool* pool, stl::StringView fontname);

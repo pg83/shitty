@@ -28,6 +28,8 @@ struct Fontpack {
     virtual bool hasItalic() const = 0;
     virtual bool hasBoldItalic() const = 0;
     virtual bool hasDoubleWidth() const = 0;
+    virtual long regularFaceIndex() const = 0;
+    virtual long doubleWidthFaceIndex() const = 0;
 
     virtual FontGlyph glyph(const u32* codepoints, size_t count, FontStyle style, bool doubleWidth) = 0;
 
