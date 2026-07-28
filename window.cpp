@@ -196,7 +196,7 @@ void NativeWindowImpl::initialize() {
         }
     );
     const plt::WindowInfo current = native->info();
-    if (isfinite(current.contentScale) && current.contentScale > 0.0f) {
+    if (std::isfinite(current.contentScale) && current.contentScale > 0.0f) {
         composer.setContentScale(current.contentScale);
     }
 }
@@ -437,7 +437,7 @@ void NativeWindowImpl::close() {
 }
 
 void NativeWindowImpl::resized(const plt::WindowInfo& current) {
-    if (isfinite(current.contentScale) && current.contentScale > 0.0f) {
+    if (std::isfinite(current.contentScale) && current.contentScale > 0.0f) {
         composer.setContentScale(current.contentScale);
     }
     composer.resize((u16)(min(current.width, (u32)(UINT16_MAX))), (u16)(min(current.height, (u32)(UINT16_MAX))));
@@ -750,7 +750,7 @@ void TestInputTranslator::sendText(Composer& composer, u32 codepoint, int rawMod
 
 void TestInputTranslator::contentScale(Composer& composer, float xScale, float yScale) {
     const float scale = max(xScale, yScale);
-    if (isfinite(scale) && scale > 0.0f) {
+    if (std::isfinite(scale) && scale > 0.0f) {
         composer.setContentScale(scale);
     }
 }
