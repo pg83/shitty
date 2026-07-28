@@ -35,6 +35,7 @@
 
 #include <std/mem/obj_pool.h>
 #include <std/str/view.h>
+#include <std/sys/crt.h>
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -232,11 +233,13 @@ bool PtyImpl::flushOutput() {
 }
 
 bool PtyImpl::readInput() {
-    constexpr size_t maxDrainBytes = 20 * 1024 * 1024;
+    constexpr size_t maxDrainBytes = 256 * 1024;
+    constexpr u64 maxDrainMicroseconds = 4'000;
     Vterm* const vterm = composer_.vterm;
     u8 buffer[8192];
     size_t drained = 0;
-    while (drained < maxDrainBytes) {
+    const u64 deadline = monotonicNowUs() + maxDrainMicroseconds;
+    while (drained < maxDrainBytes && monotonicNowUs() < deadline) {
         const ssize_t count = read(buffer, sizeof(buffer));
         if (count > 0) {
             vterm->feedPty(StringView(buffer, count));

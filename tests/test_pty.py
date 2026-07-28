@@ -11,15 +11,14 @@ from harness import Shitty
 
 
 class PtyTest(unittest.TestCase):
-    def test_twenty_mibibyte_drain_limit_yields_with_input_remaining(self):
-        limit = 20 * 1024 * 1024
+    def test_drain_yields_before_one_mibibyte_of_continuous_input(self):
+        continuous_input = 1024 * 1024
         with Shitty(columns=8, rows=2) as terminal:
-            terminal.script_pty_repeat(0, limit + 1, eof=True)
+            terminal.script_pty_repeat(0, continuous_input, eof=True)
             self.assertFalse(terminal.read_pty())
-            self.assertEqual(terminal.pending_scripted_pty_read_bytes(), 1)
-
-            self.assertTrue(terminal.read_pty())
-            self.assertEqual(terminal.pending_scripted_pty_read_bytes(), 0)
+            remaining = terminal.pending_scripted_pty_read_bytes()
+            self.assertGreater(remaining, 0)
+            self.assertLess(remaining, continuous_input)
 
     def test_eof_finishes_even_before_the_first_payload(self):
         with Shitty(columns=8, rows=2) as terminal:

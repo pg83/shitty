@@ -35,6 +35,7 @@
 #include <std/lib/buffer.h>
 #include <std/lib/vector.h>
 #include <std/mem/obj_pool.h>
+#include <std/sys/crt.h>
 #include <std/sys/throw.h>
 
 #include <algorithm>
@@ -1003,11 +1004,13 @@ u64 TestTerminal::droppedPtyResponses() {
 }
 
 bool TestTerminal::readPty() {
-    constexpr size_t maxDrainBytes = 20 * 1024 * 1024;
+    constexpr size_t maxDrainBytes = 256 * 1024;
+    constexpr u64 maxDrainMicroseconds = 4'000;
     u8 buffer[8192];
     size_t drained = 0;
     bool finished = false;
-    while (drained < maxDrainBytes) {
+    const u64 deadline = monotonicNowUs() + maxDrainMicroseconds;
+    while (drained < maxDrainBytes && monotonicNowUs() < deadline) {
         const ssize_t count = pty.read(buffer, sizeof(buffer));
         if (count > 0) {
             terminal.feedPty(StringView(buffer, count));
