@@ -9,7 +9,7 @@ from harness import Shitty
 
 
 class PtyOutputTest(unittest.TestCase):
-    protocol_high_water = 1024 * 1024
+    protocol_high_water = 4096
 
     def test_simultaneous_read_and_write_flushes_older_bytes_before_reply(self):
         with Shitty(columns=8, rows=2) as terminal:

@@ -86,7 +86,7 @@ void MouseTrackingState::setEncoding(MouseTrackingEnc value) {
 }
 
 namespace {
-    constexpr size_t ptyProtocolHighWater = 1024 * 1024;
+    constexpr size_t ptyProtocolHighWater = 4096;
 
     StringView stringView(const std::string& value) {
         return StringView((const u8*)(value.data()), value.size());
