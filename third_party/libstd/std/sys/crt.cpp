@@ -49,7 +49,7 @@ void stl::memZero(void* from, void* to) noexcept {
     }
 }
 
-u64 stl::monotonicNowUs() noexcept {
+__attribute__((weak)) u64 stl::monotonicNowUs() noexcept {
     timespec ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
