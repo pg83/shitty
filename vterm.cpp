@@ -3098,7 +3098,7 @@ void VtermImpl::resetTerminal() {
     hMargin = 0;
     nColsEff = composer.columns;
 
-    osc_TITLE_0(StringView((const u8*)(opts.title), std::strlen(opts.title)));
+    osc_TITLE_0(StringView((const u8*)(opts.title), opts.title != nullptr ? std::strlen(opts.title) : 0));
 }
 
 void VtermImpl::resetScreen(bool resetTabStops) {
