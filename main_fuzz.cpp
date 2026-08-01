@@ -14,6 +14,17 @@
  * remain bit-identical forever: equal pty responses, equal presentation
  * state, equal cell grids. Any divergence is a determinism bug. On top of
  * that, each rig is validated against the standalone invariants below.
+ *
+ * v3 strategies:
+ * - Wild instances: records may create and destroy extra terminals. Global
+ *   or shared state must never reference a destroyed instance; AddressSanitizer
+ *   judges. This is the tab/lifetime bug class.
+ * - Fake clock: monotonicNowUs is overridden and advanced deterministically
+ *   per record, so timer deadlines (synchronized output, blink, animation)
+ *   fire reproducibly inside short fuzz inputs. libstd's definition is weak
+ *   (third_party/libstd/std/sys/crt.cpp); this file's is strong.
+ * - Scheduler pump: records may run the headless platform's timer loop once,
+ *   firing those deadline timers on demand.
  */
 
 #include "composer.h"
@@ -23,6 +34,9 @@
 #include "vterm_headless.h"
 #include "vterm_test.h"
 #include "vterm_trace.h"
+
+#include <plt/platform.h>
+#include <plt/poller.h>
 
 #include <std/ios/output.h>
 #include <std/lib/buffer.h>
@@ -40,6 +54,17 @@
 
 using namespace stl;
 using namespace plt;
+
+// Strong override of the weak libstd definition: a deterministic clock the
+// harness advances per record. This also affects libFuzzer's own timing, so
+// -max_total_time counts fake time and must be sized accordingly.
+static u64 fuzzClockUs = 1'000'000'000'000;
+
+namespace stl {
+    u64 monotonicNowUs() noexcept {
+        return fuzzClockUs;
+    }
+}
 
 namespace {
     u64 sequence = 0;
@@ -95,6 +120,35 @@ namespace {
             VtermHeadless::create(*composer, &capture);
             term = composer->vterm;
             api = capture.api;
+        }
+    };
+
+    // Extra terminals a record may create and destroy mid-stream. Anything
+    // shared across instances must not reference a destroyed one.
+    struct WildSet {
+        Rig* rigs[2] = {};
+        size_t count = 0;
+
+        void create() {
+            if (count < 2) {
+                rigs[count++] = new Rig();
+            }
+        }
+
+        void destroy(u8 which) {
+            if (count == 0) {
+                return;
+            }
+            const size_t index = which % count;
+            delete rigs[index];
+            rigs[index] = rigs[--count];
+            rigs[count] = nullptr;
+        }
+
+        ~WildSet() {
+            for (size_t i = 0; i < count; ++i) {
+                delete rigs[i];
+            }
         }
     };
 
@@ -438,18 +492,16 @@ namespace {
                 break;
             case 218:
                 if (len >= 1) {
-                    // force=0 compares against a wall-clock deadline and can
-                    // legitimately diverge between the two rigs.
+                    // The clock is fake and shared, so deadline-based expiry
+                    // is deterministic between the rigs now.
                     result.present = true;
-                    result.value = term->expireSynchronizedOutput(true);
+                    result.value = term->expireSynchronizedOutput((payload[0] & 1) != 0);
                 }
                 break;
             case 219:
                 if (len >= 1) {
-                    // force=0 compares against a wall-clock deadline and can
-                    // legitimately diverge between the two rigs.
                     result.present = true;
-                    result.value = term->advanceAnimation(true);
+                    result.value = term->advanceAnimation((payload[0] & 1) != 0);
                 }
                 break;
             case 220:
@@ -469,6 +521,28 @@ namespace {
                     rig.composer->resize(backWidth, backHeight);
                 }
                 break;
+            case 222:
+                if (len >= 2) {
+                    // Mimic a font zoom: glyph metrics change while the window
+                    // adopts the same cell geometry, as fontChanged() does.
+                    const u16 glyphWidth = (u16)(1 + payload[0] % 4);
+                    const u16 glyphHeight = (u16)(1 + payload[1] % 4);
+                    rig.composer->setGlyphSize(glyphWidth, glyphHeight);
+                    rig.composer->resize((u16)(2 * opts.border + rig.composer->columns * glyphWidth), (u16)(2 * opts.border + rig.composer->rows * glyphHeight));
+                }
+                break;
+            case 225: {
+                // Run the headless platform's timer loop once: deadline
+                // timers (synchronized output, blink, animation) fire here.
+                PollerLoop* const poller = static_cast<PollerLoop*>(rig.composer->platform->poller());
+                if (poller != nullptr) {
+                    poller->dispatchTimers();
+                    if (poller->nextDeadline() == 0) {
+                        poller->wait(0);
+                    }
+                }
+                break;
+            }
             default:
                 if (rig.splitFeeds && len > 2) {
                     // Deliver the same bytes in chunks: escape sequences split
@@ -495,7 +569,27 @@ namespace {
         check(a.text == b.text, "action texts diverge", a.text.size(), b.text.size());
     }
 
-    void runRecord(Rig& a, Rig& b, u8 op, const u8* payload, size_t len) {
+    void validateRig(Rig& rig) {
+        rig.term->expose();
+        if (const TerminalUpdate* update = rig.term->output()) {
+            checkUpdate(rig, *update);
+            rig.term->consume();
+        }
+        checkState(rig);
+        checkCells(rig);
+    }
+
+    void runRecord(Rig& a, Rig& b, WildSet& wild, u8 op, const u8* payload, size_t len) {
+        // Deterministic clock: 10 ms per record. Synchronized output's 150 ms
+        // deadline expires a handful of records after the mode is enabled.
+        fuzzClockUs += 10'000;
+
+        if (op == 223) {
+            wild.create();
+        } else if (op == 224 && len >= 1) {
+            wild.destroy(payload[0]);
+        }
+
         const ActionResult ra = apply(a, op, payload, len);
         const ActionResult rb = apply(b, op, payload, len);
         compareResult(ra, rb);
@@ -535,6 +629,13 @@ namespace {
             probeScrollRoundTrip(b, viewOffset, historyRows);
             comparePty(a, b);
         }
+
+        // Wild terminals get the same record and the full invariant suite;
+        // only the mirror pair is differentially compared.
+        for (size_t i = 0; i < wild.count; ++i) {
+            apply(*wild.rigs[i], op, payload, len);
+            validateRig(*wild.rigs[i]);
+        }
     }
 }
 
@@ -543,6 +644,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t len) {
     // every crash artifact is standalone-reproducible and minimizable.
     Rig a;
     Rig b;
+    WildSet wild;
     b.splitFeeds = true;
     ++sequence;
     size_t offset = 0;
@@ -555,9 +657,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t len) {
         }
         // A quarter of the opcode space drives actions; the rest feeds bytes.
         if (op >= 192) {
-            op = (u8)(200 + (op - 192) % 22);
+            op = (u8)(200 + (op - 192) % 26);
         }
-        runRecord(a, b, op, (const u8*)(data + offset), size);
+        runRecord(a, b, wild, op, (const u8*)(data + offset), size);
         offset += size;
     }
     return 0;
