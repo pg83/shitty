@@ -143,17 +143,20 @@ libplt = library(
 )
 
 if build.target == build.host:
+    plt_unit_test_sources = [
+        "$(S)/tests/test_ut.cpp",
+        "$(S)/drop_ut.cpp",
+        "$(S)/fiber_ut.cpp",
+        "$(S)/mutex_ut.cpp",
+        "$(S)/platform_headless_ut.cpp",
+        "$(S)/pointer_grab_ut.cpp",
+    ]
+    if system == "Darwin":
+        plt_unit_test_sources.append("$(S)/platform_cocoa_ut.mm")
     plt_unit_tests = program(
         name="plt_unit_tests",
         output="$(B)/plt_unit_tests",
-        srcs=[
-            "$(S)/tests/test_ut.cpp",
-            "$(S)/drop_ut.cpp",
-            "$(S)/fiber_ut.cpp",
-            "$(S)/mutex_ut.cpp",
-            "$(S)/platform_headless_ut.cpp",
-            "$(S)/pointer_grab_ut.cpp",
-        ],
+        srcs=plt_unit_test_sources,
         deps=[libplt, libstd],
     )
 

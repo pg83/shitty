@@ -545,9 +545,6 @@ namespace {
         void button(NSEvent* event, bool pressed);
         void scroll(NSEvent* event);
         void pointerPresence(bool present);
-        u16 modifiers(NSEventModifierFlags flags) const;
-        InputKey inputKey(NSEvent* event) const;
-        u32 firstCodepoint(NSString* string) const;
         void emitText(NSString* string, u16 modifiers);
         NSPoint pointerPosition(NSEvent* event) const;
         void writePasteboard(NSPasteboard* pasteboard, StringView content);
@@ -1468,7 +1465,7 @@ void WindowImpl::focused(bool value) {
     }
 }
 
-u16 WindowImpl::modifiers(NSEventModifierFlags flags) const {
+static u16 modifiers(NSEventModifierFlags flags) {
     u16 result = 0;
     if (flags & NSEventModifierFlagShift) {
         result |= InputShift;
@@ -1488,7 +1485,7 @@ u16 WindowImpl::modifiers(NSEventModifierFlags flags) const {
     return result;
 }
 
-u32 WindowImpl::firstCodepoint(NSString* string) const {
+static u32 firstCodepoint(NSString* string) {
     if (string.length == 0) {
         return 0;
     }
@@ -1499,7 +1496,7 @@ u32 WindowImpl::firstCodepoint(NSString* string) const {
     return first;
 }
 
-InputKey WindowImpl::inputKey(NSEvent* event) const {
+static InputKey inputKey(NSEvent* event) {
     switch (event.keyCode) {
         case kVK_ANSI_Keypad0:
             return InputKey::Keypad0;
@@ -1609,27 +1606,7 @@ void WindowImpl::key(NSEvent* event, bool pressed) {
     if (input == nullptr) {
         return;
     }
-    const InputAction action = !pressed ? InputAction::Release : (event.isARepeat ? InputAction::Repeat : InputAction::Press);
-    u16 mods = modifiers(event.modifierFlags);
-    const InputKey key = inputKey(event);
-    if (key >= InputKey::Keypad0 && key <= InputKey::KeypadDecimal) {
-        mods |= InputNumLock;
-    }
-    const u32 layout = firstCodepoint(event.characters);
-    u32 base = firstCodepoint(event.charactersIgnoringModifiers);
-    if (key == InputKey::Printable && base >= 0x80) {
-        const u32 ascii = asciiBaseCodepoint(event);
-        if (ascii >= 0x20 && ascii < 0x7f) {
-            base = ascii;
-        }
-    }
-    input->key({
-        .key = key,
-        .action = action,
-        .modifiers = mods,
-        .layoutCodepoint = layout,
-        .baseCodepoint = base,
-    });
+    input->key(keyInputFromEvent(event, pressed));
 }
 
 void WindowImpl::flushInput() {
@@ -1821,7 +1798,7 @@ void cocoaKeyImpl(void* owner, NSEvent* event, bool pressed) {
 
 void cocoaTextImpl(void* owner, NSString* text, NSEventModifierFlags flags) {
     WindowImpl* const window = (WindowImpl*)(owner);
-    window->emitText(text, window->modifiers(flags));
+    window->emitText(text, modifiers(flags));
 }
 
 void cocoaFlushInputImpl(void* owner) {
@@ -1877,6 +1854,37 @@ void cocoaWakeReady(CFMachPortRef, void*, CFIndex, void* owner) {
 
 void cocoaTimerReady(CFRunLoopTimerRef, void* owner) {
     ((PollerImpl*)(owner))->dispatchTimers();
+}
+
+KeyInput plt::keyInputFromEvent(NSEvent* event, bool pressed) {
+    const InputAction action = !pressed ? InputAction::Release : (event.isARepeat ? InputAction::Repeat : InputAction::Press);
+    u16 mods = modifiers(event.modifierFlags);
+    const InputKey key = inputKey(event);
+    if (key >= InputKey::Keypad0 && key <= InputKey::KeypadDecimal) {
+        mods |= InputNumLock;
+    }
+    u32 layout = firstCodepoint(event.characters);
+    u32 base = firstCodepoint(event.charactersIgnoringModifiers);
+    if (key == InputKey::Printable && base >= 0x80) {
+        const u32 ascii = asciiBaseCodepoint(event);
+        if (ascii >= 0x20 && ascii < 0x7f) {
+            base = ascii;
+        }
+    }
+    // Cocoa folds Control into characters: Ctrl+B reports STX, where xkbcommon
+    // reports 'b'. A C0 control is never a layout key, and the kitty key field
+    // needs the layout one - reporting 2 instead of 98 kills every multiplexer
+    // prefix. The named keys carry their own codes, so only printables recover.
+    if (key == InputKey::Printable && layout < 0x20 && base >= 0x20) {
+        layout = base;
+    }
+    return {
+        .key = key,
+        .action = action,
+        .modifiers = mods,
+        .layoutCodepoint = layout,
+        .baseCodepoint = base,
+    };
 }
 
 Platform* plt::createCocoaPlatform(ObjPool& owner) {
