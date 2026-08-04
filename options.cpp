@@ -66,6 +66,7 @@ namespace {
         {"font", OptionKind::SepArg, nullptr, "monospace", "Font to use; repeat for fallbacks"},
         {"fontsize", OptionKind::SepArg, nullptr, "16", "Font size"},
         {"geometry", OptionKind::SepArg, nullptr, "80x24", "Terminal size in chars"},
+        {"kittyCtrlBaseLayout", OptionKind::NoArg, "true", "false", "Kitty Ctrl base-layout compatibility mode"},
         {"vulkanInfo", OptionKind::NoArg, "true", "false", "Print Vulkan information"},
         {"help", OptionKind::NoArg, "true", "false", "Print usage listing and quit"},
         {"listres", OptionKind::NoArg, "true", "false", "Print advanced option listing and quit"},
@@ -433,6 +434,7 @@ void Options::parse() {
         }
         osc52SelectClipboard = osc52Select == "clipboard";
         boldColors = getBool("boldColors");
+        kittyCtrlBaseLayout = getBool("kittyCtrlBaseLayout");
         login = getBool("login");
         showWraps = getBool("showWraps");
         verbose = getBool("verbose");

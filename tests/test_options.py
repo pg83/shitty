@@ -8,6 +8,11 @@ from harness import Shitty, run_startup_failure
 
 
 class OptionTest(unittest.TestCase):
+    def test_kitty_ctrl_base_layout_is_listed_in_help(self):
+        result = run_startup_failure(extra_arguments=("-help",))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"-kittyCtrlBaseLayout", result.stdout)
+
     def test_shell_and_login_argv_are_built_from_selected_executable(self):
         with Shitty(extra_arguments=("-shell", "/bin/sh")) as terminal:
             self.assertEqual(terminal.launch_command(), ("/bin/sh", ["sh"]))

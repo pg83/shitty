@@ -1666,8 +1666,14 @@ bool VtermInput::key(const KeyInput& input) {
             terminal->writeKittyKey(input.key, kittyMods, event);
             return true;
         }
-        const u32 primaryKey = input.layoutCodepoint != 0 ? input.layoutCodepoint : input.baseCodepoint;
         const u16 textMods = kittyMods & ~(64 | 128);
+        const u32 layoutKey = input.layoutCodepoint != 0 ? input.layoutCodepoint : input.baseCodepoint;
+        const bool baseLayoutShortcut =
+            opts.kittyCtrlBaseLayout && (kittyFlags & 0x04) && (textMods & 4) &&
+            layoutKey >= 0x80 &&
+            input.baseCodepoint >= 0x20 && input.baseCodepoint < 0x7f;
+        // Compatibility for consumers that ignore Kitty's base-layout field.
+        const u32 primaryKey = baseLayoutShortcut ? input.baseCodepoint : layoutKey;
         const bool reportEvent = (kittyFlags & 0x02) && event != VtermKeyEventType::Press;
         if (primaryKey && ((textMods & (2 | 4 | 8)) || (kittyFlags & 0x08) || reportEvent)) {
             if (pressed && !(textMods & (2 | 4 | 8))) {

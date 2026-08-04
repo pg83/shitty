@@ -182,6 +182,15 @@ During a session, `Cmd+=`/`Cmd+-`/`Cmd+0` on macOS (`Ctrl+Shift+=`/
 resizing preserves the terminal's rows and columns by resizing the window
 to the new cell dimensions.
 
+Some enhanced-keyboard clients ignore Kitty's reported base-layout key when
+matching shortcuts. `-kittyCtrlBaseLayout` enables a compatibility mode for
+those clients. It is disabled by default. When the client requests alternate
+keys and Ctrl is held, a non-ASCII active-layout key uses its printable ASCII
+base-layout key as the primary key while retaining the original modifiers and
+event type. This intentionally trades the active-layout identity for shortcut
+interoperability; see [#16](https://github.com/pg83/shitty/issues/16) and
+[Crossterm #968](https://github.com/crossterm-rs/crossterm/issues/968).
+
 By default, applications cannot read local selections through OSC 52 and
 cannot manipulate or query the host window. These operations can be enabled
 explicitly for trusted applications.

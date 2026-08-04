@@ -52,6 +52,7 @@ struct Options {
     bool allowWindowOps;
     bool osc52SelectClipboard;
     bool boldColors;
+    bool kittyCtrlBaseLayout;
     bool vulkanInfo;
     bool login;
     bool showWraps;

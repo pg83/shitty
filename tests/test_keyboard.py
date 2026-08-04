@@ -170,6 +170,110 @@ class KeyboardTest(unittest.TestCase):
             terminal.kitty_key(ord("a"), shifted=ord("A"), modifiers=1)
             self.assertEqual(terminal.read_input(), b"\x1b[97:65;2u")
 
+    def test_kitty_ctrl_base_layout_covers_press_repeat_and_release(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>7u")
+            for key, layout_codepoint, base_codepoint in (
+                ("C", 1089, 99),
+                ("D", 1074, 100),
+                ("A", 1092, 97),
+            ):
+                for action in (1, 2, 0):
+                    terminal.layout_key(
+                        key,
+                        layout_codepoint,
+                        base_codepoint,
+                        modifiers=2,
+                        action=action,
+                    )
+            self.assertEqual(
+                terminal.read_input(),
+                b"\x1b[99;5u\x1b[99;5:2u\x1b[99;5:3u"
+                b"\x1b[100;5u\x1b[100;5:2u\x1b[100;5:3u"
+                b"\x1b[97;5u\x1b[97;5:2u\x1b[97;5:3u",
+            )
+
+    def test_kitty_ctrl_base_layout_keeps_ascii_remap_primary(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>7u")
+            terminal.layout_key("C", "j", "c", modifiers=2)
+            self.assertEqual(terminal.read_input(), b"\x1b[106::99;5u")
+
+    def test_kitty_ctrl_base_layout_requires_alternate_key_flag(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>3u")
+            terminal.layout_key("C", "с", "c", modifiers=2)
+            self.assertEqual(terminal.read_input(), b"\x1b[1089;5u")
+
+    def test_kitty_ctrl_base_layout_preserves_lock_modifiers(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>7u")
+            terminal.layout_key("B", "и", "b", modifiers=2 | 32)
+            terminal.layout_key("B", "и", "b", modifiers=2 | 32, action=0)
+            terminal.layout_key("B", "и", "b", modifiers=2 | 16)
+            self.assertEqual(
+                terminal.read_input(),
+                b"\x1b[98;133u\x1b[98;133:3u\x1b[98;69u",
+            )
+
+    def test_kitty_ctrl_base_layout_preserves_other_modifiers(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>7u")
+            terminal.layout_key("B", "и", "b", modifiers=2 | 1)
+            terminal.layout_key("B", "и", "b", modifiers=2 | 4)
+            terminal.layout_key("B", "и", "b", modifiers=2 | 8)
+            self.assertEqual(
+                terminal.read_input(),
+                b"\x1b[98;6u\x1b[98;7u\x1b[98;13u",
+            )
+
+    def test_kitty_ctrl_base_layout_requires_control(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>7u")
+            terminal.layout_key("C", "с", "c", modifiers=4)
+            self.assertEqual(terminal.read_input(), b"\x1b[1089::99;3u")
+
+    def test_kitty_ctrl_base_layout_requires_printable_ascii_base(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>7u")
+            for base in (0, 0x1F, 0x7F, 0x80):
+                terminal.layout_key("C", "с", base, modifiers=2)
+            self.assertEqual(
+                terminal.read_input(),
+                b"\x1b[1089;5u"
+                b"\x1b[1089::31;5u"
+                b"\x1b[1089::127;5u"
+                b"\x1b[1089::128;5u",
+            )
+
     def test_kitty_supports_all_defined_enhancement_flags(self):
         with Shitty(columns=8, rows=2) as terminal:
             terminal.write(b"\x1b[>31u\x1b[?u")
