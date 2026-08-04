@@ -196,8 +196,7 @@
               pkgs.perl
               pkgs.vttest
             ]
-            ++ lib.optionals (sanitizer != null || coverage) [ pkgs.llvmPackages.llvm ]
-            ++ lib.optionals coverage [ pkgs.lcov ];
+            ++ lib.optionals (sanitizer != null || coverage) [ pkgs.llvmPackages.llvm ];
 
           postPatch = old.postPatch + ''
             # Some vendored xterm scripts invoke other scripts by their
@@ -294,18 +293,13 @@
                 -instr-profile="$coverageDirectory/coverage.profdata" \
                 -format=lcov \
                 -ignore-filename-regex="$coverageIgnore" \
-                > "$coverageDirectory/core.info"
+                > "$coverageDirectory/coverage.info"
               llvm-cov export \
                 "$waylandBinary" \
                 -instr-profile="$coverageDirectory/wayland.profdata" \
                 -format=lcov \
                 -ignore-filename-regex="$coverageIgnore" \
-                > "$coverageDirectory/wayland.info"
-              lcov \
-                --branch-coverage \
-                --add-tracefile "$coverageDirectory/core.info" \
-                --add-tracefile "$coverageDirectory/wayland.info" \
-                --output-file "$coverageDirectory/coverage.info"
+                > "$coverageDirectory/wayland-coverage.info"
               {
                 echo "Core coverage"
                 llvm-cov report \
@@ -337,17 +331,21 @@
                 -show-branches=percent \
                 -coverage-watermark=80,50 \
                 -ignore-filename-regex="$coverageIgnore"
-              substituteInPlace "$coverageDirectory/coverage.info" \
-                --replace-quiet "SF:$PWD/" "SF:"
-              if grep -q '^SF:/' "$coverageDirectory/coverage.info"; then
-                echo "coverage report contains absolute source paths" >&2
-                grep '^SF:/' "$coverageDirectory/coverage.info" | head -10 >&2
-                exit 1
-              fi
-              if ! grep -q '^SF:' "$coverageDirectory/coverage.info"; then
-                echo "coverage report does not contain source files" >&2
-                exit 1
-              fi
+              for coverageInfo in \
+                "$coverageDirectory/coverage.info" \
+                "$coverageDirectory/wayland-coverage.info"; do
+                substituteInPlace "$coverageInfo" \
+                  --replace-quiet "SF:$PWD/" "SF:"
+                if grep -q '^SF:/' "$coverageInfo"; then
+                  echo "coverage report contains absolute source paths: $coverageInfo" >&2
+                  grep '^SF:/' "$coverageInfo" | head -10 >&2
+                  exit 1
+                fi
+                if ! grep -q '^SF:' "$coverageInfo"; then
+                  echo "coverage report does not contain source files: $coverageInfo" >&2
+                  exit 1
+                fi
+              done
               cat "$coverageDirectory/summary.txt"
             ''}
             runHook postBuild
@@ -360,6 +358,7 @@
               if coverage then
                 ''
                   install -Dm644 .coverage/coverage.info "$out/coverage.info"
+                  install -Dm644 .coverage/wayland-coverage.info "$out/wayland-coverage.info"
                   install -Dm644 .coverage/summary.txt "$out/summary.txt"
                   cp -R .coverage/html "$out/html"
                 ''
