@@ -61,6 +61,33 @@ namespace plt::test {
             return false;
         }
 
+        const auto checkControl = [&](Command modifiers, u32 layout, u16 expectedModifiers, const char* failure) {
+            const u32 presses = input.pressCount;
+            const u32 text = input.textCount;
+            command(fd, modifiers);
+            pump(*client.platform);
+            command(fd, Command::KeyboardPress);
+            pump(*client.platform);
+            const bool matches = input.pressCount == presses + 1
+                && input.pressedKey.key == InputKey::Printable
+                && input.pressedKey.layoutCodepoint == layout
+                && input.pressedKey.baseCodepoint == 'a'
+                && input.pressedKey.modifiers == expectedModifiers
+                && input.textCount == text;
+            command(fd, Command::KeyboardRelease);
+            pump(*client.platform);
+            if (!matches) {
+                fprintf(stderr, "keyboard input: %s\n", failure);
+            }
+            return matches;
+        };
+        if (!checkControl(Command::KeyboardControl, 'a', InputControl, "Control folded the layout codepoint")
+            || !checkControl(Command::KeyboardControlShift, 'a', InputControl | InputShift, "Shift changed the layout key identity")
+            || !checkControl(Command::KeyboardControlCapsLock, 'a', InputControl | InputCapsLock, "Caps Lock changed the layout key identity")
+            || !checkControl(Command::KeyboardRussianControl, 0x0444, InputControl, "active layout identity was not preserved")) {
+            return false;
+        }
+
         command(fd, Command::KeyboardLeave);
         pump(*client.platform);
         if (input.blurCount != 1 || events.lastInfo.focused) {

@@ -324,6 +324,8 @@ namespace {
         void stopRepeat();
         u16 modifiers() const;
         InputKey inputKey(xkb_keysym_t symbol) const;
+        u32 keymapCodepoint(xkb_keycode_t key, xkb_layout_index_t layout) const;
+        u32 layoutCodepoint(xkb_keycode_t key) const;
         u32 baseCodepoint(xkb_keycode_t key) const;
         bool composing() const;
         size_t composeFeed(xkb_keysym_t symbol, u32 codepoint, u32* codepoints, size_t capacity);
@@ -1857,15 +1859,27 @@ InputKey PlatformImpl::inputKey(xkb_keysym_t symbol) const {
     }
 }
 
-u32 PlatformImpl::baseCodepoint(xkb_keycode_t key) const {
+u32 PlatformImpl::keymapCodepoint(xkb_keycode_t key, xkb_layout_index_t layout) const {
     if (keymap == nullptr) {
         return 0;
     }
     const xkb_keysym_t* symbols = nullptr;
-    if (xkb_keymap_key_get_syms_by_level(keymap, key, 0, 0, &symbols) <= 0) {
+    if (xkb_keymap_key_get_syms_by_level(keymap, key, layout, 0, &symbols) <= 0) {
         return 0;
     }
     return xkb_keysym_to_utf32(symbols[0]);
+}
+
+u32 PlatformImpl::layoutCodepoint(xkb_keycode_t key) const {
+    if (xkbState == nullptr) {
+        return 0;
+    }
+    const xkb_layout_index_t layout = xkb_state_key_get_layout(xkbState, key);
+    return layout == XKB_LAYOUT_INVALID ? 0 : keymapCodepoint(key, layout);
+}
+
+u32 PlatformImpl::baseCodepoint(xkb_keycode_t key) const {
+    return keymapCodepoint(key, 0);
 }
 
 void PlatformImpl::serial(u32 value) {
@@ -1935,7 +1949,7 @@ void PlatformImpl::keyboardKey(u32 serial, u32 time, u32 key, u32 state, bool re
     const xkb_keycode_t keycode = key + 8;
     const xkb_keysym_t symbol = xkb_state_key_get_one_sym(xkbState, keycode);
     const InputAction action = repeated ? InputAction::Repeat : (state == WL_KEYBOARD_KEY_STATE_PRESSED ? InputAction::Press : InputAction::Release);
-    const u32 codepoint = xkb_state_key_get_utf32(xkbState, keycode);
+    const u32 codepoint = xkb_keysym_to_utf32(symbol);
     u32 composed[8];
     size_t composedCount = 0;
     if (action == InputAction::Press) {
@@ -1949,7 +1963,7 @@ void PlatformImpl::keyboardKey(u32 serial, u32 time, u32 key, u32 state, bool re
         .key = inputKey(symbol),
         .action = action,
         .modifiers = activeModifiers,
-        .layoutCodepoint = composedCount != 0 ? composed[0] : codepoint,
+        .layoutCodepoint = layoutCodepoint(keycode),
         .baseCodepoint = baseCodepoint(keycode),
     });
     if (action != InputAction::Release && !(activeModifiers & (InputControl | InputSuper))) {

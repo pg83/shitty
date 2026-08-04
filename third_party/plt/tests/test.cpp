@@ -157,6 +157,9 @@ namespace plt::test {
         u32 titleCount = 0;
         u32 targetTitleCount = 0;
         u32 serial = 1;
+        u32 controlModifier = 0;
+        u32 shiftModifier = 0;
+        u32 capsLockModifier = 0;
         u32 selectionCount = 0;
         u32 primarySelectionCount = 0;
         u32 requestFlags = 0;
@@ -264,8 +267,18 @@ namespace plt::test {
     void sendKeymap(Server& server) {
         xkb_context* const context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
         xkb_rule_names names{};
+        names.layout = "us,ru";
         xkb_keymap* const keymap = context == nullptr ? nullptr : xkb_keymap_new_from_names(context, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
         char* const text = keymap == nullptr ? nullptr : xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
+        if (keymap != nullptr) {
+            const auto modifier = [keymap](const char* name) -> u32 {
+                const xkb_mod_index_t index = xkb_keymap_mod_get_index(keymap, name);
+                return index != XKB_MOD_INVALID && index < sizeof(u32) * 8 ? 1u << index : 0;
+            };
+            server.controlModifier = modifier(XKB_MOD_NAME_CTRL);
+            server.shiftModifier = modifier(XKB_MOD_NAME_SHIFT);
+            server.capsLockModifier = modifier(XKB_MOD_NAME_CAPS);
+        }
         if (text != nullptr) {
             const size_t size = strLen(reinterpret_cast<const u8*>(text)) + 1;
             const int fd = memfd_create("plt-keymap", MFD_CLOEXEC);
@@ -1076,6 +1089,34 @@ namespace plt::test {
                     wl_keyboard_send_key(keyboard, serial++, 2600, KEY_A, WL_KEYBOARD_KEY_STATE_RELEASED);
                     wl_display_flush_clients(display);
                     reply.count = 1;
+                }
+                break;
+            case Command::KeyboardControl:
+                if (keyboard != nullptr) {
+                    wl_keyboard_send_modifiers(keyboard, serial++, controlModifier, 0, 0, 0);
+                    wl_display_flush_clients(display);
+                    reply.count = controlModifier != 0;
+                }
+                break;
+            case Command::KeyboardControlShift:
+                if (keyboard != nullptr) {
+                    wl_keyboard_send_modifiers(keyboard, serial++, controlModifier | shiftModifier, 0, 0, 0);
+                    wl_display_flush_clients(display);
+                    reply.count = controlModifier != 0 && shiftModifier != 0;
+                }
+                break;
+            case Command::KeyboardControlCapsLock:
+                if (keyboard != nullptr) {
+                    wl_keyboard_send_modifiers(keyboard, serial++, controlModifier, 0, capsLockModifier, 0);
+                    wl_display_flush_clients(display);
+                    reply.count = controlModifier != 0 && capsLockModifier != 0;
+                }
+                break;
+            case Command::KeyboardRussianControl:
+                if (keyboard != nullptr) {
+                    wl_keyboard_send_modifiers(keyboard, serial++, controlModifier, 0, 0, 1);
+                    wl_display_flush_clients(display);
+                    reply.count = controlModifier != 0;
                 }
                 break;
             case Command::KeyboardLeave:
