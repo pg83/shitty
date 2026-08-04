@@ -10,7 +10,7 @@ import build
 
 std_build = os.path.join("third_party", "libstd", "build.py")
 plt_build = os.path.join("third_party", "plt", "build.py")
-shitty_version = date.today().strftime("%Y.%m.%d")
+shitty_version = os.environ.get("SHITTY_VERSION", date.today().strftime("%Y.%m.%d"))
 
 build.flags.allow({
     "group": {
@@ -160,8 +160,18 @@ utf8proc = pkg_config("libutf8proc >= 2.9.0")
 threads = dependency(ldflags=["-pthread"])
 
 vulkan = dependency()
+wayland = dependency()
+xkbcommon = dependency()
+realtime = dependency()
+math = dependency()
+cxx_runtime = dependency()
 if linux:
     vulkan = pkg_config("vulkan")
+    wayland = pkg_config("wayland-client >= 1.20")
+    xkbcommon = pkg_config("xkbcommon >= 1.0")
+    realtime = dependency(ldflags=["-lrt"])
+    math = dependency(ldflags=["-lm"])
+    cxx_runtime = dependency(ldflags=["-lstdc++"])
     build.cppflags += ["-DHAVE_VULKAN_WAYLAND=1"]
 
 
@@ -521,15 +531,15 @@ libshitty_test_sources = [
 ]
 libshitty_deps = [
     freetype, fontconfig, harfbuzz, darwin_backend, plt, vulkan, threads, libstd,
-    brotli_common, utf8proc, simdutf,
+    brotli_common, utf8proc, simdutf, wayland, xkbcommon, realtime, math, cxx_runtime,
 ]
 libshitty_test_deps = [
     freetype, fontconfig, harfbuzz, darwin_backend, plt, vulkan, threads, libstd,
-    brotli_common, utf8proc, simdutf,
+    brotli_common, utf8proc, simdutf, wayland, xkbcommon, realtime, math, cxx_runtime,
 ]
 libshitty_fuzz_deps = [
     freetype, fontconfig, harfbuzz, darwin_backend, plt, vulkan, threads, libstd_external_clock,
-    brotli_common, utf8proc, simdutf,
+    brotli_common, utf8proc, simdutf, wayland, xkbcommon, realtime, math, cxx_runtime,
 ]
 
 

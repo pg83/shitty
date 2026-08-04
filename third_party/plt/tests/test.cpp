@@ -235,7 +235,9 @@ namespace plt::test {
         .set_buffer_scale = [](wl_client*, wl_resource*, i32) {},
         .damage_buffer = [](wl_client*, wl_resource*, i32, i32, i32, i32) {},
         .offset = [](wl_client*, wl_resource*, i32, i32) {},
-        .get_release = nullptr,
+        #if defined(WL_SURFACE_GET_RELEASE_SINCE_VERSION)
+            .get_release = nullptr,
+        #endif
     };
 
     const struct wl_region_interface regionImplementation{
@@ -261,7 +263,9 @@ namespace plt::test {
         wl_resource* const region = wl_resource_create(client, &wl_region_interface, wl_resource_get_version(resource), id);
         wl_resource_set_implementation(region, &regionImplementation, nullptr, nullptr);
     },
-        .release = destroyResource,
+        #if defined(WL_COMPOSITOR_RELEASE_SINCE_VERSION)
+            .release = destroyResource,
+        #endif
     };
 
     const struct wl_pointer_interface pointerImplementation{
@@ -432,7 +436,9 @@ namespace plt::test {
         server->dataDevice = wl_resource_create(client, &wl_data_device_interface, wl_resource_get_version(resource), id);
         wl_resource_set_implementation(server->dataDevice, &dataDeviceImplementation, server, nullptr);
     },
-        .release = destroyResource,
+        #if defined(WL_DATA_DEVICE_MANAGER_RELEASE_SINCE_VERSION)
+            .release = destroyResource,
+        #endif
     };
 
     const struct zwp_primary_selection_source_v1_interface primarySourceImplementation{
@@ -658,9 +664,11 @@ namespace plt::test {
         server->textInputPendingEnabled = false;
         server->textInputPendingDisabled = false;
     },
-        .set_available_actions = [](wl_client*, wl_resource*, wl_array*) {},
-        .show_input_panel = [](wl_client*, wl_resource*) {},
-        .hide_input_panel = [](wl_client*, wl_resource*) {},
+        #if defined(ZWP_TEXT_INPUT_V3_SET_AVAILABLE_ACTIONS_SINCE_VERSION)
+            .set_available_actions = [](wl_client*, wl_resource*, wl_array*) {},
+            .show_input_panel = [](wl_client*, wl_resource*) {},
+            .hide_input_panel = [](wl_client*, wl_resource*) {},
+        #endif
     };
 
     const struct zwp_text_input_manager_v3_interface textInputManagerImplementation{

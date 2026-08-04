@@ -1,10 +1,7 @@
 name: Release
 
-# The release button: publishes the next numeric tag from the current
-# master with a portable darwin-arm64 binary (static utf8proc, no
-# Homebrew dylibs - dev/build_brew_macos.sh guards that) and
-# GitHub-generated notes. The homebrew tap picks the release up on its
-# own schedule.
+# The release button serializes tag selection, builds the Ubuntu and macOS
+# artifacts in parallel from one commit, then publishes them together.
 on:
   workflow_dispatch:
     inputs:
@@ -12,40 +9,200 @@ on:
         description: release tag (empty picks the next number)
         required: false
 
-permissions:
-  attestations: write
-  contents: write
-  id-token: write
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions: {}
 
 jobs:
-  release:
-    runs-on: macos-14
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Install the toolchain
+
+      - name: Resolve release source
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/master ]]; then
+            echo "releases must run from refs/heads/master, not $GITHUB_REF" >&2
+            exit 1
+          fi
+          arguments=()
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            arguments+=("$REQUESTED_TAG")
+          fi
+          tag="$(python3 dev/release.py "${arguments[@]}" --sha "$GITHUB_SHA" --resolve-tag-only)"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Install the Ubuntu toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            clang \
+            dpkg-dev \
+            file \
+            glslang-tools \
+            libbrotli-dev \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libharfbuzz-dev \
+            librsvg2-bin \
+            libutf8proc-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            lintian \
+            pkg-config \
+            python3 \
+            ragel \
+            wayland-protocols
+
+      - name: Build Ubuntu package
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 dev/build_deb.py --release-tag "$RELEASE_TAG" --output-directory dist
+
+      - name: Validate Ubuntu package
+        run: |
+          packages=(dist/*.deb)
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "expected one Debian package, found ${#packages[@]}" >&2
+            exit 1
+          fi
+          python3 dev/check_deb.py "${packages[0]}"
+          sudo apt-get --simulate install "./${packages[0]}"
+          lintian --fail-on error "${packages[0]}"
+
+      - name: Upload Ubuntu package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  build-macos:
+    needs: prepare
+    runs-on: macos-14
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Install the macOS toolchain
         run: |
           brew install llvm ragel glslang spirv-cross librsvg
           command -v pkg-config >/dev/null || brew install pkgconf
+
+      - name: Build source and macOS artifacts
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          python3 dev/release.py "$RELEASE_TAG" \
+            --sha "$RELEASE_SHA" \
+            --builder brew \
+            --build-only \
+            --artifacts-directory "$RUNNER_TEMP/release-artifacts"
+
+      - name: Upload source and macOS artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-macos
+          path: ${{ runner.temp }}/release-artifacts/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: [prepare, build-linux, build-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/release-artifacts
+          merge-multiple: true
+
       - name: Let the release push tags
         run: |
           git config --global user.name "shitty release bot"
           git config --global user.email "noreply@github.com"
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
         env:
           GH_TOKEN: ${{ github.token }}
+
       - name: Build draft release
-        run: |
-          python3 dev/release.py ${{ inputs.tag }} --sha "$GITHUB_SHA" --builder brew --generate-notes \
-            --artifacts-directory "$RUNNER_TEMP/release-artifacts" --draft \
-            --tag-file "$RUNNER_TEMP/release-tag"
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          artifacts=("$RUNNER_TEMP/release-artifacts/"*)
+          if [[ ${#artifacts[@]} -ne 3 ]]; then
+            echo "expected three release artifacts, found ${#artifacts[@]}" >&2
+            exit 1
+          fi
+          artifact_arguments=()
+          for artifact_file in "${artifacts[@]}"; do
+            artifact_arguments+=(--artifact "$artifact_file")
+          done
+          python3 dev/release.py "$RELEASE_TAG" \
+            --sha "$RELEASE_SHA" \
+            --generate-notes \
+            --draft \
+            --publish-only \
+            "${artifact_arguments[@]}" \
+            --tag-file "$RUNNER_TEMP/release-tag"
+
       - name: Attest release artifacts
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
-          subject-path: '${{ runner.temp }}/release-artifacts/*.tar.gz'
+          subject-path: '${{ runner.temp }}/release-artifacts/*'
+
       - name: Publish release
         run: gh release edit "$(cat "$RUNNER_TEMP/release-tag")" --draft=false --repo "$GITHUB_REPOSITORY"
         env:

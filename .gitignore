@@ -11,6 +11,7 @@
 /main_fuzz
 /result
 /result-*
+/dist/
 __pycache__/
 .codegraph/
 /plt_tests

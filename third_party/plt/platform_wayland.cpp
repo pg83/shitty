@@ -952,9 +952,11 @@ namespace {
     },
         .axis_value120 = pointerAxisSteps,
         .axis_relative_direction = [](void*, struct wl_pointer*, u32, u32) {},
-        .warp = [](void* data, struct wl_pointer*, wl_fixed_t x, wl_fixed_t y) {
-        pointerMotion(data, nullptr, 0, x, y);
-    },
+        #if defined(WL_POINTER_WARP_SINCE_VERSION)
+            .warp = [](void* data, struct wl_pointer*, wl_fixed_t x, wl_fixed_t y) {
+            pointerMotion(data, nullptr, 0, x, y);
+        },
+        #endif
     };
 
     void seatCapabilities(void* data, struct wl_seat*, u32 capabilities) {
@@ -1140,11 +1142,13 @@ namespace {
             [](void* data, struct zwp_text_input_v3*, u32) {
         ((PlatformImpl*)(data))->textInputDone();
     },
-        // Version 2 events; never delivered because the manager is bound at
-        // version 1.
-        .action = [](void*, struct zwp_text_input_v3*, u32, u32) {},
-        .language = [](void*, struct zwp_text_input_v3*, const char*) {},
-        .preedit_hint = [](void*, struct zwp_text_input_v3*, u32, u32, u32) {},
+        #if defined(ZWP_TEXT_INPUT_V3_ACTION_SINCE_VERSION)
+            // Version 2 events; never delivered because the manager is bound
+            // at version 1.
+            .action = [](void*, struct zwp_text_input_v3*, u32, u32) {},
+            .language = [](void*, struct zwp_text_input_v3*, const char*) {},
+            .preedit_hint = [](void*, struct zwp_text_input_v3*, u32, u32, u32) {},
+        #endif
     };
 
     u32 cursorShape(PointerIcon icon, u32 version) {

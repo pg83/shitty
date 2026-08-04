@@ -58,6 +58,18 @@
 using namespace stl;
 
 namespace {
+    #if defined(VK_KHR_swapchain_maintenance1)
+        using SwapchainMaintenanceFeatures = VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR;
+        using SwapchainPresentFenceInfo = VkSwapchainPresentFenceInfoKHR;
+        constexpr VkStructureType swapchainMaintenanceFeaturesType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR;
+        constexpr VkStructureType swapchainPresentFenceInfoType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR;
+    #else
+        using SwapchainMaintenanceFeatures = VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT;
+        using SwapchainPresentFenceInfo = VkSwapchainPresentFenceInfoEXT;
+        constexpr VkStructureType swapchainMaintenanceFeaturesType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
+        constexpr VkStructureType swapchainPresentFenceInfoType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT;
+    #endif
+
     struct RendererImpl;
 
     struct CallRendererFontChanged final: public Listener {
@@ -541,11 +553,15 @@ void RendererImpl::createInstance() {
     const char* extensions[5] = {VK_KHR_SURFACE_EXTENSION_NAME};
     u32 extensionCount = 1;
     extensions[extensionCount++] = VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME;
-    khrSurfaceMaintenance = instanceHasExtension(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+    #if defined(VK_KHR_surface_maintenance1)
+        khrSurfaceMaintenance = instanceHasExtension(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+    #endif
     extSurfaceMaintenance = instanceHasExtension(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-    if (khrSurfaceMaintenance) {
-        extensions[extensionCount++] = VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME;
-    }
+    #if defined(VK_KHR_surface_maintenance1)
+        if (khrSurfaceMaintenance) {
+            extensions[extensionCount++] = VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME;
+        }
+    #endif
     if (extSurfaceMaintenance) {
         extensions[extensionCount++] = VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME;
     }
@@ -635,14 +651,17 @@ void RendererImpl::selectPhysicalDevice() {
     vkGetPhysicalDeviceFeatures(physicalDevice, &features);
     extendedStorageFormats = features.shaderStorageImageExtendedFormats;
 
-    if (khrSurfaceMaintenance && deviceHasExtension(physicalDevice, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
-        swapchainMaintenanceExtension = VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
-    } else if (extSurfaceMaintenance && deviceHasExtension(physicalDevice, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+    #if defined(VK_KHR_swapchain_maintenance1)
+        if (khrSurfaceMaintenance && deviceHasExtension(physicalDevice, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+            swapchainMaintenanceExtension = VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+        } else
+    #endif
+    if (extSurfaceMaintenance && deviceHasExtension(physicalDevice, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
         swapchainMaintenanceExtension = VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
     }
     if (swapchainMaintenanceExtension != nullptr) {
-        VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance{};
-        maintenance.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR;
+        SwapchainMaintenanceFeatures maintenance{};
+        maintenance.sType = swapchainMaintenanceFeaturesType;
         VkPhysicalDeviceFeatures2 available{};
         available.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         available.pNext = &maintenance;
@@ -676,9 +695,9 @@ void RendererImpl::createDevice() {
     }
     VkPhysicalDeviceFeatures features{};
     features.shaderStorageImageExtendedFormats = extendedStorageFormats;
-    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance{};
+    SwapchainMaintenanceFeatures maintenance{};
     if (swapchainMaintenanceExtension != nullptr) {
-        maintenance.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR;
+        maintenance.sType = swapchainMaintenanceFeaturesType;
         maintenance.swapchainMaintenance1 = VK_TRUE;
     }
     VkDeviceCreateInfo createInfo{};
@@ -1819,7 +1838,7 @@ bool RendererImpl::submitPresentFrame(u32 width, u32 height, FrameResources& fra
     checkVk(vkQueueSubmit(queue, 1, &submitInfo, frame.fence), "vkQueueSubmit");
     chain->initialized.mut(imageIndex) = true;
 
-    VkSwapchainPresentFenceInfoKHR presentFenceInfo{};
+    SwapchainPresentFenceInfo presentFenceInfo{};
     VkFence presentFence = VK_NULL_HANDLE;
     if (swapchainMaintenanceExtension != nullptr) {
         presentFence = chain->presentFences[imageIndex];
@@ -1827,7 +1846,7 @@ bool RendererImpl::submitPresentFrame(u32 width, u32 height, FrameResources& fra
             checkVk(vkWaitForFences(device, 1, &presentFence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
             checkVk(vkResetFences(device, 1, &presentFence), "vkResetFences");
         }
-        presentFenceInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR;
+        presentFenceInfo.sType = swapchainPresentFenceInfoType;
         presentFenceInfo.swapchainCount = 1;
         presentFenceInfo.pFences = &presentFence;
     }

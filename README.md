@@ -223,7 +223,20 @@ release automatically. The same portable binary (`st-darwin-arm64.tar.gz`,
 nothing dynamically linked outside the system) is attached to every
 [GitHub release](https://github.com/pg83/shitty/releases).
 
-### Linux
+### Ubuntu 24.04 (amd64)
+
+Each GitHub release includes a native package built against Ubuntu 24.04:
+
+```sh
+gh release download --repo pg83/shitty --pattern 'shitty_*_amd64.deb'
+sudo apt install ./shitty_*_amd64.deb
+```
+
+The package installs `st`, the desktop entry, the scalable icon, and the
+project documentation. Its dependencies are derived from the packaged ELF.
+It conflicts with Ubuntu's `stterm` package because both install `/usr/bin/st`.
+
+### Linux from source
 
 The executable is named `st`; the desktop application and icon are named
 `shitty`:
