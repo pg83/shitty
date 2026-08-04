@@ -2,6 +2,7 @@ name: Release
 
 # The release button serializes tag selection, builds the Ubuntu and macOS
 # artifacts in parallel from one commit, then publishes them together.
+# The Homebrew tap picks the release up on its own schedule.
 on:
   workflow_dispatch:
     inputs:
