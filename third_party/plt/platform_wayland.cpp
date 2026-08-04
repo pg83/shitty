@@ -1871,9 +1871,6 @@ u32 PlatformImpl::keymapCodepoint(xkb_keycode_t key, xkb_layout_index_t layout) 
 }
 
 u32 PlatformImpl::layoutCodepoint(xkb_keycode_t key) const {
-    if (xkbState == nullptr) {
-        return 0;
-    }
     const xkb_layout_index_t layout = xkb_state_key_get_layout(xkbState, key);
     return layout == XKB_LAYOUT_INVALID ? 0 : keymapCodepoint(key, layout);
 }
