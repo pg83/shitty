@@ -196,7 +196,8 @@
               pkgs.perl
               pkgs.vttest
             ]
-            ++ lib.optionals (sanitizer != null || coverage) [ pkgs.llvmPackages.llvm ];
+            ++ lib.optionals (sanitizer != null || coverage) [ pkgs.llvmPackages.llvm ]
+            ++ lib.optionals coverage [ pkgs.lcov ];
 
           postPatch = old.postPatch + ''
             # Some vendored xterm scripts invoke other scripts by their
@@ -241,15 +242,15 @@
               test
             ${lib.optionalString coverage ''
               # Groups deliberately do not publish their outputs. Ask the
-              # runner for the two coverage binaries explicitly so its
+              # runner for the three coverage binaries explicitly so their
               # stable source-root symlinks can be passed to llvm-cov.
               python3 ./build \
                 -B ${buildDirectory} \
                 -j "$NIX_BUILD_CORES" \
-                st_test unit_tests
+                st_test unit_tests plt_wayland_integration_tests
               coverageDirectory="$PWD/.coverage"
               coverageIgnore='(^|/)(tests|third_party/libstd|\.build[^/]*)/|(^|/)[^/]*_ut\.cpp$|(^|/)(test_mode|test_input)\.(cpp|h)$|^/nix/store/'
-              mkdir -p "$coverageDirectory/html"
+              mkdir -p "$coverageDirectory"
               coverageProfiles=()
               for binary in ./st_test ./unit_tests; do
                 buildId="$(llvm-readelf -n "$binary" |
@@ -266,29 +267,73 @@
                 fi
                 coverageProfiles+=("''${binaryProfiles[@]}")
               done
+              waylandBinary=./plt_wayland_integration_tests
+              waylandBuildId="$(llvm-readelf -n "$waylandBinary" |
+                sed -n 's/.*Build ID: //p' |
+                head -1)"
+              if [[ -z "$waylandBuildId" ]]; then
+                echo "coverage binary has no build ID: $waylandBinary" >&2
+                exit 1
+              fi
+              waylandProfiles=("$profileDirectory/$waylandBuildId"-*.profraw)
+              if [[ ! -e "''${waylandProfiles[0]}" ]]; then
+                echo "coverage binary produced no profiles: $waylandBinary" >&2
+                exit 1
+              fi
               llvm-profdata merge \
                 -sparse \
                 "''${coverageProfiles[@]}" \
                 -o "$coverageDirectory/coverage.profdata"
+              llvm-profdata merge \
+                -sparse \
+                "''${waylandProfiles[@]}" \
+                -o "$coverageDirectory/wayland.profdata"
               llvm-cov export \
                 ./st_test \
                 -object=./unit_tests \
                 -instr-profile="$coverageDirectory/coverage.profdata" \
                 -format=lcov \
                 -ignore-filename-regex="$coverageIgnore" \
-                > "$coverageDirectory/coverage.info"
-              llvm-cov report \
-                ./st_test \
-                -object=./unit_tests \
-                -instr-profile="$coverageDirectory/coverage.profdata" \
+                > "$coverageDirectory/core.info"
+              llvm-cov export \
+                "$waylandBinary" \
+                -instr-profile="$coverageDirectory/wayland.profdata" \
+                -format=lcov \
                 -ignore-filename-regex="$coverageIgnore" \
-                > "$coverageDirectory/summary.txt"
+                > "$coverageDirectory/wayland.info"
+              lcov \
+                --branch-coverage \
+                --add-tracefile "$coverageDirectory/core.info" \
+                --add-tracefile "$coverageDirectory/wayland.info" \
+                --output-file "$coverageDirectory/coverage.info"
+              {
+                echo "Core coverage"
+                llvm-cov report \
+                  ./st_test \
+                  -object=./unit_tests \
+                  -instr-profile="$coverageDirectory/coverage.profdata" \
+                  -ignore-filename-regex="$coverageIgnore"
+                echo
+                echo "Wayland integration coverage"
+                llvm-cov report \
+                  "$waylandBinary" \
+                  -instr-profile="$coverageDirectory/wayland.profdata" \
+                  -ignore-filename-regex="$coverageIgnore"
+              } > "$coverageDirectory/summary.txt"
               llvm-cov show \
                 ./st_test \
                 -object=./unit_tests \
                 -instr-profile="$coverageDirectory/coverage.profdata" \
                 -format=html \
                 -output-dir="$coverageDirectory/html" \
+                -show-branches=percent \
+                -coverage-watermark=80,50 \
+                -ignore-filename-regex="$coverageIgnore"
+              llvm-cov show \
+                "$waylandBinary" \
+                -instr-profile="$coverageDirectory/wayland.profdata" \
+                -format=html \
+                -output-dir="$coverageDirectory/html/wayland" \
                 -show-branches=percent \
                 -coverage-watermark=80,50 \
                 -ignore-filename-regex="$coverageIgnore"

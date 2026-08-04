@@ -1669,7 +1669,7 @@ bool VtermInput::key(const KeyInput& input) {
         const u16 textMods = kittyMods & ~(64 | 128);
         const u32 layoutKey = input.layoutCodepoint != 0 ? input.layoutCodepoint : input.baseCodepoint;
         const bool baseLayoutShortcut =
-            opts.kittyCtrlBaseLayout && (kittyFlags & 0x04) && (textMods & 4) &&
+            opts.kittyCtrlBaseLayout && (kittyFlags & 0x04) && (textMods & 4) && !(input.modifiers & InputAltGraph) &&
             layoutKey >= 0x80 &&
             input.baseCodepoint >= 0x20 && input.baseCodepoint < 0x7f;
         // Compatibility for consumers that ignore Kitty's base-layout field.

@@ -28,6 +28,7 @@ namespace {
     constexpr int testModSuper = 0x0008;
     constexpr int testModCapsLock = 0x0010;
     constexpr int testModNumLock = 0x0020;
+    constexpr int testModAltGraph = 0x0040;
 
     struct TestInputImpl final: public TestInput {
         explicit TestInputImpl(Composer& composer);
@@ -171,6 +172,9 @@ u16 TestInputImpl::translateModifiers(int modifiers, bool rightAlt) {
     }
     if (modifiers & testModNumLock) {
         result |= InputNumLock;
+    }
+    if (modifiers & testModAltGraph) {
+        result |= InputAltGraph;
     }
     return result;
 }

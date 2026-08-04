@@ -255,7 +255,21 @@ class KeyboardTest(unittest.TestCase):
         ) as terminal:
             terminal.write(b"\x1b[>7u")
             terminal.layout_key("C", "с", "c", modifiers=4)
-            self.assertEqual(terminal.read_input(), b"\x1b[1089::99;3u")
+            terminal.layout_key("C", "с", "c", modifiers=8)
+            self.assertEqual(
+                terminal.read_input(),
+                b"\x1b[1089::99;3u\x1b[1089::99;9u",
+            )
+
+    def test_kitty_ctrl_base_layout_preserves_alt_graph(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>7u")
+            terminal.layout_key("C", "с", "c", modifiers=2 | 64)
+            self.assertEqual(terminal.read_input(), b"\x1b[1089::99;5u")
 
     def test_kitty_ctrl_base_layout_requires_printable_ascii_base(self):
         with Shitty(
@@ -273,6 +287,16 @@ class KeyboardTest(unittest.TestCase):
                 b"\x1b[1089::127;5u"
                 b"\x1b[1089::128;5u",
             )
+
+    def test_kitty_ctrl_base_layout_falls_back_to_base_codepoint(self):
+        with Shitty(
+            columns=8,
+            rows=2,
+            extra_arguments=("-kittyCtrlBaseLayout",),
+        ) as terminal:
+            terminal.write(b"\x1b[>7u")
+            terminal.layout_key("C", 0, "c", modifiers=2)
+            self.assertEqual(terminal.read_input(), b"\x1b[99;5u")
 
     def test_kitty_supports_all_defined_enhancement_flags(self):
         with Shitty(columns=8, rows=2) as terminal:

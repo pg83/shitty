@@ -43,6 +43,11 @@
 
 using namespace stl;
 
+#ifdef __LLVM_INSTR_PROFILE_GENERATE
+extern "C" int __llvm_profile_dump();
+extern "C" void __llvm_profile_reset_counters();
+#endif
+
 namespace plt::test {
 
     bool transfer(int fd, void* data, size_t size, bool writeData) {
@@ -1455,6 +1460,9 @@ namespace plt::test {
             return false;
         }
         if (child == 0) {
+#ifdef __LLVM_INSTR_PROFILE_GENERATE
+            __llvm_profile_reset_counters();
+#endif
             signal(SIGPIPE, SIG_DFL);
             close(wayland[0]);
             close(control[0]);
@@ -1463,6 +1471,13 @@ namespace plt::test {
             setenv("WAYLAND_SOCKET", fd, 1);
             const bool success = scenario(control[1]);
             command(control[1], Command::Quit);
+#ifdef __LLVM_INSTR_PROFILE_GENERATE
+            // _exit bypasses the profiling runtime's atexit hook.
+            if (__llvm_profile_dump() != 0) {
+                fprintf(stderr, "%s: failed to write coverage profile\n", name);
+                _exit(1);
+            }
+#endif
             _exit(success ? 0 : 1);
         }
 
