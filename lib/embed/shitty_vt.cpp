@@ -511,7 +511,12 @@ namespace {
         }
         const CellColor foreground = cell.foreground();
         const CellColor background = cell.background();
-        const CellColor underline = extras->underlineColor(cell);
+        // The store is reached through a virtual call that cannot inline, and
+        // a cell with no extra already carries its underline color inline.
+        // Taking that branch here rather than inside the store is worth about
+        // a tenth of what reading a cell costs, on a grid where almost no
+        // cell has an extra at all.
+        const CellColor underline = cell.hasExtra() ? extras->underlineColor(cell) : cell.inlineUnderlineColor();
         out.foreground_source = packColorSource(foreground);
         out.background_source = packColorSource(background);
         out.underline_source = packColorSource(underline);
@@ -522,11 +527,18 @@ namespace {
             // A configured special color stood in for the request. The
             // embedder is handed a color, not a palette entry it could
             // resolve for itself.
-            if (colors->resolve(foreground).packed() != out.foreground) {
-                out.foreground_source = SHITTY_VT_COLOR_DIRECT;
-            }
-            if (colors->resolve(background).packed() != out.background) {
-                out.background_source = SHITTY_VT_COLOR_DIRECT;
+            //
+            // Guarded, because detecting that substitution costs two more
+            // resolutions on every cell and nothing can substitute while no
+            // special color is enabled - which is every terminal that was
+            // never asked to use one.
+            if (colors->specialModes != 0) {
+                if (colors->resolve(foreground).packed() != out.foreground) {
+                    out.foreground_source = SHITTY_VT_COLOR_DIRECT;
+                }
+                if (colors->resolve(background).packed() != out.background) {
+                    out.background_source = SHITTY_VT_COLOR_DIRECT;
+                }
             }
         }
         out.attributes = (u16)(packAttributes(cell));
