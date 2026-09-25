@@ -14,6 +14,8 @@
 
 #include "startup.h"
 
+#include <lib/vterm/fatal.h>
+
 #include <plt/fiber.h>
 #include <plt/loop_wake.h>
 #include <plt/platform.h>
@@ -77,6 +79,17 @@ namespace {
         exit(1);
     }
 
+    // A failed spawn must not take the terminal down with it: opening one
+    // more tab can hit a descriptor, pty or process limit while every
+    // existing tab is perfectly healthy. Unlike sysError this throws, and
+    // releases the descriptor the failed step still holds.
+    [[noreturn]] void spawnError(const char* message, int error, int heldFd) {
+        if (heldFd >= 0) {
+            close(heldFd);
+        }
+        raiseError(StringView(message), StringView(u8": "), StringView(strerror(error)), StringView(u8" (errno="), (i64)(error), StringView(u8")"));
+    }
+
     void sysWarn(const char* message) {
         const int error = errno;
         sysE << StringView(u8"Warning: ") << StringView(message) << StringView(u8": ") << StringView(strerror(error)) << StringView(u8" (errno=") << (i64)(error) << StringView(u8")") << endL;
@@ -106,20 +119,20 @@ namespace {
     int openPtyMaster(char* slaveName, size_t capacity) {
         const int master = posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (master < 0) {
-            sysError("can't open master pty: posix_openpt()");
+            spawnError("can't open master pty: posix_openpt()", errno, -1);
         }
         if (fcntl(master, F_SETFD, FD_CLOEXEC) < 0) {
-            sysError("can't open master pty: fcntl(FD_CLOEXEC)");
+            spawnError("can't open master pty: fcntl(FD_CLOEXEC)", errno, master);
         }
         if (grantpt(master) < 0) {
-            sysError("can't open master pty: grantpt()");
+            spawnError("can't open master pty: grantpt()", errno, master);
         }
         if (unlockpt(master) < 0) {
-            sysError("can't open master pty: unlockpt()");
+            spawnError("can't open master pty: unlockpt()", errno, master);
         }
         const char* const name = ptsname(master);
         if (name == nullptr) {
-            sysError("can't open master pty: ptsname()");
+            spawnError("can't open master pty: ptsname()", errno, master);
         }
         const StringView text(name);
         const size_t length = text.length() < capacity - 1 ? text.length() : capacity - 1;
@@ -128,10 +141,10 @@ namespace {
         return master;
     }
 
-    int openPtySlave(const char* name) {
+    int openPtySlave(const char* name, int master) {
         const int slave = open(name, O_RDWR | O_NOCTTY);
         if (slave < 0) {
-            sysError("can't open slave pty: open()");
+            spawnError("can't open slave pty: open()", errno, master);
         }
         return slave;
     }
@@ -886,7 +899,7 @@ PtyHandle* PtyImpl::spawn(ObjPool& owner, const LaunchCommand& command) {
 
     char slaveName[PATH_MAX];
     const int master = openPtyMaster(slaveName, sizeof(slaveName));
-    const int slave = openPtySlave(slaveName);
+    const int slave = openPtySlave(slaveName, master);
 
     // A child that exits immediately must not outrun the caller's SIGCHLD
     // bookkeeping. The child restores the inherited mask before exec.
@@ -901,8 +914,7 @@ PtyHandle* PtyImpl::spawn(ObjPool& owner, const LaunchCommand& command) {
         close(master);
         close(slave);
         sigprocmask(SIG_SETMASK, &previousMask, nullptr);
-        errno = error;
-        sysError("fork");
+        spawnError("fork", error, -1);
     }
     if (pid == 0) {
         sigprocmask(SIG_SETMASK, &previousMask, nullptr);
