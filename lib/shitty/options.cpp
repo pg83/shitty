@@ -19,6 +19,7 @@
 #include "toml.h"
 #include "brand.h"
 #include "darts.h"
+#include "startup.h"
 #include "terminal_colors.h"
 
 #include <lib/vterm/num.h>
@@ -38,6 +39,7 @@
 #include <wchar.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 using namespace stl;
 
@@ -1272,7 +1274,13 @@ void OptionsParser::parse() {
         vt.boldColors = getBool("boldColors");
         vt.kittyCtrlBaseLayout = getBool("kittyCtrlBaseLayout");
         noDecorations = getBool("no-decorations");
-        login = getBool("login");
+        // A desktop launch has no shell environment to inherit, so the
+        // profile files that build PATH (Homebrew's lives in .zprofile) only
+        // run for a login shell. An explicit login setting still wins.
+        StringView loginOption;
+        OptionSource loginSource = OptionSource::NONE;
+        get("login", loginOption, &loginSource);
+        login = getBool("login") || (loginSource == OptionSource::HardDefault && launchedFromDesktop(getppid()));
         maximized = getBool("maximized");
         fullscreen = getBool("fullscreen");
         showWraps = getBool("showWraps");

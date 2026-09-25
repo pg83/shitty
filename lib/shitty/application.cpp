@@ -603,6 +603,7 @@ int ApplicationImpl::run(int argc, char* argv[]) {
     // window, and setenv() must never run in a forked child of a
     // multithreaded process: glibc's environ lock is not reset at fork.
     configureTerminalChildEnvironment(*composer.brand, composer.opts->vt.widths);
+    enterHomeWhenLaunchedFromDesktop();
     composer.fontSize = composer.opts->fontsize;
     composer.inputRemap = InputRemap::create(composer);
     if (testFd >= 0) {

@@ -85,4 +85,14 @@ STD_TEST_SUITE(Startup) {
         // The width level lands in the reported features verbatim.
         STD_INSIST(StringView(getenv("TERM_FEATURES")) == StringView("T3CwLrMSc7UUw15Ts3BFGsGoSyHNoSxP"));
     }
+
+    STD_TEST(OnlyLaunchdAsParentMeansADesktopLaunch) {
+        STD_INSIST(!launchedFromDesktop(2));
+        STD_INSIST(!launchedFromDesktop(4711));
+#if defined(__APPLE__)
+        STD_INSIST(launchedFromDesktop(1));
+#else
+        STD_INSIST(!launchedFromDesktop(1));
+#endif
+    }
 }

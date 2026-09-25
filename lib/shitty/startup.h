@@ -11,6 +11,8 @@
 #include <std/lib/vector.h>
 #include <std/sys/types.h>
 
+#include <sys/types.h>
+
 struct Brand;
 class UnicodeWidths;
 
@@ -30,3 +32,11 @@ struct LaunchCommand {
 LaunchCommand buildLaunchCommand(int argc, char* argv[], stl::StringView defaultShell, bool login);
 
 void configureTerminalChildEnvironment(const Brand& brand, const UnicodeWidths& widths);
+
+// True when launchd itself started this process - a Finder, Dock or open(1)
+// launch of the .app on macOS - so no shell handed it an environment.
+// parent is the parent process id; always false outside macOS.
+bool launchedFromDesktop(pid_t parent);
+
+// A desktop launch starts in "/", which is no place for a shell to begin.
+void enterHomeWhenLaunchedFromDesktop();

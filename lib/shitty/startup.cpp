@@ -11,6 +11,8 @@
 #include <lib/vterm/fatal.h>
 #include <lib/vterm/term_features.h>
 
+#include <std/ios/sys.h>
+
 #include <pwd.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -148,4 +150,34 @@ void configureTerminalChildEnvironment(const Brand& brand, const UnicodeWidths& 
         raiseError(StringView(u8"cannot configure terminal child environment"));
     }
     brand.configureVersionEnvironment();
+}
+
+bool launchedFromDesktop(pid_t parent) {
+#if defined(__APPLE__)
+    return parent == 1;
+#else
+    (void)(parent);
+    return false;
+#endif
+}
+
+void enterHomeWhenLaunchedFromDesktop() {
+    if (!launchedFromDesktop(getppid())) {
+        return;
+    }
+    char current[PATH_MAX];
+    if (getcwd(current, sizeof(current)) == nullptr || StringView(current) != StringView(u8"/")) {
+        return;
+    }
+    const char* home = getenv("HOME");
+    if (home == nullptr || home[0] != '/') {
+        const passwd* entry = getpwuid(getuid());
+        home = entry != nullptr ? entry->pw_dir : nullptr;
+    }
+    if (home == nullptr || home[0] != '/') {
+        return;
+    }
+    if (chdir(home) < 0) {
+        sysO << StringView(u8"Warning: could not enter the home directory.") << endL;
+    }
 }
