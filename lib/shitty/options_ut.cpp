@@ -41,6 +41,19 @@ namespace {
 }
 
 STD_TEST_SUITE(Options) {
+    STD_TEST(CursorKeepSelectionFgFlag) {
+        auto pool = ObjPool::fromMemory();
+        char program[] = "st";
+        char enabled[] = "-cursorKeepSelectionFg";
+        char disabled[] = "+cursorKeepSelectionFg";
+        char* defaults[] = {program, nullptr};
+        char* on[] = {program, enabled, nullptr};
+        char* off[] = {program, enabled, disabled, nullptr};
+        STD_INSIST(!Options::create(*pool, *Brand::generic(), defaults, 1)->cursorKeepSelectionFg);
+        STD_INSIST(Options::create(*pool, *Brand::generic(), on, 2)->cursorKeepSelectionFg);
+        STD_INSIST(!Options::create(*pool, *Brand::generic(), off, 3)->cursorKeepSelectionFg);
+    }
+
     STD_TEST(SymbolFontTablesParseFromConfig) {
         auto pool = ObjPool::fromMemory();
         Buffer config = writeTempConfig(StringView(

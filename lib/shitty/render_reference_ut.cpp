@@ -331,6 +331,63 @@ STD_TEST_SUITE(ReferenceRenderer) {
         STD_INSIST((cellPixel(image, 1, 0) == Color{4, 5, 6}));
     }
 
+    STD_TEST(CursorKeepsSelectedForegroundWhenEnabled) {
+        ScreenFixture fx(1, 1);
+        TerminalCell attrs = coloredCell({255, 0, 0}, {0, 0, 255});
+        // An overline gives exact foreground pixels without glyph antialiasing.
+        attrs.overline = true;
+        fx.writeText(0, 0, " ", attrs);
+        Options options;
+        fx.composer->setOptions(&options);
+        ReferenceFixture renderer(*fx.composer);
+        TerminalUpdate update = fx.capture();
+        update.snappedSelection = Rect(0, 0);
+        update.cursor.color = {0, 255, 0};
+        update.cursor.style = TerminalCursor::Style::filled_block;
+        const auto checkColors = [&](Color foreground) {
+            const ReferenceImage image = renderer->render(update);
+            STD_INSIST(image.pixels != nullptr);
+            STD_INSIST(cellPixel(image, 0, 0) == foreground);
+            STD_INSIST(cellPixel(image, 0, 1) == update.cursor.color);
+        };
+
+        checkColors({255, 0, 0});
+        options.cursorKeepSelectionFg = true;
+        checkColors({0, 0, 255});
+        update.snappedSelection = {};
+        checkColors({0, 0, 255});
+    }
+
+    STD_TEST(CursorKeepsReverseVideoForegroundWhenEnabled) {
+        ScreenFixture fx(1, 1);
+        TerminalCell attrs = coloredCell({255, 0, 0}, {0, 0, 255});
+        attrs.inverse = true;
+        attrs.overline = true;
+        fx.writeText(0, 0, " ", attrs);
+        Options options;
+        fx.composer->setOptions(&options);
+        ReferenceFixture renderer(*fx.composer);
+        TerminalUpdate update = fx.capture();
+        update.cursor.color = {0, 255, 0};
+        update.cursor.style = TerminalCursor::Style::filled_block;
+        const auto checkColors = [&](Color foreground) {
+            const ReferenceImage image = renderer->render(update);
+            STD_INSIST(image.pixels != nullptr);
+            STD_INSIST(cellPixel(image, 0, 0) == foreground);
+            STD_INSIST(cellPixel(image, 0, 1) == update.cursor.color);
+        };
+
+        checkColors({255, 0, 0});
+        options.cursorKeepSelectionFg = true;
+        checkColors({0, 0, 255});
+        attrs.inverse = false;
+        fx.writeText(0, 0, " ", attrs);
+        update = fx.capture();
+        update.cursor.color = {0, 255, 0};
+        update.cursor.style = TerminalCursor::Style::filled_block;
+        checkColors({0, 0, 255});
+    }
+
     STD_TEST(SelectionOfWideContinuationHighlightsWholeGlyph) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());

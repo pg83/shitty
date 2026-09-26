@@ -423,7 +423,8 @@ void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const Refer
     if ((source.inverse != 0) != update.screenReverse) {
         xchg(foreground, background);
     }
-    if (selected(update, source, column, row)) {
+    const bool selectedCell = selected(update, source, column, row);
+    if (selectedCell) {
         if (update.selectionColorMask == 0) {
             xchg(foreground, background);
         } else {
@@ -448,7 +449,9 @@ void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const Refer
     }
     const bool cursorHere = column == update.cursor.posX && row == update.cursor.posY && (!update.cursorBlink || update.blinkVisible);
     if (cursorHere && update.cursor.style == TerminalCursor::Style::filled_block) {
-        foreground = background;
+        if (!(selectedCell || source.inverse) || !composer_.opts->cursorKeepSelectionFg) {
+            foreground = background;
+        }
         background = cursor;
     }
 

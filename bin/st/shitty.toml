@@ -47,6 +47,9 @@ border = 2
 # CLI: -cr COLOR — Set the cursor RGB color; omit the key to use the foreground color.
 cr = "#88c0d0"
 
+# CLI: -cursorKeepSelectionFg / +cursorKeepSelectionFg — Keep selected or reverse-video text's foreground color under the block cursor.
+cursorKeepSelectionFg = false
+
 # CLI: -dump PATH — Write raw PTY input to PATH; normally omitted.
 # dump = "/tmp/shitty.pty"
 
