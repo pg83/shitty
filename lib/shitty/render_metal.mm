@@ -124,9 +124,10 @@ namespace {
         u32 hoveredLinkBegin;
         u32 hoveredLinkEnd;
         u32 updateCount;
+        u32 cursorKeepSelectionFg;
     };
 
-    static_assert(sizeof(PushConstants) == 116, "Metal push constant layout mismatch");
+    static_assert(sizeof(PushConstants) == 120, "Metal push constant layout mismatch");
 
     struct PresentationState {
         TerminalCursor cursor;
@@ -694,6 +695,7 @@ bool MetalRendererImpl::draw() {
         state.hoveredLinkBegin,
         state.hoveredLinkEnd,
         updateCount,
+        composer.opts->cursorKeepSelectionFg ? 1u : 0u,
     };
 
     // The spirv-cross assignment for this shader: push constants at

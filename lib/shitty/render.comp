@@ -77,6 +77,7 @@ layout (push_constant) uniform PushConstants
    uint hoveredLinkBegin;
    uint hoveredLinkEnd;
    uint updateCount;
+   uint cursorKeepSelectionFg;
 } parameters;
 
 vec3 unpackColor (uint color)
@@ -592,7 +593,8 @@ void main ()
       foreground = background;
       background = temporary;
    }
-   if (selected (cellPosition, doubleWidth))
+   bool selectedCell = selected (cellPosition, doubleWidth);
+   if (selectedCell)
    {
       if (parameters.selectionColorMask == 0)
       {
@@ -633,7 +635,8 @@ void main ()
       (parameters.cursorBlink == 0 || parameters.blinkVisible != 0);
    if (cursorHere && parameters.cursorStyle == 1)
    {
-      foreground = background;
+      if (!selectedCell || parameters.cursorKeepSelectionFg == 0)
+         foreground = background;
       background = cursor;
    }
 

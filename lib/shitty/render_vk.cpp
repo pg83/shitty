@@ -172,9 +172,10 @@ namespace {
             u32 hoveredLinkBegin;
             u32 hoveredLinkEnd;
             u32 updateCount;
+            u32 cursorKeepSelectionFg;
         };
 
-        static_assert(sizeof(PushConstants) == 116, "Vulkan push constant layout mismatch");
+        static_assert(sizeof(PushConstants) == 120, "Vulkan push constant layout mismatch");
 
         // The strip arenas mirrored on the device; append-only between
         // collections, so only the tail uploads each frame.
@@ -1793,6 +1794,7 @@ void RendererImpl::recordCommands(FrameResources& frame, u32 imageIndex, const P
             state.hoveredLinkBegin,
             state.hoveredLinkEnd,
             updateCount,
+            composer.opts->cursorKeepSelectionFg ? 1u : 0u,
         };
         vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &frame.descriptorSet, 0, nullptr);

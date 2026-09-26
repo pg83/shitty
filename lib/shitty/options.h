@@ -99,6 +99,7 @@ struct Options {
     bool titleFallbackProcess = false;
     bool optical = false;
     bool showWraps = false;
+    bool cursorKeepSelectionFg = false;
     bool rv = false;
 
     static Options* create(stl::ObjPool& pool, Brand& brand, char** argv, int argc, OptionsLoad load = OptionsLoad::Startup);
