@@ -635,7 +635,7 @@ void main ()
       (parameters.cursorBlink == 0 || parameters.blinkVisible != 0);
    if (cursorHere && parameters.cursorStyle == 1)
    {
-      if (!selectedCell || parameters.cursorKeepSelectionFg == 0)
+      if (!(selectedCell || inverse != 0) || parameters.cursorKeepSelectionFg == 0)
          foreground = background;
       background = cursor;
    }

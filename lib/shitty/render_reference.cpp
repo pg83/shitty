@@ -449,7 +449,7 @@ void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const Refer
     }
     const bool cursorHere = column == update.cursor.posX && row == update.cursor.posY && (!update.cursorBlink || update.blinkVisible);
     if (cursorHere && update.cursor.style == TerminalCursor::Style::filled_block) {
-        if (!selectedCell || !composer_.opts->cursorKeepSelectionFg) {
+        if (!(selectedCell || source.inverse) || !composer_.opts->cursorKeepSelectionFg) {
             foreground = background;
         }
         background = cursor;

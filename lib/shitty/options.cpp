@@ -89,7 +89,7 @@ namespace {
         {"config", OptionKind::SepArg, nullptr, nullptr, "Path to the TOML config file", true},
         {"colorScheme", OptionKind::SepArg, nullptr, "default", "Named terminal color scheme"},
         {"cr", OptionKind::SepArg, nullptr, nullptr, "Cursor color"},
-        {"cursorKeepSelectionFg", OptionKind::NoArg, "true", "false", "Keep selected text color under the block cursor"},
+        {"cursorKeepSelectionFg", OptionKind::NoArg, "true", "false", "Keep selected or reverse-video text color under the block cursor"},
         {"debug", OptionKind::SepArg, nullptr, nullptr, "Append window, font and grid diagnostics to this file", true},
         {"dump", OptionKind::SepArg, nullptr, nullptr, "Dump raw PTY input to file"},
         {"fg", OptionKind::SepArg, nullptr, "#fff", "Foreground color"},
