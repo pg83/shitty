@@ -61,6 +61,14 @@ namespace {
         void dropped(plt::Drop& drop) override;
 
         Composer& composer;
+        // S3: dropped() is handed no coordinates, so the last hover's are
+        // kept - both backends call dragOver() on entry and on every motion
+        // before ever settling a drop (platform_cocoa.mm:1835,
+        // platform_wayland.cpp:2254), in the same surface-pixel space the
+        // pointer events use.
+        i32 overX = 0;
+        i32 overY = 0;
+        bool haveOver = false;
     };
 }
 
@@ -69,7 +77,10 @@ VtermDropTarget::VtermDropTarget(Composer& composer_)
 {
 }
 
-plt::DropReply VtermDropTarget::dragOver(const plt::DropOffer& offer, i32, i32) {
+plt::DropReply VtermDropTarget::dragOver(const plt::DropOffer& offer, i32 x, i32 y) {
+    overX = x;
+    overY = y;
+    haveOver = true;
     return {
         .mime = preferredMime(offer),
         .action = plt::DropAction::Copy,
@@ -77,6 +88,10 @@ plt::DropReply VtermDropTarget::dragOver(const plt::DropOffer& offer, i32, i32) 
 }
 
 void VtermDropTarget::dragLeft() {
+    // The drag left the surface: the position it left from is not where a
+    // later drop lands, and a drop that follows without a hover of its own
+    // is better sent to the focused pane than to a remembered pixel.
+    haveOver = false;
 }
 
 void VtermDropTarget::dropped(plt::Drop& drop) {
@@ -88,7 +103,12 @@ void VtermDropTarget::dropped(plt::Drop& drop) {
     if (source.ptr == nullptr) {
         return;
     }
-    Vterm* const terminal = composer.sessions->activeTerminal();
+    // S3: the pane under the pointer, not the pane holding the focus. They
+    // were the same thing until a tab could hold more than one pane, and
+    // this file did not have to change for that to stop being true: a path
+    // quoted for the shell would go to whichever pane had the keyboard,
+    // which may be sitting at a sudo prompt or inside an ssh session.
+    Vterm* const terminal = haveOver ? composer.sessions->terminalAt(overX, overY) : composer.sessions->activeTerminal();
     if (mime == uriListMime) {
         terminal->dropUriList(*source.ptr);
     } else {

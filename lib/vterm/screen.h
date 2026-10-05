@@ -171,6 +171,9 @@ struct Screen {
     virtual void clearSelection() = 0;
     virtual bool selectedText(stl::Buffer& text) const = 0;
     virtual Point logicalPoint(Point point) const = 0;
+    // The selection as it will be copied - snapped to words or lines - in
+    // logical rows, the ones logicalPoint() answers in; empty for none.
+    virtual Rect logicalSelection() const = 0;
 
     void writeCodepoint(u16 row, u16 column, u32 codepoint, bool wide, const TerminalCell& attrs, u32 hyperlink, u32 semantic, const TerminalCell& eraseAttrs) {
         writeGrapheme(row, column, &codepoint, 1, wide, attrs, hyperlink, semantic, eraseAttrs);

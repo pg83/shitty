@@ -41,10 +41,17 @@ def main():
         "\n"
         "#include <cstddef>\n"
         "\n"
+        # Guarded by name and not by the file's own #pragma once: T8 made
+        # a second generated header (the embedded example config) that a
+        # single translation unit includes alongside the icon one, and
+        # two copies of the struct are a redefinition.
+        "#ifndef SHITTY_EMBEDDED_FONT_DATA\n"
+        "#define SHITTY_EMBEDDED_FONT_DATA\n"
         "struct EmbeddedFontData {\n"
         "    const unsigned char* data;\n"
         "    size_t size;\n"
         "};\n"
+        "#endif\n"
     ]
     for name, path in fonts:
         data = path.read_bytes()

@@ -226,6 +226,7 @@ namespace {
         void clearSelection() override;
         bool selectedText(Buffer& text) const override;
         Point logicalPoint(Point point) const override;
+        Rect logicalSelection() const override;
 
         Coord nCols = 0;
         Coord nRows = 0;
@@ -1903,6 +1904,17 @@ bool ScreenBase<Traits>::selectedText(Buffer& utf8_selection) const {
     }
 
     return true;
+}
+
+template <typename Traits>
+Rect ScreenBase<Traits>::logicalSelection() const {
+    Rect selected = snappedSelection();
+    if (selected.empty()) {
+        return {};
+    }
+    selected.tl.y -= viewOffset;
+    selected.br.y -= viewOffset;
+    return selected;
 }
 
 template <typename Traits>

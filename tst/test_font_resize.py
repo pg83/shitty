@@ -17,19 +17,17 @@ MOD_SHIFT = 1
 MOD_CONTROL = 2
 MOD_SUPER = 8
 
+# The chords that do *not* bind here - the half of this knowledge that
+# belongs to a test rather than to the harness. The harness presses what
+# works on this platform; this list asserts that the other platform's
+# chords do nothing on it.
 if TEST_PLATFORM == "cocoa":
-    FONT_INC = (KEY_EQUAL, None, MOD_SUPER)
-    FONT_DEC = (KEY_MINUS, None, MOD_SUPER)
-    FONT_RESET = (KEY_0, None, MOD_SUPER)
     INACTIVE_FONT_CHORDS = (
         (KEY_EQUAL, MOD_CONTROL | MOD_SHIFT),
         (KEY_MINUS, MOD_CONTROL),
         (KEY_0, MOD_CONTROL),
     )
 else:
-    FONT_INC = (KEY_EQUAL, "+", MOD_CONTROL | MOD_SHIFT)
-    FONT_DEC = (KEY_MINUS, "-", MOD_CONTROL)
-    FONT_RESET = (KEY_0, "0", MOD_CONTROL)
     INACTIVE_FONT_CHORDS = (
         (KEY_EQUAL, MOD_SUPER),
         (KEY_EQUAL, MOD_SUPER | MOD_SHIFT),
@@ -64,7 +62,7 @@ class FontResizeTest(unittest.TestCase):
             horizontal_padding = initial[3] - initial[5] * initial[1]
             vertical_padding = initial[4] - initial[6] * initial[2]
 
-            self.shortcut(terminal, *FONT_INC)
+            terminal.chord_font_increase()
             increased = terminal.font_state()
 
             self.assertEqual(increased[0], 17)
@@ -83,12 +81,12 @@ class FontResizeTest(unittest.TestCase):
             self.assertGreater(terminal.snapshot().refresh_count, before.refresh_count)
             self.assertEqual(terminal.select_finish(), b"one")
 
-            self.shortcut(terminal, *FONT_DEC)
+            terminal.chord_font_decrease()
             self.assertEqual(terminal.font_state()[0], 16)
-            self.shortcut(terminal, *FONT_INC)
-            self.shortcut(terminal, *FONT_INC)
+            terminal.chord_font_increase()
+            terminal.chord_font_increase()
             self.assertEqual(terminal.font_state()[0], 18)
-            self.shortcut(terminal, *FONT_RESET)
+            terminal.chord_font_reset()
             self.assertEqual(terminal.font_state()[0], 16)
             self.assertEqual(terminal.read_input(), b"")
 
@@ -135,7 +133,7 @@ class FontResizeTest(unittest.TestCase):
                     terminal.window_info(**state)
                     initial = terminal.font_state()
 
-                    self.shortcut(terminal, *FONT_INC)
+                    terminal.chord_font_increase()
                     increased = terminal.font_state()
 
                     self.assertEqual(increased[0], 17)
@@ -151,7 +149,7 @@ class FontResizeTest(unittest.TestCase):
                     )
                     self.assertEqual(terminal.winsize(), increased[5:7])
 
-                    self.shortcut(terminal, *FONT_DEC)
+                    terminal.chord_font_decrease()
                     restored = terminal.font_state()
                     self.assertEqual(restored[0], 16)
                     # The real fontpack replaced the test one, so the grid
@@ -178,7 +176,7 @@ class FontResizeTest(unittest.TestCase):
             terminal.write(b"visible contents")
             terminal.snapshot()
 
-            self.shortcut(terminal, *FONT_INC)
+            terminal.chord_font_increase()
 
             cells, spans = terminal.last_update()
             self.assertEqual(cells, 40 * 8)
@@ -197,14 +195,14 @@ class FontResizeTest(unittest.TestCase):
         ) as terminal:
             terminal.write(b"before resize")
             fresh = terminal.shape_generation()
-            self.shortcut(terminal, *FONT_INC)
+            terminal.chord_font_increase()
             heard = terminal.shape_generation()
             self.assertNotEqual(heard, fresh)
 
             terminal.resize(50, 10)
             terminal.write(b" after resize")
             resized = terminal.shape_generation()
-            self.shortcut(terminal, *FONT_INC)
+            terminal.chord_font_increase()
             self.assertNotEqual(terminal.shape_generation(), resized)
 
 

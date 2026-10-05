@@ -22,6 +22,30 @@ namespace {
                                isARepeat:NO
                                  keyCode:keyCode];
     }
+
+    // What the *currently selected* keyboard layout answers for a
+    // physical key, asked of Carbon directly rather than of the AppKit
+    // call under test - an independent second opinion, not a restatement
+    // of the implementation.
+    u32 activeLayoutLevel(unsigned short keyCode, UInt32 carbonModifiers) {
+        TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
+        if (source == nullptr) {
+            return 0;
+        }
+        u32 result = 0;
+        auto layoutData = (CFDataRef)(TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData));
+        if (layoutData != nullptr) {
+            const auto* layout = (const UCKeyboardLayout*)(CFDataGetBytePtr(layoutData));
+            UInt32 deadKeys = 0;
+            UniChar characters[4];
+            UniCharCount length = 0;
+            if (UCKeyTranslate(layout, keyCode, kUCKeyActionDisplay, carbonModifiers, LMGetKbdType(), kUCKeyTranslateNoDeadKeysBit, &deadKeys, 4, &length, characters) == noErr && length != 0) {
+                result = characters[0];
+            }
+        }
+        CFRelease(source);
+        return result;
+    }
 }
 
 STD_TEST_SUITE(PlatformCocoaWindow) {
@@ -144,8 +168,39 @@ STD_TEST_SUITE(PlatformCocoaKey) {
         }
     }
 
+    // -charactersByApplyingModifiers:, which the Shift path asks for both
+    // levels, re-derives them from the *currently selected* keyboard
+    // layout and ignores the strings a synthetic event carries. Hard
+    // coding 'a'/'A' therefore only held while the machine running the
+    // test happened to sit on a Latin layout, and failed outright on a
+    // Russian one, where kVK_ANSI_A answers CYRILLIC EF. The expectation
+    // comes from the same live layout instead, so what is asserted is
+    // the actual claim: level zero lands in layoutCodepoint and level
+    // one in shiftedCodepoint, on release as well as on press.
+    //
+    // Both levels are read for what they are, with no precondition on
+    // what they contain. Requiring them to be non-empty and to differ
+    // would have traded a Latin assumption for a cased-script one:
+    // Hebrew, Lao, KANA and 2-Set Hangul answer the same character at
+    // both levels, and Tibetan-QWERTY and Georgian-QWERTY answer nothing
+    // at level one - 28 of this machine's 251 installed layouts break one
+    // of those three requirements (R2-qa round 3, I12). An empty level is
+    // not a broken test either, it is the documented fallback: the Shift
+    // path keeps the event's own characters when the layout has nothing
+    // to offer, which is the second half of each expectation below.
+    //
+    // baseCodepoint stays literal on purpose - it comes from the
+    // ASCII-capable layout, which is Latin by definition, and the two
+    // sibling tests above pin it the same way.
     STD_TEST(ShiftedPrintableKeepsBothLayoutLevelsOnRelease) {
         @autoreleasepool {
+            const u32 unshifted = activeLayoutLevel(kVK_ANSI_A, 0);
+            const u32 shifted = activeLayoutLevel(kVK_ANSI_A, shiftKey >> 8);
+            // 'A' on both sides is what the synthetic event below carries
+            // as its own characters.
+            const u32 expectedLayout = unshifted != 0 ? unshifted : (u32)('A');
+            const u32 expectedShifted = shifted != 0 ? shifted : (u32)('A');
+
             NSEvent* const event = keyEvent(
                 @"A",
                 @"A",
@@ -156,8 +211,8 @@ STD_TEST_SUITE(PlatformCocoaKey) {
             STD_INSIST(input.key == InputKey::Printable);
             STD_INSIST(input.action == InputAction::Release);
             STD_INSIST((input.modifiers & InputShift) != 0);
-            STD_INSIST(input.layoutCodepoint == 'a');
-            STD_INSIST(input.shiftedCodepoint == 'A');
+            STD_INSIST(input.layoutCodepoint == expectedLayout);
+            STD_INSIST(input.shiftedCodepoint == expectedShifted);
             STD_INSIST(input.baseCodepoint == 'a');
         }
     }

@@ -19,6 +19,7 @@
 #include "toml.h"
 #include "brand.h"
 #include "darts.h"
+#include "quick_geometry.h"
 #include "terminal_colors.h"
 
 #include <lib/vterm/num.h>
@@ -60,6 +61,14 @@ namespace {
         // Options that only make sense on a command line stay out of the
         // config file.
         bool cliOnly = false;
+        // What to name when refusing a spelling that carries no value.
+        // The hard default is always legal and reads as a fair example
+        // for most options - -bg #000, -saveLines 500 - but where the
+        // default is also the inert mode it answers "how do I turn this
+        // on?" with "off". Spelling out the whole set instead stays
+        // neutral between -opt and +opt, and says exactly what the value
+        // parser says when it refuses an unknown name.
+        const char* valueNames = nullptr;
     };
 
     struct ResourceDesc {
@@ -70,31 +79,25 @@ namespace {
         bool hidden = false;
     };
 
-    // macOS sinks the active tab and the terminal into one well whose rim
-    // lives in the border: three points of material with the cut and the
-    // lit edge, the lip on the terminal's own side, two points of room.
-    #if defined(__APPLE__)
-        static const char* const defaultBorder = "6";
-    #else
-        static const char* const defaultBorder = "2";
-    #endif
-
     static const OptionDesc optionsTable[] = {
 
         {"altScroll", OptionKind::NoArg, "true", "false", "Alternate scroll mode"},
         {"autoCopy", OptionKind::NoArg, "true", "false", "Sync primary to clipboard"},
+        {"backgroundBlur", OptionKind::SepArg, nullptr, "glass", "What to put behind a translucent background: off, blur or glass; glass falls back to blur where the system has none, and none of them does anything while backgroundOpacity is 100", false, "off, blur or glass"},
+        {"backgroundOpacity", OptionKind::SepArg, nullptr, "60", "Opacity of the terminal background, 0..100; 100 is opaque, and only the background goes translucent - text, cursor, selection and the pane divider stay solid"},
         {"bg", OptionKind::SepArg, nullptr, "#000", "Background color"},
         {"boldColors", OptionKind::NoArg, "true", "false", "Brighten bold text's palette colors"},
-        {"border", OptionKind::SepArg, nullptr, defaultBorder, "Border width in pixels"},
+        {"border", OptionKind::SepArg, nullptr, "2", "Border width in pixels"},
         {"config", OptionKind::SepArg, nullptr, nullptr, "Path to the TOML config file", true},
-        {"colorScheme", OptionKind::SepArg, nullptr, "default", "Named terminal color scheme"},
+        {"colorScheme", OptionKind::SepArg, nullptr, "Catppuccin Mocha", "Named terminal color scheme"},
         {"cr", OptionKind::SepArg, nullptr, nullptr, "Cursor color"},
         {"cursorKeepSelectionFg", OptionKind::NoArg, "true", "false", "Keep selected or reverse-video text color under the block cursor"},
         {"debug", OptionKind::SepArg, nullptr, nullptr, "Append window, font and grid diagnostics to this file", true},
+        {"directory", OptionKind::SepArg, nullptr, nullptr, "Working directory for the shell; ~ and a leading ~/ mean the home directory. Unset, the shell inherits the launcher's directory, except a launcher's / - what launchd hands a bundled app - which becomes the home directory. A new tab starts where the active tab's foreground process is"},
         {"dump", OptionKind::SepArg, nullptr, nullptr, "Dump raw PTY input to file"},
         {"fg", OptionKind::SepArg, nullptr, "#fff", "Foreground color"},
         {"font", OptionKind::SepArg, nullptr, "monospace", "Font to use; repeat for fallbacks"},
-        {"fontsize", OptionKind::SepArg, nullptr, "16", "Font size"},
+        {"fontsize", OptionKind::SepArg, nullptr, "15", "Font size"},
         {"fullscreen", OptionKind::NoArg, "true", "false", "Start with the window fullscreen"},
         {"soft", OptionKind::SepArg, nullptr, "-1", "Unhinted subpixel rendering; 0..100 scales the stem darkening"},
         {"geometry", OptionKind::SepArg, nullptr, "80x24", "Terminal size in chars"},
@@ -104,20 +107,49 @@ namespace {
         {"help", OptionKind::NoArg, "true", "false", "Print usage listing and quit", true},
         {"listres", OptionKind::NoArg, "true", "false", "Print advanced option listing and quit", true},
         {"listColorSchemes", OptionKind::NoArg, "true", "false", "Print terminal color scheme names and quit", true},
+        {"printConfig", OptionKind::NoArg, "true", "false", "Print a config file carrying every option at its default, and quit; redirect it into the config path to start from the shipped configuration", true},
         {"login", OptionKind::NoArg, "true", "false", "Start shell as a login shell"},
         {"maximized", OptionKind::NoArg, "true", "false", "Start with the window maximized"},
-        {"naturalEditing", OptionKind::NoArg, "true", "false", "Bind the macOS natural text editing chords"},
+        {"naturalEditing", OptionKind::NoArg, "true", "true", "Bind the macOS natural text editing chords"},
+        {"promptEditor", OptionKind::NoArg, "true", "true", "Edit the command line at a shell prompt like a text field: click to place the cursor, select and delete, Cmd+A to select the command; needs the shell integration"},
+        {"shellIntegration", OptionKind::NoArg, "true", "true", "Load the terminal's zsh integration into zsh shells, which tells the terminal where each prompt's command line is"},
         {"no-decorations", OptionKind::NoArg, "true", "false", "Disable window decorations"},
         {"optical", OptionKind::NoArg, "true", "false", "Optically space simple Latin and Cyrillic runs"},
+        {"quick", OptionKind::NoArg, "true", "false", "Run as a quick-terminal window, hidden at startup and toggled by quickHotkey"},
+        {"quickHotkey", OptionKind::SepArg, nullptr, "ctrl+grave", "Chord that toggles the quick-terminal window"},
+        {"quickGeometry", OptionKind::SepArg, nullptr, "90%x75%+5%+10%", "Quick-terminal window size and position: <W>x<H>+<X>+<Y>, each pixels or a percent of the screen's usable area"},
+        {"quickCompanion", OptionKind::SepArg, nullptr, nullptr, "Path to a config file for a quick-terminal companion process this one spawns and manages; ignored when quick is true"},
+        {"quickCornerRadius", OptionKind::SepArg, nullptr, "12", "Quick-terminal window corner radius in points; 0 disables rounding"},
+        {"quickRememberFrame", OptionKind::NoArg, "true", "true", "Remember the quick-terminal window's manually set position and size across shows"},
+        {"quickFullscreenHotkey", OptionKind::SepArg, nullptr, nullptr, "Chord that toggles quick-terminal window fullscreen; empty disables it"},
+        {"tabBar", OptionKind::SepArg, nullptr, "sidebar", "Where the tab bar lives: top or sidebar"},
+        {"sidebarColor", OptionKind::SepArg, nullptr, nullptr, "Color of the sidebar tab list; defaults to a shade off the terminal background, and every other shade in the panel follows it. A color far from the background necessarily covers more of what shows through a translucent window"},
+        {"sidebarTabTint", OptionKind::SepArg, nullptr, "65", "How opaque the active tab's glass pill is, 0..100 on the same scale as backgroundOpacity; 100 is the terminal background flat, 0 is clear glass with the desktop straight through. Only -backgroundBlur glass draws that pill, so this does nothing under blur or off"},
+        {"sidebarWidth", OptionKind::SepArg, nullptr, "220", "Width of the sidebar tab list in points"},
+        {"layeredWindow", OptionKind::NoArg, "true", "true", "Draw the terminal as a rounded panel laid over the window's own surface, the sidebar tab list on the surface beneath it. macOS and Wayland, with -tabBar sidebar; the panel takes -bg and -backgroundOpacity, the surface -sidebarColor and -sidebarOpacity"},
+        {"sidebarOpacity", OptionKind::SepArg, nullptr, "55", "Opacity of the window surface under the terminal panel, 0..100, on the same scale as backgroundOpacity; only -layeredWindow has that surface"},
+        {"sidebarTabColor", OptionKind::SepArg, nullptr, nullptr, "Color of the active tab's highlight on the -layeredWindow surface; defaults to the terminal's foreground"},
+        {"sidebarTabOpacity", OptionKind::SepArg, nullptr, "16", "Opacity of the active tab's highlight on the -layeredWindow surface, 0..100; the hovered row takes half of it"},
+        {"panelGap", OptionKind::SepArg, nullptr, "8", "Space between the terminal panel and the window's edges, in points, 0..100; only -layeredWindow has a panel"},
+        {"panelRadius", OptionKind::SepArg, nullptr, "12", "Corner radius of the terminal panel in points, 0..100; only -layeredWindow has a panel"},
+        {"bookmarksFile", OptionKind::SepArg, nullptr, nullptr, "File of [[bookmark]] tables the sidebar lists above the tabs and pins into; defaults to bookmarks.toml beside the config file"},
+        {"cloneDirectory", OptionKind::SepArg, nullptr, "~/Projects", "Where the command palette's Clone Repository puts a repository, in a folder of its name"},
+        {"teleportLogin", OptionKind::SepArg, nullptr, nullptr, "Login the command palette puts before a Teleport host (tsh ssh LOGIN@host); unset, tsh picks"},
+        {"autoHideChrome", OptionKind::NoArg, "true", "true", "Hide the titlebar chrome and reveal it on mouse hover"},
+        {"panes", OptionKind::NoArg, "true", "true", "Allow splitting a tab's terminal into multiple panes"},
+        {"tabs", OptionKind::NoArg, "true", "true", "Allow more than one tab in a window; off, a window is a single shell, with no tab chords and no tab list"},
+        {"paneDividerColor", OptionKind::SepArg, nullptr, "#00cd00", "Color of the seam between panes. Needs -border above 0 to have anywhere to paint"},
+        {"paneDividerWidth", OptionKind::SepArg, nullptr, "1", "Thickness of the seam between panes, in pixels; painted into the air the panes' own borders leave, so it is clamped to twice -border and invisible when -border is 0"},
         {"remap", OptionKind::SepArg, nullptr, nullptr, "Rewrite a key chord, from=to; repeat for more"},
         {"rv", OptionKind::NoArg, "true", "false", "Reverse video"},
-        {"saveLines", OptionKind::SepArg, nullptr, "500", "Lines of scrollback history"},
+        {"saveLines", OptionKind::SepArg, nullptr, "50000", "Lines of scrollback history"},
         {"shell", OptionKind::SepArg, nullptr, nullptr, "Shell program to run"},
         {"showWraps", OptionKind::NoArg, "true", "false", "Show wrap marks at right margin"},
         {"title", OptionKind::SepArg, nullptr, nullptr, "Window title"},
         {"titleFallback", OptionKind::SepArg, nullptr, "process", "Title when the app sets none: process or none"},
+        {"transparentTitlebar", OptionKind::NoArg, "true", "true", "Make the titlebar's color match the terminal background"},
         {"unicodeWidths", OptionKind::SepArg, nullptr, "0", "Unicode version for character widths; 0 matches the system libc"},
-        {"uriScheme", OptionKind::SepArg, nullptr, nullptr, "Open a plain URI with this scheme; repeat for more, default http https file"},
+        {"uriScheme", OptionKind::SepArg, nullptr, nullptr, "Open a plain URI with this scheme; repeat for more, default http https file mailto gemini"},
         {"verbose", OptionKind::NoArg, "true", "false", "Output info messages"},
         {"version", OptionKind::NoArg, "true", "false", "Print version and quit", true},
         {"e", OptionKind::SkipLine, nullptr, nullptr, "Command line to run", true},
@@ -165,16 +197,26 @@ namespace {
         bool isAdvancedOption(StringView name) const;
         bool isConfigurableOption(StringView name) const;
         void getBorder(u16& outBorder);
+        void getBackgroundOpacity(u16& outOpacity);
+        void getPaneDividerWidth(u16& outWidth);
         void getSaveLines(u16& outSaveLines);
+        void getQuickCornerRadius(u16& outRadius);
+        void getSidebarTabTint(u8& outTint);
+        void getSidebarWidth(u16& outWidth);
+        void getPercent(const char* name, u8& outPercent);
+        void getPoints(const char* name, u16& outPoints);
         void getUnicodeWidths(UnicodeWidths& outWidths);
         void getFontsize(u8& outFontsize);
         void getSoft(i8& outSoft);
         void getGeometry(u16& outCols, u16& outRows);
+        void getQuickGeometry(plt::QuickGeometry& outGeometry);
         void printVersion() const;
+        void printConfig() const;
         void printUsage() const;
         void printResources() const;
         void printColorSchemes() const;
         bool getBool(const char* name, bool defaultValue = false);
+        void getBackdropMode(const char* name, BackdropMode& out);
         void getColor(const char* name, Color& outColor);
         int getInteger(const char* name, int min, int max);
         Vector<StringView>* configList(StringView name);
@@ -187,6 +229,8 @@ namespace {
         SymbolMap<StringView> configFile;
         Vector<StringView> configFonts;
         Vector<SymbolFontSpan> configSymbolFonts;
+        Vector<PaletteApp> configApps;
+        Vector<PaletteEnv> configEnvs;
         Vector<StringView> configRemaps;
         Vector<StringView> configUriSchemes;
         OptionsLoad load;
@@ -243,6 +287,18 @@ bool OptionsParser::isAdvancedOption(StringView name) const {
     return resourceTrie->find(name) >= 0;
 }
 
+stl::StringView backdropModeName(BackdropMode mode) {
+    switch (mode) {
+        case BackdropMode::Blur:
+            return StringView(u8"blur");
+        case BackdropMode::Glass:
+            return StringView(u8"glass");
+        case BackdropMode::Off:
+            break;
+    }
+    return StringView(u8"off");
+}
+
 bool OptionsParser::isConfigurableOption(StringView name) const {
     const i32 option = optionTrie->find(name);
     if (option >= 0) {
@@ -281,6 +337,22 @@ namespace {
         bool symbolFirstSet;
         bool symbolLastSet;
         bool symbolBroken;
+        // An [[app]] or [[env]] table being read: which, its fields, the
+        // key the next scalar is for, and whether this file has had one
+        // (its first drops the imported ones, as a list option does).
+        enum class Entry : u8 {
+            None,
+            App,
+            Env,
+        };
+        Entry entryOpen = Entry::None;
+        bool entryBroken = false;
+        bool appSeen = false;
+        bool envSeen = false;
+        Buffer entryKey;
+        PaletteApp app;
+        StringView envName;
+        Buffer envVariables;
 
         ConfigSink(OptionsParser& options, const char* path);
 
@@ -296,6 +368,8 @@ namespace {
         // Validates and commits the open [[symbolFont]] entry; called on
         // the next table header and once after the document ends.
         void finishSymbolEntry();
+        // The same for the open [[app]] or [[env]] entry.
+        void finishEntry();
 
         void warn(const char* what, StringView name);
     };
@@ -368,9 +442,58 @@ void ConfigSink::finishSymbolEntry() {
     options.configSymbolFonts.pushBack(entry);
 }
 
+void ConfigSink::finishEntry() {
+    const Entry entry = entryOpen;
+    const bool broken = entryBroken;
+    entryOpen = Entry::None;
+    entryBroken = false;
+    entryKey.reset();
+    if (entry == Entry::App) {
+        const PaletteApp made = app;
+        app = PaletteApp();
+        if (broken) {
+            return;
+        }
+        if (made.name.empty() || made.command.empty()) {
+            warn("app needs a name and a command", made.name);
+            return;
+        }
+        options.configApps.pushBack(made);
+    } else if (entry == Entry::Env) {
+        const StringView name = envName;
+        envName = StringView();
+        const StringView variables = options.pool.intern(StringView(envVariables));
+        envVariables.reset();
+        if (broken) {
+            return;
+        }
+        if (name.empty()) {
+            warn("env needs a name", StringView());
+            return;
+        }
+        options.configEnvs.pushBack(PaletteEnv{name, variables});
+    }
+}
+
 bool ConfigSink::tomlTable(const StringView* segments, size_t count, bool array) {
     finishSymbolEntry();
+    finishEntry();
     symbolOpen = false;
+    if (count == 1 && array && (segments[0] == StringView(u8"app") || segments[0] == StringView(u8"env"))) {
+        const bool isApp = segments[0] == StringView(u8"app");
+        bool& seen = isApp ? appSeen : envSeen;
+        if (!seen) {
+            seen = true;
+            if (isApp) {
+                options.configApps.clear();
+            } else {
+                options.configEnvs.clear();
+            }
+        }
+        entryOpen = isApp ? Entry::App : Entry::Env;
+        skippingTable = false;
+        return true;
+    }
     if (count == 1 && array && segments[0] == StringView(u8"symbolFont")) {
         if (!symbolSeen) {
             // This file speaks for the whole set: its first entry drops
@@ -396,6 +519,16 @@ bool ConfigSink::tomlTable(const StringView* segments, size_t count, bool array)
 
 bool ConfigSink::tomlKey(const StringView* segments, size_t count) {
     if (inlineDepth != 0) {
+        return true;
+    }
+    if (entryOpen != Entry::None) {
+        entryKey.reset();
+        if (count != 1) {
+            warn(entryOpen == Entry::App ? "app keys are plain keys" : "env keys are plain keys", segments[0]);
+            entryBroken = true;
+        } else {
+            entryKey.append(segments[0].data(), segments[0].length());
+        }
         return true;
     }
     if (symbolOpen) {
@@ -493,6 +626,38 @@ bool ConfigSink::tomlScalar(TomlType type, StringView text) {
     if (inlineDepth != 0) {
         return true;
     }
+    if (entryOpen != Entry::None) {
+        const StringView key(entryKey);
+        if (arrayDepth != 0 || type != TomlType::String) {
+            if (!entryBroken) {
+                warn(entryOpen == Entry::App ? "app values are strings" : "env values are strings", key);
+            }
+            entryBroken = true;
+            return true;
+        }
+        if (entryOpen == Entry::App) {
+            if (key == StringView(u8"name")) {
+                app.name = options.pool.intern(text);
+            } else if (key == StringView(u8"command")) {
+                app.command = options.pool.intern(text);
+            } else if (key == StringView(u8"dir")) {
+                app.directory = options.pool.intern(text);
+            } else {
+                warn("unknown app key", key);
+                entryBroken = true;
+            }
+        } else if (key == StringView(u8"name")) {
+            envName = options.pool.intern(text);
+        } else if (!key.empty()) {
+            // Every other key is a variable of the set.
+            envVariables.append(key.data(), key.length());
+            envVariables.append("=", 1);
+            envVariables.append(text.data(), text.length());
+            envVariables.append("\n", 1);
+        }
+        entryKey.reset();
+        return true;
+    }
     if (symbolOpen) {
         if (arrayDepth != 0) {
             if (!symbolBroken) {
@@ -548,6 +713,14 @@ bool ConfigSink::tomlScalar(TomlType type, StringView text) {
 }
 
 bool ConfigSink::tomlArrayBegin() {
+    if (entryOpen != Entry::None) {
+        if (arrayDepth == 0 && inlineDepth == 0 && !entryBroken) {
+            warn("app and env values are strings, not lists", StringView(entryKey));
+            entryBroken = true;
+        }
+        arrayDepth += 1;
+        return true;
+    }
     if (symbolOpen) {
         if (inlineDepth == 0 && arrayDepth == 0 && !symbolBroken) {
             warn("symbolFont values are scalars, not lists", StringView());
@@ -577,6 +750,14 @@ bool ConfigSink::tomlArrayEnd() {
 }
 
 bool ConfigSink::tomlInlineTableBegin() {
+    if (entryOpen != Entry::None) {
+        if (inlineDepth == 0 && !entryBroken) {
+            warn("app and env values are strings, not tables", StringView(entryKey));
+            entryBroken = true;
+        }
+        inlineDepth += 1;
+        return true;
+    }
     if (symbolOpen) {
         if (inlineDepth == 0 && !symbolBroken) {
             warn("symbolFont values are scalars, not tables", StringView());
@@ -740,6 +921,12 @@ void OptionsParser::loadConfigFile() {
             path << StringView(home) << StringView(u8"/.config/") << brand.identifier() << StringView(u8"/") << brand.identifier() << StringView(u8".toml");
         }
     }
+    // Recorded whether or not the file below actually exists:
+    // quick_companion.cpp's self-reference guard needs the path this
+    // process would read from even when -config named a file that is
+    // not there yet, and loadConfigFrom() below either loads it or
+    // raises.
+    configPath = pool.intern(StringView(path));
     loadConfigFrom(StringView(path), required, 0);
 }
 
@@ -804,6 +991,7 @@ void OptionsParser::loadConfigFrom(StringView path, bool required, int depth) {
     // The parser has no document-end event; the last [[symbolFont]]
     // entry is still open here.
     sink.finishSymbolEntry();
+    sink.finishEntry();
     if (load == OptionsLoad::Reload && configSyntaxError) {
         raiseError(StringView(u8"config reload: invalid TOML in "), path);
     }
@@ -829,6 +1017,11 @@ bool OptionsParser::get(const char* name, StringView& out, OptionSource* src) {
     const i32 option = optionTrie->find(StringView(name));
     if (option >= 0 && StringView(name) == StringView(u8"title")) {
         return withSource(OptionSource::HardDefault, brand.displayName());
+    }
+    if (option >= 0) {
+        if (const char* own = brand.defaultFor(StringView(name))) {
+            return withSource(OptionSource::HardDefault, StringView(own));
+        }
     }
     if (option >= 0 && optionsTable[option].hardDefault != nullptr) {
         return withSource(OptionSource::HardDefault, StringView(optionsTable[option].hardDefault));
@@ -864,6 +1057,24 @@ void OptionsParser::getBorder(u16& outBorder) {
     outBorder = (u16)(border);
 }
 
+void OptionsParser::getBackgroundOpacity(u16& outOpacity) {
+    StringView value;
+    long opacity = 0;
+    if (!get("backgroundOpacity", value) || !parseNumber(value, opacity) || opacity < 0 || opacity > 100) {
+        raiseError(StringView(u8"-backgroundOpacity: expected 0..100"));
+    }
+    outOpacity = (u16)(opacity);
+}
+
+void OptionsParser::getPaneDividerWidth(u16& outWidth) {
+    StringView value;
+    long width = 0;
+    if (!get("paneDividerWidth", value) || !parseNumber(value, width) || width < 0 || width > 3000) {
+        raiseError(StringView(u8"-paneDividerWidth: expected unsigned, max. 3000"));
+    }
+    outWidth = (u16)(width);
+}
+
 void OptionsParser::getSaveLines(u16& outSaveLines) {
     StringView value;
     long lines = 0;
@@ -871,6 +1082,53 @@ void OptionsParser::getSaveLines(u16& outSaveLines) {
         raiseError(StringView(u8"-saveLines: expected unsigned, max. 50000"));
     }
     outSaveLines = (u16)(lines);
+}
+
+void OptionsParser::getQuickCornerRadius(u16& outRadius) {
+    StringView value;
+    long radius = 0;
+    if (!get("quickCornerRadius", value) || !parseNumber(value, radius) || radius < 0 || radius > 1000) {
+        raiseError(StringView(u8"-quickCornerRadius: expected unsigned, max. 1000"));
+    }
+    outRadius = (u16)(radius);
+}
+
+void OptionsParser::getSidebarTabTint(u8& outTint) {
+    StringView value;
+    long tint = 0;
+    if (!get("sidebarTabTint", value) || !parseNumber(value, tint) || tint < 0 || tint > 100) {
+        raiseError(StringView(u8"-sidebarTabTint: expected 0..100"));
+    }
+    outTint = (u8)(tint);
+}
+
+void OptionsParser::getSidebarWidth(u16& outWidth) {
+    StringView value;
+    long width = 0;
+    if (!get("sidebarWidth", value) || !parseNumber(value, width) || width < 1 || width > 3000) {
+        raiseError(StringView(u8"-sidebarWidth: expected 1..3000"));
+    }
+    outWidth = (u16)(width);
+}
+
+// The two shapes the layered window's options come in. Named by the
+// option they are asked for, so the error says which one was wrong.
+void OptionsParser::getPercent(const char* name, u8& outPercent) {
+    StringView value;
+    long percent = 0;
+    if (!get(name, value) || !parseNumber(value, percent) || percent < 0 || percent > 100) {
+        raiseError(StringView(u8"-"), StringView(name), StringView(u8": expected 0..100"));
+    }
+    outPercent = (u8)(percent);
+}
+
+void OptionsParser::getPoints(const char* name, u16& outPoints) {
+    StringView value;
+    long points = 0;
+    if (!get(name, value) || !parseNumber(value, points) || points < 0 || points > 100) {
+        raiseError(StringView(u8"-"), StringView(name), StringView(u8": expected 0..100"));
+    }
+    outPoints = (u16)(points);
 }
 
 void OptionsParser::getUnicodeWidths(UnicodeWidths& outWidths) {
@@ -933,6 +1191,14 @@ void OptionsParser::getGeometry(u16& outCols, u16& outRows) {
     }
     outCols = (u16)(cols);
     outRows = (u16)(rows);
+}
+
+void OptionsParser::getQuickGeometry(plt::QuickGeometry& outGeometry) {
+    StringView value;
+    get("quickGeometry", value);
+    if (!parseQuickGeometry(value, outGeometry)) {
+        raiseError(StringView(u8"-quickGeometry: expected format <W>x<H>+<X>+<Y>, each a positive pixel count or a percent 0..100 (X/Y may be 0)"));
+    }
 }
 
 namespace {
@@ -1051,11 +1317,30 @@ void OptionsParser::initialize(int* argc, char** argv) {
                 commandLine.insert(StringView(option->option), StringView(enabled ? option->implValue : "false"));
                 break;
             case OptionKind::SepArg: {
+                // A form hint and not merely a complaint. -backgroundBlur
+                // grew a value, and every config and every finger that
+                // still spells it as a flag arrives in one of these two
+                // branches; naming the shape - and a value worth typing -
+                // is what turns the refusal into an instruction. An option
+                // that spells its set out takes that; for the rest the
+                // hard default is the example, being always legal.
+                const auto valueHint = [option](StringBuilder& hint) {
+                    hint << StringView(u8"; -") << StringView(option->option) << StringView(u8" takes a value");
+                    if (option->valueNames != nullptr) {
+                        hint << StringView(u8": ") << StringView(option->valueNames);
+                    } else if (option->hardDefault != nullptr) {
+                        hint << StringView(u8", as in -") << StringView(option->option) << StringView(u8" ") << StringView(option->hardDefault);
+                    }
+                };
                 if (!enabled) {
-                    raiseError(StringView(argument), StringView(u8": '+' is invalid here"));
+                    StringBuilder hint;
+                    valueHint(hint);
+                    raiseError(StringView(argument), StringView(u8": '+' is invalid here"), StringView(hint));
                 }
                 if (input + 1 >= *argc) {
-                    raiseError(StringView(argument), StringView(u8": missing value"));
+                    StringBuilder hint;
+                    valueHint(hint);
+                    raiseError(StringView(argument), StringView(u8": missing value"), StringView(hint));
                 }
                 const StringView value = pool.intern(StringView(argv[++input]));
                 commandLine.insert(StringView(option->option), value);
@@ -1102,6 +1387,36 @@ bool OptionsParser::getBool(const char* name, bool defaultValue) {
     raiseError(StringView(u8"-"), StringView(name), StringView(u8": expected true or false"));
 }
 
+void OptionsParser::getBackdropMode(const char* name, BackdropMode& out) {
+    StringView option;
+    // There is no "no value" case to answer here. When neither the command
+    // line nor the config names this option, get() hands back the table's
+    // hard default, and this option's is the legal name "off" - so it
+    // always comes back with something to read. The early exit that used
+    // to stand here could not run. Should the hard default ever go null,
+    // the empty name falls to the refusal at the end of this function
+    // instead of passing quietly as Off, which is the louder of the two.
+    (void)(get(name, option));
+    // 'true' and 'false' are what every config written while this was a
+    // flag still carries. Dropping them would turn a working config into
+    // a refusal to start - the one outcome the field's own comment block
+    // exists to avoid - so they stay as aliases of the two modes a flag
+    // could express.
+    if (option == StringView(u8"off") || option == StringView(u8"false")) {
+        out = BackdropMode::Off;
+        return;
+    }
+    if (option == StringView(u8"blur") || option == StringView(u8"true")) {
+        out = BackdropMode::Blur;
+        return;
+    }
+    if (option == StringView(u8"glass")) {
+        out = BackdropMode::Glass;
+        return;
+    }
+    raiseError(StringView(u8"-"), StringView(name), StringView(u8": expected off, blur or glass"));
+}
+
 void OptionsParser::getColor(const char* name, Color& outColor) {
     StringView option;
     if (!get(name, option)) {
@@ -1140,12 +1455,18 @@ void OptionsParser::handlePrintOpts() {
         printColorSchemes();
         exit(0);
     }
+    if (getBool("printConfig")) {
+        printConfig();
+        exit(0);
+    }
 }
 
 void OptionsParser::parse() {
     handlePrintOpts();
     try {
         getBorder(border);
+        getBackgroundOpacity(backgroundOpacity);
+        getPaneDividerWidth(paneDividerWidth);
         getSaveLines(vt.saveLines);
         getUnicodeWidths(vt.widths);
         if (fontnames.empty()) {
@@ -1157,6 +1478,8 @@ void OptionsParser::parse() {
             fontnames.pushBack(fallback);
         }
         symbolFonts.append(configSymbolFonts.data(), configSymbolFonts.length());
+        paletteApps.append(configApps.data(), configApps.length());
+        paletteEnvs.append(configEnvs.data(), configEnvs.length());
         if (remaps.empty()) {
             remaps.append(configRemaps.data(), configRemaps.length());
         }
@@ -1164,11 +1487,21 @@ void OptionsParser::parse() {
             uriSchemes.append(configUriSchemes.data(), configUriSchemes.length());
         }
         if (uriSchemes.empty()) {
-            // The conservative default: schemes with a handler on any sane
-            // desktop. A configured list replaces this outright.
+            // Schemes with a handler on any sane desktop. A configured
+            // list replaces this outright.
+            //
+            // The list lives here rather than in the table's hardDefault
+            // column because this option is list-shaped: get() hands
+            // back one scalar, and a hard default of "http https file
+            // mailto gemini" would arrive as a single scheme with spaces
+            // in it. The help text names the same five, and the
+            // example configs carry them commented out - keep the three
+            // in step.
             uriSchemes.pushBack(StringView(u8"http"));
             uriSchemes.pushBack(StringView(u8"https"));
             uriSchemes.pushBack(StringView(u8"file"));
+            uriSchemes.pushBack(StringView(u8"mailto"));
+            uriSchemes.pushBack(StringView(u8"gemini"));
         }
         {
             // The trie is queried with a lowercased probe, so fold the
@@ -1199,6 +1532,15 @@ void OptionsParser::parse() {
         if (shell.empty()) {
             shell = StringView(u8"bash");
         }
+        // Any string is a path and empty is "no directory named", the
+        // same shape as -shell above; whether it can be entered is the
+        // child's finding, at spawn, and never fatal.
+        get("directory", directory);
+        // A path like -directory; unset, bookmarks.toml beside the
+        // config (defaultBookmarksPath(), bookmarks.h).
+        get("bookmarksFile", bookmarksFile);
+        get("cloneDirectory", cloneDirectory);
+        get("teleportLogin", teleportLogin);
         get("title", vt.title, &titleSource);
         StringView titleFallback;
         get("titleFallback", titleFallback);
@@ -1262,8 +1604,38 @@ void OptionsParser::parse() {
         } else {
             vt.cr = vt.fg;
         }
+        // T8. Not cr's shape any more: the seam carries a hard default
+        // of its own, so it is the same colour under every scheme rather
+        // than the palette's bright black under each. A seam is a
+        // deliberate accent - it has to be found by the eye and aimed at
+        // by the mouse - and a per-scheme grey is exactly the thing that
+        // disappears into some of them.
+        //
+        // An explicit value still wins, and needs no branch to do so:
+        // get() reaches the table's hard default only after the command
+        // line and the config file have both missed.
+        StringView divider;
+        (void)(get("paneDividerColor", divider));
+        convColor("paneDividerColor", divider, paneDividerColor);
+        // C10. Same shape as the divider above, with one difference that
+        // decides the whole option: there is no default to resolve here.
+        //
+        // The panel's own default is six percent of the foreground mixed
+        // into the background, and that mix is done by AppKit, in sRGB,
+        // by NSColor. Computing it here in integers would land a byte or
+        // two off it - which is to say the default would change, on a
+        // fork whose upstream has no such option at all. So the flag
+        // says whether anyone asked, and an unasked sidebar takes the
+        // path it took before this option existed, unchanged.
+        StringView sidebar;
+        sidebarColorSet = get("sidebarColor", sidebar);
+        if (sidebarColorSet) {
+            convColor("sidebarColor", sidebar, sidebarColor);
+        }
         vt.altScrollMode = getBool("altScroll");
         naturalEditing = getBool("naturalEditing");
+        vt.promptEditor = getBool("promptEditor");
+        shellIntegration = getBool("shellIntegration");
         vt.altSendsEscape = getBool("altSendsEscape");
         vt.autoCopyMode = getBool("autoCopy");
         vt.allowOsc52Read = getBool("allowOsc52Read");
@@ -1286,9 +1658,77 @@ void OptionsParser::parse() {
         login = getBool("login") || (loginSource == OptionSource::HardDefault && desktopLaunch);
         maximized = getBool("maximized");
         fullscreen = getBool("fullscreen");
+        quick = getBool("quick");
+        {
+            StringView hotkey;
+            get("quickHotkey", hotkey);
+            if (hotkey.empty()) {
+                raiseError(StringView(u8"-quickHotkey: expected a non-empty chord"));
+            }
+            quickHotkey = hotkey;
+        }
+        getQuickGeometry(quickGeometry);
+        // No format to validate here - any non-empty string is a path -
+        // and no error on empty: that is simply "no companion", the
+        // same shape as -dump/-shell/-title above.
+        get("quickCompanion", quickCompanion);
+        getQuickCornerRadius(quickCornerRadius);
+        quickRememberFrame = getBool("quickRememberFrame");
+        // Same shape as quickCompanion above: any string is a chord, empty
+        // means disabled, chord grammar is validated where it is parsed.
+        get("quickFullscreenHotkey", quickFullscreenHotkey);
+        // Two named placements rather than a boolean feature switch: the
+        // question a reader has is "where do the tabs live", and "top"
+        // is an answer where "false" was a riddle. Same shape as
+        // osc52Select above - the names are checked here and stored as
+        // the one bit the chrome modules actually branch on.
+        StringView tabBar;
+        get("tabBar", tabBar);
+        if (tabBar != StringView(u8"top") && tabBar != StringView(u8"sidebar")) {
+            raiseError(StringView(u8"-tabBar: expected top or sidebar"));
+        }
+        tabs = getBool("tabs");
+        // No tabs, no list of them: the sidebar, its chord and the window
+        // chrome drawn around it all hang off this one bit.
+        sidebarTabs = tabs && tabBar == StringView(u8"sidebar");
+        getSidebarWidth(sidebarWidth);
+        getSidebarTabTint(sidebarTabTint);
+        layeredWindow = getBool("layeredWindow");
+        getPercent("sidebarOpacity", sidebarOpacity);
+        // Same shape as sidebarColor above: unset is an absence, and the
+        // highlight then follows the foreground through a theme change.
+        StringView tabColor;
+        sidebarTabColorSet = get("sidebarTabColor", tabColor);
+        if (sidebarTabColorSet) {
+            convColor("sidebarTabColor", tabColor, sidebarTabColor);
+        }
+        getPercent("sidebarTabOpacity", sidebarTabOpacity);
+        getPoints("panelGap", panelGap);
+        getPoints("panelRadius", panelRadius);
+        autoHideChrome = getBool("autoHideChrome");
+        panes = getBool("panes");
         showWraps = getBool("showWraps");
         cursorKeepSelectionFg = getBool("cursorKeepSelectionFg");
         vt.verbose = getBool("verbose");
+        getBackdropMode("backgroundBlur", backgroundBlur);
+        // F10. An opaque background hides the backdrop completely,
+        // whichever mode asked for it, so none is created - the same
+        // shape README.md
+        // gives for the quick-window options that do not apply. What
+        // the acceptance found missing was not the behaviour but the
+        // silence: the user turns the backdrop on, sees nothing change,
+        // and has nothing to go on. One line, and it names the option to
+        // reach for rather than merely reporting that something was
+        // ignored.
+        //
+        // A warning and not an error, for the reason backgroundOpacity's
+        // own comment gives: that option is reloadable, and a config
+        // legal at one of its values and fatal at another turns a
+        // one-line edit into a refusal to start.
+        if (backgroundBlur != BackdropMode::Off && backgroundOpacity == 100) {
+            sysE << brand.identifier() << StringView(u8": -backgroundBlur has nothing to show while -backgroundOpacity is 100; lower -backgroundOpacity to let the desktop show through") << endL;
+        }
+        transparentTitlebar = getBool("transparentTitlebar");
         vt.modifyOtherKeys = getInteger("modifyOtherKeys", 0, 2);
     } catch (Exception& error) {
         if (load == OptionsLoad::Startup) {
@@ -1300,6 +1740,32 @@ void OptionsParser::parse() {
 
 void OptionsParser::printVersion() const {
     sysO << brand.displayName() << StringView(u8" " SHITTY_VERSION "\nCopyright (C) 2026 ") << brand.displayName() << StringView(u8" team") << endL;
+}
+
+// T8. The brand's own example config, embedded at build time and
+// written back out unchanged.
+//
+// Generating this from optionsTable instead was the other candidate and
+// is the wrong one, because the table is not where the effective
+// defaults are. bg and fg carry hard defaults of "#000" and "#fff" that
+// nothing ever uses - a named colorScheme outranks them, and one is
+// always in force; cr and the sixteen palette slots have no hard default
+// at all and follow the scheme too; uriScheme is a list, which the
+// column cannot hold. A generator reading the table would print four of
+// those wrong and say nothing.
+//
+// The example config, by contrast, is the artifact that already has to
+// be right: tst/test_config.py starts the terminal on it, compares it
+// against -help, and holds the two brands' copies to each other. Making
+// it the source means -printConfig cannot drift from what ships, and
+// that a file the user writes with it is the file the tests exercise.
+void OptionsParser::printConfig() const {
+    // Empty only for the generic brand, which ships no config file and
+    // is never the one running a command line. Writing nothing is then
+    // the honest answer rather than someone else's brand.
+    const StringView config = brand.exampleConfig();
+    OutBuf output(stdoutStream());
+    output << config;
 }
 
 void OptionsParser::printUsage() const {
@@ -1318,10 +1784,24 @@ void OptionsParser::printUsage() const {
         StringView hardDefault;
         if (name == StringView(u8"title")) {
             hardDefault = brand.displayName();
+        } else if (const char* own = brand.defaultFor(name)) {
+            hardDefault = StringView(own);
         } else if (option.hardDefault != nullptr) {
             hardDefault = StringView(option.hardDefault);
         }
-        if (!hardDefault.empty() && option.parseType != OptionKind::NoArg) {
+        // T8. Boolean options print their default too, which they did
+        // not before. The old silence carried no information while every
+        // NoArg default was false; now that five of them are true, "is
+        // -panes already on?" is a question the listing has to answer,
+        // and +panes is the spelling that turns it off.
+        //
+        // The exception is the NoArg options that are actions rather
+        // than settings - -help, -version, -listres and their kin. They
+        // are cliOnly, never appear in a config file, and "(default:
+        // false)" beside -help would be noise about a switch nobody
+        // holds.
+        const bool actionFlag = option.parseType == OptionKind::NoArg && option.cliOnly;
+        if (!hardDefault.empty() && !actionFlag) {
             output << StringView(u8" (default: ") << hardDefault << StringView(u8")");
         }
         output << endL;

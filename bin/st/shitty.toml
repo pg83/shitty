@@ -15,8 +15,30 @@ altScroll = false
 # CLI: -autoCopy / +autoCopy — Copy the primary selection to the clipboard automatically.
 autoCopy = false
 
+# CLI: -backgroundBlur MODE — Put a backdrop behind what shows through a translucent background.
+# One of "off", "blur" or "glass". "blur" is the frosted backdrop; "glass"
+# is the macOS 26 system glass and falls back to "blur" where the system
+# has none. The older spellings true and false still read as "blur" and
+# "off". Does nothing while backgroundOpacity is 100: an opaque background
+# hides the backdrop completely, so none is created. macOS only.
+backgroundBlur = "glass"
+
+# CLI: -backgroundOpacity PERCENT — Set how opaque the terminal background is, from 0 to 100.
+# 100 is the solid window this terminal drew before it could do anything
+# else; 60, the default, lets the backdrop above show through.
+# Only the background goes translucent - text, the cursor, a selection
+# and the pane divider stay solid. Applied to the window when it is
+# created: turning it on in a running terminal needs a restart, while
+# changing it on a window that already started translucent takes effect
+# on the next config reload. macOS only: the Vulkan backend leaves the
+# background solid at every value, see "Known limits" in the README.
+backgroundOpacity = 60
+
 # CLI: -bg COLOR — Set the default background to a three- or six-digit RGB color.
-bg = "#2e3440"
+# Commented out, like fg, cr and the palette below: unset, they come from
+# colorScheme, so changing that one key restyles the whole terminal.
+# Uncommenting any of them pins it against every scheme.
+# bg = "#1e1e2e"
 
 # CLI: -boldColors / +boldColors — Use bright palette colors for bold text.
 # Off by default: a themed palette expects bold to change only the
@@ -24,9 +46,6 @@ bg = "#2e3440"
 boldColors = false
 
 # CLI: -border PIXELS — Set the empty border around the terminal grid, from 0 to 3000 pixels.
-# On macOS the title-bar tab strip sinks the active tab and the terminal into one
-# well edged along this border, so it defaults to 6 there: 4 still shows the full
-# rim, 1 leaves only the inner lip.
 border = 2
 
 # CLI: -config PATH — Load PATH instead of the default config file; command line only.
@@ -38,14 +57,25 @@ border = 2
 # import = ["themes/seoul256_light.toml"]
 
 # CLI: -colorScheme NAME — Use a built-in terminal color scheme as the base for foreground, background, and ANSI colors 0 through 15.
-# Run `st -listColorSchemes` to print all available names. The built-in
-# "default" is Retro Legends on pure black; "classic" restores the xterm
-# look. Explicit fg, bg, and colorN values at the same or higher-priority
-# source override the scheme.
-# colorScheme = "3024 Night"
+# Run `st -listColorSchemes` to print all available names. "Catppuccin
+# Mocha", set below, is the default; the built-in "default" is Retro
+# Legends on pure black, and "classic" restores the xterm look. Explicit
+# fg, bg, and colorN values at the same or higher-priority source
+# override the scheme, which is why this file leaves all of them
+# commented out.
+colorScheme = "Catppuccin Mocha"
 
 # CLI: -cr COLOR — Set the cursor RGB color; omit the key to use the foreground color.
-cr = "#88c0d0"
+# cr = "#89b4fa"
+
+# CLI: -directory PATH — Start the shell in PATH; ~ and a leading ~/ mean the home directory.
+# Unset, the shell inherits the directory the terminal was launched from,
+# except a launcher's / - what launchd hands a bundled app - which becomes
+# the home directory. A new tab or pane starts where the active tab's
+# foreground process is, and comes back to this rule only when that
+# cannot be read. A directory that cannot be entered is reported in the
+# terminal and the shell starts where it would have anyway.
+# directory = "~/src"
 
 # CLI: -cursorKeepSelectionFg / +cursorKeepSelectionFg — Keep selected or reverse-video text's foreground color under the block cursor.
 cursorKeepSelectionFg = false
@@ -54,7 +84,7 @@ cursorKeepSelectionFg = false
 # dump = "/tmp/shitty.pty"
 
 # CLI: -fg COLOR — Set the default foreground to a three- or six-digit RGB color.
-fg = "#d8dee9"
+# fg = "#cdd6f4"
 
 # CLI: -font FAMILY — Set the font family or file; repeat on the CLI or use a list for fallbacks.
 font = ["monospace"]
@@ -80,6 +110,11 @@ kittyCtrlBaseLayout = false
 
 # CLI: -listColorSchemes — Print all built-in terminal color scheme names and exit; command line only.
 
+# CLI: -printConfig — Print this file, every option at its default, and exit; command line only.
+# `st -printConfig > ~/.config/shitty/shitty.toml` starts a config from the
+# shipped one. What it prints is this file verbatim, embedded in the binary
+# at build time, so it cannot drift from the defaults the tests check.
+
 # CLI: -login / +login — Start the selected shell as a login shell.
 login = false
 
@@ -90,14 +125,149 @@ maximized = false
 # Fullscreen wins when both this and maximized are set.
 fullscreen = false
 
-# CLI: -naturalEditing / +naturalEditing — Bind the macOS natural text editing chords: Option arrows move by word, Command arrows to the line ends, Option/Command Backspace erase the word or line. Off by default: the Command arrows stay reserved for tab navigation.
-naturalEditing = false
+# CLI: -naturalEditing / +naturalEditing — Bind the macOS natural text editing chords: Option arrows move by word, Command arrows to the line ends, Option/Command Backspace erase the word or line. On by default; turning it off returns the Command arrows to tab navigation.
+naturalEditing = true
+
+# CLI: -promptEditor / +promptEditor — Edit the command line at a shell prompt like a text field: click to place the cursor, select and delete, Cmd+A to select the command. zsh keeps the line - Tab, history and plugins work as ever - so it needs shellIntegration.
+promptEditor = true
+
+# CLI: -shellIntegration / +shellIntegration — Load the terminal's zsh integration into zsh shells: it marks where each prompt's command line starts and keeps the terminal told what is in it. Your .zshenv and .zshrc are read as ever.
+shellIntegration = true
 
 # CLI: -no-decorations / +no-decorations — Disable or enable native window decorations.
-no-decorations = false
+# The default differs by binary on Linux: st is one bare shell to a window
+# (no title bar, tabs or panes; a tiling window manager arranges the windows),
+# pt has all of them. On macOS both have them. Uncomment to choose yourself.
+# no-decorations = false
 
 # CLI: -optical / +optical — Optically space simple Latin and Cyrillic runs inside the glyph cell.
 optical = false
+
+# CLI: -quick / +quick — Run as a quick-terminal window: hidden at startup, shown and hidden by the quickHotkey chord instead of appearing on launch.
+quick = false
+
+# CLI: -quickHotkey CHORD — Set the global chord that shows and hides the quick-terminal window when quick is enabled.
+quickHotkey = "ctrl+grave"
+
+# CLI: -quickGeometry <W>x<H>+<X>+<Y> — Set the quick-terminal window's size and position; each of W, H, X, Y is pixels or a percent of the screen's usable area, and X/Y offset from its top-left corner.
+quickGeometry = "90%x75%+5%+10%"
+
+# CLI: -quickCompanion PATH — Set a config file for a quick-terminal companion process this one spawns and manages; ignored when quick is true.
+# A normal terminal started with this set also spawns PATH's own quick
+# window as a second process, and kills it again on exit. PATH would
+# typically import this file to inherit its colors and fonts, and set
+# quick = true - but must not also set quickCompanion itself, since that
+# would try to spawn a companion of its own; quick = true always skips
+# it, precisely to make that safe.
+# quickCompanion = "~/.config/shitty/quick.toml"
+
+# CLI: -quickCornerRadius POINTS — Set the quick-terminal window's corner radius in points; 0 disables rounding.
+quickCornerRadius = 12
+
+# CLI: -quickRememberFrame / +quickRememberFrame — Remember the quick-terminal window's manually set position and size across shows.
+# State is kept beside the config file actually in use and named after
+# it: this file saves into shitty-quick-frame, while -config myconf.toml
+# saves into myconf-quick-frame, each in its own directory. Delete that
+# file to forget the saved frame and fall back to quickGeometry; a file
+# left by an older build is ignored the same way, the frame now being
+# stored in points rather than pixels.
+quickRememberFrame = true
+
+# CLI: -quickFullscreenHotkey CHORD — Set the chord that toggles quick-terminal window fullscreen; empty disables it.
+# quickFullscreenHotkey = "cmd+f"
+
+# CLI: -tabs / +tabs — Allow more than one tab in a window. Off, a window is a single
+# shell: the tab chords reach the program inside and there is no tab list.
+# The default differs by binary on Linux: st is one bare shell to a window
+# (no title bar, tabs or panes; a tiling window manager arranges the windows),
+# pt has all of them. On macOS both have them. Uncomment to choose yourself.
+# tabs = true
+
+# CLI: -tabBar top|sidebar — Choose where the tab bar lives: a strip along the top, or
+# a vertical list down the window's right edge.
+tabBar = "sidebar"
+
+# CLI: -sidebarColor COLOR — Set the sidebar tab list's color. Unset, the panel is a
+# shade off the terminal background and follows it through a theme change, which is
+# why there is no default written here. Every other shade in the panel - the
+# separator, the active and hovered rows, the text - is mixed from this color, so the
+# panel stays consistent with itself. On a translucent window a color close to the
+# background stays as see-through as the terminal; one far from it necessarily
+# covers more of what shows through.
+# sidebarColor = "#363c4a"
+
+# CLI: -sidebarWidth POINTS — Set the sidebar tab list's width in points.
+sidebarWidth = 220
+
+# CLI: -sidebarTabTint PERCENT — Set how opaque the active tab's pill is, 0 to 100, on
+# the same scale as `backgroundOpacity`: 100 paints it the terminal background flat,
+# 0 leaves it clear glass with the desktop straight through. Only `backgroundBlur =
+# "glass"` draws that pill, so this does nothing under blur or off. The default reads
+# the active title against the pill at better than 4.5:1 over both a dark and a light
+# desktop; lower it for more of the desktop, raise it for more contrast.
+sidebarTabTint = 65
+
+# CLI: -layeredWindow / +layeredWindow — Draw the terminal as a rounded panel laid over
+# the window's own surface, with the sidebar tab list on the surface beneath it. Both
+# are glass under `backgroundBlur = "glass"`. The panel takes its color from `bg` (or
+# `colorScheme`) and its opacity from `backgroundOpacity`; the surface takes
+# `sidebarColor` and `sidebarOpacity`. macOS and Wayland, with `tabBar = "sidebar"`.
+layeredWindow = true
+
+# CLI: -sidebarOpacity PERCENT — Set how opaque the window surface under the terminal
+# panel is, 0 to 100, on the same scale as `backgroundOpacity`. Only `layeredWindow`
+# has that surface.
+sidebarOpacity = 55
+
+# CLI: -sidebarTabColor COLOR — Set the color of the active tab's highlight on the
+# `layeredWindow` surface. Unset, it is the terminal's foreground, so it follows a
+# theme change.
+# sidebarTabColor = "#ffffff"
+
+# CLI: -sidebarTabOpacity PERCENT — Set how opaque the active tab's highlight is on the
+# `layeredWindow` surface, 0 to 100. The hovered row takes half of it.
+sidebarTabOpacity = 16
+
+# CLI: -panelGap POINTS — Set the space between the terminal panel and the window's
+# edges, 0 to 100 points. On the side the sidebar holds, the panel meets the sidebar
+# instead.
+panelGap = 8
+
+# CLI: -panelRadius POINTS — Set the corner radius of the terminal panel, 0 to 100
+# points.
+panelRadius = 12
+
+# CLI: -bookmarksFile PATH — Read bookmarks from PATH instead of bookmarks.toml beside
+# this file. The file holds only [[bookmark]] tables (title, command, dir, folder); the
+# sidebar lists them above the tabs, and pinning a tab from the sidebar appends one.
+# bookmarksFile = "~/.config/bookmarks.toml"
+
+# CLI: -cloneDirectory PATH — Where the command palette's Clone Repository puts a
+# repository, in a folder named after it.
+# cloneDirectory = "~/Projects"
+
+# CLI: -teleportLogin LOGIN — The login the command palette puts before a Teleport
+# host (tsh ssh LOGIN@host); unset, tsh uses its own.
+# teleportLogin = "root"
+
+# CLI: -autoHideChrome / +autoHideChrome — Hide the titlebar chrome and reveal it on mouse hover.
+autoHideChrome = true
+
+# CLI: -panes / +panes — Allow splitting a tab's terminal into multiple panes.
+# The default differs by binary on Linux: st is one bare shell to a window
+# (no title bar, tabs or panes; a tiling window manager arranges the windows),
+# pt has all of them. On macOS both have them. Uncomment to choose yourself.
+# panes = true
+
+# CLI: -paneDividerWidth PIXELS — Set the thickness of the seam between panes, from 0
+# to 3000 pixels. The seam is painted into the air the panes' own borders already
+# leave, so it is clamped to twice `border` and is invisible when `border` is 0.
+paneDividerWidth = 1
+
+# CLI: -paneDividerColor COLOR — Set the seam's color. The default is the same green
+# under every scheme rather than a shade of each: a seam has to be found by the eye
+# and aimed at by the mouse. Needs `border` above 0 to have anywhere to paint.
+paneDividerColor = "#00cd00"
 
 # CLI: -remap FROM=TO — Rewrite a key chord into another one; repeat the flag for more rules.
 # A chord is modifiers (ctrl, alt, shift, super) joined with + around one
@@ -109,7 +279,7 @@ optical = false
 rv = false
 
 # CLI: -saveLines LINES — Keep this many scrollback lines, from 0 to 50000.
-saveLines = 500
+saveLines = 50000
 
 # CLI: -shell PATH — Use PATH as the shell when no command is provided; normally inherited from SHELL.
 # shell = "/bin/sh"
@@ -126,6 +296,9 @@ title = "Shitty"
 # the classic xterm behavior where only escape sequences touch the title.
 titleFallback = "process"
 
+# CLI: -transparentTitlebar / +transparentTitlebar — Make the titlebar's color match the terminal background.
+transparentTitlebar = true
+
 # CLI: -unicodeWidths VERSION — Emulate this Unicode major version's character
 # widths. The default 0 probes the system libc and matches it, so local shells
 # measure their lines the same way the terminal draws them; pin a version when
@@ -134,8 +307,9 @@ titleFallback = "process"
 unicodeWidths = 0
 
 # CLI: -uriScheme SCHEME — Treat a detected plain URI with this scheme as openable; repeat the flag for more.
-# The default list is http, https, file; a configured list replaces it
-# outright, so repeat the defaults if you only mean to extend them.
+# The default list is http, https, file, mailto, gemini; a configured list
+# replaces it outright, so repeat the defaults if you only mean to extend
+# them.
 # Explicit OSC 8 hyperlinks ignore this list. To enumerate the schemes
 # your desktop actually handles:
 #   grep -ho 'x-scheme-handler/[a-z0-9.+-]*' \
@@ -168,53 +342,58 @@ allowWindowOps = false
 # CLI: -osc52Select NAME — Use "primary" or "clipboard" for OSC 52 selector `s`.
 osc52Select = "primary"
 
+# The sixteen ANSI slots. Commented out for the reason bg and fg are:
+# unset, they come from colorScheme. Each is shown at the value the
+# default scheme gives it, so uncommenting one changes nothing until
+# you edit it.
+
 # CLI: -color0 COLOR — Set palette color 0 (black).
-color0 = "#000000"
+# color0 = "#45475a"
 
 # CLI: -color1 COLOR — Set palette color 1 (red).
-color1 = "#cd0000"
+# color1 = "#f38ba8"
 
 # CLI: -color2 COLOR — Set palette color 2 (green).
-color2 = "#00cd00"
+# color2 = "#a6e3a1"
 
 # CLI: -color3 COLOR — Set palette color 3 (yellow).
-color3 = "#cdcd00"
+# color3 = "#f9e2af"
 
 # CLI: -color4 COLOR — Set palette color 4 (blue).
-color4 = "#0000ee"
+# color4 = "#89b4fa"
 
 # CLI: -color5 COLOR — Set palette color 5 (magenta).
-color5 = "#cd00cd"
+# color5 = "#f5c2e7"
 
 # CLI: -color6 COLOR — Set palette color 6 (cyan).
-color6 = "#00cdcd"
+# color6 = "#94e2d5"
 
 # CLI: -color7 COLOR — Set palette color 7 (light gray).
-color7 = "#e5e5e5"
+# color7 = "#bac2de"
 
 # CLI: -color8 COLOR — Set palette color 8 (dark gray).
-color8 = "#7f7f7f"
+# color8 = "#585b70"
 
 # CLI: -color9 COLOR — Set palette color 9 (bright red).
-color9 = "#ff0000"
+# color9 = "#f7aec2"
 
 # CLI: -color10 COLOR — Set palette color 10 (bright green).
-color10 = "#00ff00"
+# color10 = "#c2ecbf"
 
 # CLI: -color11 COLOR — Set palette color 11 (bright yellow).
-color11 = "#ffff00"
+# color11 = "#fcd682"
 
 # CLI: -color12 COLOR — Set palette color 12 (bright blue).
-color12 = "#5c5cff"
+# color12 = "#aeccfc"
 
 # CLI: -color13 COLOR — Set palette color 13 (bright magenta).
-color13 = "#ff00ff"
+# color13 = "#f398da"
 
 # CLI: -color14 COLOR — Set palette color 14 (bright cyan).
-color14 = "#00ffff"
+# color14 = "#b1eae1"
 
 # CLI: -color15 COLOR — Set palette color 15 (bright white).
-color15 = "#ffffff"
+# color15 = "#a6adc8"
 
 # symbolFont — Give a font priority over the fallback chain inside a
 # codepoint range. Configuration file only; there is no command-line
@@ -233,3 +412,25 @@ color15 = "#ffffff"
 # font = "Noto Sans Symbols 2"
 # first = 0x2600
 # last = 0x27BF
+
+# app — A program the command palette (Cmd+K; Ctrl+Shift+K in pt on Linux)
+# opens by name, in a new tab or in the current shell. Each
+# [[app]] table has a name, the command the shell runs and, optionally,
+# the directory it starts in.
+#
+# [[app]]
+# name = "lazygit"
+# command = "lazygit"
+#
+# [[app]]
+# name = "htop on prod"
+# command = "ssh -t prod htop"
+
+# env — A named set of environment variables the command palette opens a
+# tab with, or exports into the current shell. Each [[env]] table has a
+# name; every other key in it is a variable.
+#
+# [[env]]
+# name = "prod-eu"
+# AWS_PROFILE = "prod"
+# KUBECONFIG = "~/.kube/eu"

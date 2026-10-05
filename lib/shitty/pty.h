@@ -25,7 +25,20 @@ struct LaunchCommand;
 // first engage() and live until exit(); the platform may be null when no
 // handle is ever engaged.
 struct Pty {
-    virtual PtyHandle* spawn(stl::ObjPool& owner, const LaunchCommand& command) = 0;
+    // The size is set on the slave before the fork, not by a resize()
+    // after it: a child which reads TIOCGWINSZ as its first operation
+    // after exec would otherwise race that resize and see 0x0.
+    //
+    // directory is where the child starts, entered by the child itself
+    // between fork and exec; empty inherits this process's. A directory
+    // that cannot be entered is not fatal: the child says so on its own
+    // stderr - the terminal, where the user is looking - and starts
+    // where it would have anyway. A terminal that fails to open over a
+    // typo in the config is worse than one open in the wrong folder.
+    virtual PtyHandle* spawn(stl::ObjPool& owner, const LaunchCommand& command, const PtySize& size, stl::StringView directory) = 0;
 };
 
-Pty* createPty(stl::ObjPool& owner, plt::Scheduler& scheduler, plt::Platform* platform = nullptr);
+// brand prefixes what a child reports before exec, the way every other
+// message of this process is prefixed; a NUL-terminated string that
+// outlives the factory.
+Pty* createPty(stl::ObjPool& owner, plt::Scheduler& scheduler, plt::Platform* platform = nullptr, const char* brand = "terminal");

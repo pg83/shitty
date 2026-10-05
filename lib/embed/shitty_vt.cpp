@@ -116,8 +116,6 @@ namespace {
         plt::WindowInfo info() override;
         void requestFrame() override;
         void requestResize(u32 width, u32 height) override;
-        void requestResizeCells(u32 columns, u32 rows) override;
-        VtGridSize gridSize(u32 pixelWidth, u32 pixelHeight) override;
         void requestMaximized(bool maximized) override;
         void requestFullscreen(bool fullscreen) override;
         void requestIconify() override;
@@ -130,6 +128,9 @@ namespace {
         bool uriSchemeAllowed(stl::StringView scheme) override;
         void titleChanged(const VtermTitleChanged& event) override;
         void resized() override;
+        VtInsets contentInsets() override;
+        void surfaceResized(u32 width, u32 height) override;
+        size_t cellCapacityExcept(const Vterm* except) override;
 
         shitty_vt& vt;
         EmbedClipboard primary_;
@@ -262,20 +263,13 @@ void EmbedHost::requestFrame() {
 }
 
 void EmbedHost::requestResize(u32 width, u32 height) {
-    const u16 columns = width < UINT16_MAX ? width : UINT16_MAX;
-    const u16 rows = height < UINT16_MAX ? height : UINT16_MAX;
-    if (vt.callbacks != nullptr && vt.callbacks->resize_request != nullptr) {
-        vt.callbacks->resize_request(vt.callbacks->user, columns, rows);
+    if (vt.callbacks == nullptr || vt.callbacks->resize_request == nullptr) {
+        return;
     }
-    vt.geometry.resizeCells(columns, rows, this);
-}
-
-void EmbedHost::requestResizeCells(u32 columns, u32 rows) {
-    requestResize(columns, rows);
-}
-
-VtGridSize EmbedHost::gridSize(u32 width, u32 height) {
-    return {width, height};
+    // The cell is one pixel square, so the pixel request is already in
+    // cells.
+    const u32 limit = 0xffff;
+    vt.callbacks->resize_request(vt.callbacks->user, (u16)(width < limit ? width : limit), (u16)(height < limit ? height : limit));
 }
 
 void EmbedHost::requestMaximized(bool) {
@@ -346,8 +340,33 @@ void EmbedHost::titleChanged(const VtermTitleChanged& event) {
 
 void EmbedHost::resized() {
     if (vt.terminal != nullptr) {
-        vt.terminal->windowResized();
+        // A8: upstream's windowResized() is paneResized() here, and
+        // this facade's single pane is the whole surface, so the pane
+        // it is handed is the geometry that just changed.
+        vt.terminal->paneResized(vt.geometry);
     }
+}
+
+VtInsets EmbedHost::contentInsets() {
+    // Neither chrome nor a border: the facade draws nothing and
+    // reserves nothing, so the window's content box is the window.
+    return VtInsets{};
+}
+
+void EmbedHost::surfaceResized(u32 width, u32 height) {
+    // Upstream's core writes this line itself (vterm.cpp, the in-band
+    // resize); ours asks, because counting the window's grid needs
+    // contentInsets() and that is the embedder's. The body is the same
+    // line either way.
+    const u32 limit = 0xffff;
+    vt.geometry.resize((u16)(width < limit ? width : limit), (u16)(height < limit ? height : limit), this);
+}
+
+size_t EmbedHost::cellCapacityExcept(const Vterm*) {
+    // A11: no pane list at all, so nothing to add - the asking terminal
+    // is the only pane there is, which is exactly what upstream's core
+    // counts with no such term in the sum.
+    return 0;
 }
 
 void* ReplyPty::ReplyChunk::data() {
@@ -571,12 +590,16 @@ shitty_vt* shitty_vt_new(uint16_t columns, uint16_t rows, uint16_t save_lines, c
         fillConfig(vt->config, save_lines);
         vt->slot.config = &vt->config;
         vt->geometry.setCellPixelSize(1, 1);
-        vt->geometry.resizeCells(columns, rows, nullptr);
+        vt->geometry.resize(columns, rows, nullptr);
         vt->extras.store = CellExtraStore::create(vt->extras, *pool.ptr, 0);
         vt->smallObjects = SmallObjAllocator::create(pool.ptr);
         vt->host = pool->make<EmbedHost>(*vt);
         vt->pty = pool->make<ReplyPty>(*vt->platform->scheduler());
-        vt->terminal = Vterm::create(*pool.ptr, vt->geometry, vt->slot, vt->extras, *vt->smallObjects, *vt->platform->scheduler(), *vt->host, *vt->pty, nullptr);
+                // A8: the window's geometry and this pane's are two parameters
+        // and one object here - the facade shows one terminal filling
+        // its whole surface, so the pane it is born with is the
+        // surface it was just sized to.
+        vt->terminal = Vterm::create(*pool.ptr, vt->geometry, vt->slot, vt->extras, *vt->smallObjects, *vt->platform->scheduler(), *vt->host, vt->geometry, *vt->pty, nullptr);
         // A library terminal has nothing to lose focus to; applications
         // that ask for focus events learn of changes when the embedder
         // grows an input surface.
@@ -609,7 +632,7 @@ void shitty_vt_resize(shitty_vt* vt, uint16_t columns, uint16_t rows) {
     if (columns == 0 || rows == 0) {
         return;
     }
-    vt->geometry.resizeCells(columns, rows, vt->host);
+    vt->geometry.resize(columns, rows, vt->host);
 }
 
 size_t shitty_vt_take_replies(shitty_vt* vt, uint8_t* out, size_t cap) {
@@ -824,27 +847,30 @@ int shitty_vt_mouse_button(shitty_vt* vt, int button, int pressed, int32_t colum
     if (button < 0 || button > SHITTY_VT_MOUSE_AUX5) {
         return 0;
     }
-    VtPointerButton input;
+    plt::PointerButtonInput input;
     input.button = (plt::PointerButton)(button);
     input.pressed = pressed != 0;
-    input.position = {column, row, column, row};
+    input.pixelX = column;
+    input.pixelY = row;
     input.modifiers = modifiers;
     input.time = time;
     return vt->terminal->pointerButton(input) ? 1 : 0;
 }
 
 int shitty_vt_mouse_motion(shitty_vt* vt, int32_t column, int32_t row, uint16_t modifiers) {
-    VtPointerMotion input;
-    input.position = {column, row, column, row};
+    plt::PointerMotionInput input;
+    input.pixelX = column;
+    input.pixelY = row;
     input.modifiers = modifiers;
     return vt->terminal->pointerMotion(input) ? 1 : 0;
 }
 
 int shitty_vt_mouse_scroll(shitty_vt* vt, double dx, double dy, int32_t column, int32_t row, uint16_t modifiers) {
-    VtScroll input;
+    plt::ScrollInput input;
     input.x = dx;
     input.y = dy;
-    input.position = {column, row, column, row};
+    input.pixelX = column;
+    input.pixelY = row;
     input.modifiers = modifiers;
     return vt->terminal->scroll(input) ? 1 : 0;
 }

@@ -5,8 +5,8 @@
  */
 
 #include "brand.h"
-
 #include "pretty_icon_data.h"
+#include "pretty_config_data.h"
 
 using namespace stl;
 
@@ -18,6 +18,7 @@ namespace {
         StringView fontSizeEnvironment() const override;
         StringView versionEnvironment() const override;
         StringView iconData() const override;
+        StringView exampleConfig() const override;
     };
 
     static Brand* createBrand();
@@ -45,6 +46,10 @@ StringView PrettyBrand::versionEnvironment() const {
 
 StringView PrettyBrand::iconData() const {
     return StringView((const u8*)(prettyIcon.data), prettyIcon.size);
+}
+
+StringView PrettyBrand::exampleConfig() const {
+    return StringView((const u8*)(prettyExampleConfig.data), prettyExampleConfig.size);
 }
 
 namespace {

@@ -142,6 +142,39 @@ LaunchCommand buildLaunchCommand(int argc, char* argv[], StringView defaultShell
     return command;
 }
 
+void launchDirectory(StringView option, StringView inherited, StringView home, Buffer& out) {
+    out.reset();
+    if (option.empty()) {
+        // Only the root directory is second-guessed, and only into home:
+        // any other inherited directory was somebody's choice.
+        if (inherited == StringView(u8"/") && !home.empty()) {
+            out.append(home.data(), home.length());
+        }
+        return;
+    }
+    if (!home.empty() && (option == StringView(u8"~") || option.startsWith(StringView(u8"~/")))) {
+        out.append(home.data(), home.length());
+        out.append(option.data() + 1, option.length() - 1);
+        return;
+    }
+    // A `~` with no home to expand into is passed on as written: the
+    // child's chdir then fails on it and says so, which beats silently
+    // starting somewhere else.
+    out.append(option.data(), option.length());
+}
+
+void homeDirectory(Buffer& out) {
+    out.reset();
+    const char* home = getenv("HOME");
+    if (home == nullptr || home[0] == '\0') {
+        const passwd* entry = getpwuid(getuid());
+        home = entry != nullptr ? entry->pw_dir : nullptr;
+    }
+    if (home != nullptr && home[0] != '\0') {
+        out.append(home, strlen(home));
+    }
+}
+
 void configureTerminalChildEnvironment(const Brand& brand, const UnicodeWidths& widths) {
     StringBuilder features;
     appendTermFeatures(features, widths);

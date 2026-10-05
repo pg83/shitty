@@ -19,6 +19,7 @@
 !/build.py
 !/codecov.yml
 !/dev
+!/docs
 !/ext
 !/flake.lock
 !/flake.nix
@@ -29,6 +30,12 @@
 # Anywhere in the tree.
 __pycache__/
 .codegraph/
+# Raw LLVM profiles: a coverage run drops these wherever it was started, and
+# one already reached the tree by accident (tst/default.profraw, 491300ce).
+# That one stays - deleting it would be a permanent divergence for 621 KB -
+# but the next one does not get in.
+*.profraw
 /bounce*.log
 /ext/plt/plt_unit_tests
 /ext/plt/plt_wayland_integration_tests
+

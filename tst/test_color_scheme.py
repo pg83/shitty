@@ -94,18 +94,23 @@ class ColorSchemeTest(unittest.TestCase):
                 b"\x1b]4;12;rgb:5c5c/5c5c/ffff\x1b\\",
             )
 
-    def test_the_default_scheme_is_retro_legends_on_black(self):
+    def test_the_default_scheme_is_catppuccin_mocha(self):
+        # T8 moved the default off the built-in "default" (Retro Legends
+        # on pure black) and onto a named scheme. Both halves are read
+        # back: fg/bg come from the scheme's own two fields, the palette
+        # query from its ansi list, and a scheme wired up by only one of
+        # the two would pass on either half alone.
         with Shitty(pin_vga=False) as terminal:
             options = terminal.options()
-            self.assertEqual(options["fg"], 0xFFFFFF)
-            self.assertEqual(options["bg"], 0x000000)
+            self.assertEqual(options["fg"], 0xCDD6F4)
+            self.assertEqual(options["bg"], 0x1E1E2E)
             self.assertEqual(options["cr"], options["fg"])
 
             terminal.write(b"\x1b]4;0;?;1;?\x1b\\")
             self.assertEqual(
                 terminal.read_input(),
-                b"\x1b]4;0;rgb:0000/0000/0000\x1b\\"
-                b"\x1b]4;1;rgb:dede/5454/5454\x1b\\",
+                b"\x1b]4;0;rgb:4545/4747/5a5a\x1b\\"
+                b"\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\",
             )
 
     def test_explicit_colors_override_the_default_scheme(self):
@@ -113,7 +118,8 @@ class ColorSchemeTest(unittest.TestCase):
             pin_vga=False, extra_arguments=("-fg", "#010203", "-color1", "#040506")
         ) as terminal:
             self.assertEqual(terminal.options()["fg"], 0x010203)
-            self.assertEqual(terminal.options()["bg"], 0x000000)
+            # bg was not given, so it stays the default scheme's.
+            self.assertEqual(terminal.options()["bg"], 0x1E1E2E)
             terminal.write(b"\x1b]4;1;?\x1b\\")
             self.assertEqual(
                 terminal.read_input(),

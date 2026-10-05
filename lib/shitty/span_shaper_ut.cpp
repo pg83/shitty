@@ -9,6 +9,7 @@
 #include "span_shaper.h"
 #include "font_embedded.h"
 #include "font_resolver.h"
+#include "grid_geometry.h"
 
 #include <lib/vterm/screen.h>
 #include <lib/vterm/listener.h>
@@ -63,7 +64,10 @@ ShapeFixture::ShapeFixture() {
     composer->fontResolvers.pushBack(createEmbeddedFontResolver(*composer));
     composer->fonts = Fontpack::create(*composer, *pool, nullptr, 0, nullptr, 0, 16);
     composer->geometry.setCellPixelSize(composer->fonts->getPx(), composer->fonts->getPy());
-    composer->resizeWindow((u16)(16 * composer->geometry.cellPixelWidth + 2 * composer->layout.borderPixels), (u16)(4 * composer->geometry.cellPixelHeight + 2 * composer->layout.borderPixels));
+    // A1: the surface is the grid plus the content insets, never twice
+    // the border option - the same formula every other fixture uses.
+    const Insets insets = composer->contentInsets();
+    composer->resize((u16)(gridPixelWidth(16, insets, composer->geometry.cellPixelWidth)), (u16)(gridPixelHeight(4, insets, composer->geometry.cellPixelHeight)));
     shaper = SpanShaper::create(*composer, *pool);
     composer->shaper = shaper;
     screen = Screen::createPrimary(composer->extras, *pool, 16, 4, &colors, 8);

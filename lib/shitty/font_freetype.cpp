@@ -57,6 +57,7 @@ namespace {
         void configure();
         void configureFixed();
         void configureScaled();
+        void reserveDescent(FontMetrics& metrics);
         u16 representativeAdvance();
         u32 fitRepresentative(u16 cells) const;
         FitMeasure measureAt(u16 pixelSize, u32 representative);
@@ -317,6 +318,26 @@ u16 FontImpl::representativeAdvance() {
     return rounded(size_ * (double)(face_->max_advance_width) / face_->units_per_EM);
 }
 
+// Below the baseline the cell keeps every row the underscore and the
+// descenders ink as the hinter places them - the strip is cut at the
+// cell's bottom, so a bar a row lower is not drawn at all. The
+// proportional split above leaves DejaVu Sans Mono at 15px a bar one
+// row past the cell. Core Text sizes its cell from ascent + descent and
+// never had the gap. The cell grows downward; the baseline stays.
+void FontImpl::reserveDescent(FontMetrics& metrics) {
+    int below = 0;
+    for (const u8 character : StringView(u8"_gjpqy")) {
+        const FT_UInt glyph = FT_Get_Char_Index(face_, character);
+        if (glyph != 0 && loadGlyph(glyph, false, true, 0, 0) && face_->glyph->bitmap.rows > 0) {
+            below = maximum(below, (int)(face_->glyph->bitmap.rows) - face_->glyph->bitmap_top);
+        }
+    }
+    const int room = (int)(metrics.height) - metrics.baseline;
+    if (room < below) {
+        metrics.height = (u16)(metrics.height + below - room);
+    }
+}
+
 void FontImpl::configureScaled() {
     if (FT_Set_Pixel_Sizes(face_, size_, size_)) {
         fail(StringView(u8"could not select scalable font size"));
@@ -326,17 +347,20 @@ void FontImpl::configureScaled() {
     }
 
     const double height = size_ * (double)(face_->height) / face_->units_per_EM + 1;
-    const FontMetrics actual{
+    FontMetrics actual{
         .width = representativeAdvance(),
         .height = rounded(height),
         .baseline = rounded(height * face_->ascender / face_->height),
     };
+    reserveDescent(actual);
     if (kind_ == FontKind::Primary) {
         metrics_ = actual;
         return;
     }
     if (kind_ == FontKind::Overlay) {
-        if (metrics_.height != actual.height) {
+        // The overlay draws into the primary's cell: a bolder underscore
+        // a row deeper still fits there, and must not cost the style.
+        if (metrics_.height < actual.height) {
             fail(StringBuilder() << StringView(u8"font cell height mismatch: expected ") << metrics_.height << StringView(u8", got ") << actual.height);
         }
         if (metrics_.baseline != actual.baseline) {
@@ -512,10 +536,10 @@ void FontImpl::renderShapedSpan(const u32* codepoints, size_t count, u16 cells, 
     u16 column = 0;
     SpanCluster cluster;
     SpanCluster next;
-    bool haveNext = composer_.opts->vt.widths.nextSpanCluster(codepoints, count, position, next);
+    bool haveNext = composer_.vtConfig.config->widths.nextSpanCluster(codepoints, count, position, next);
     while (haveNext) {
         cluster = next;
-        haveNext = composer_.opts->vt.widths.nextSpanCluster(codepoints, count, position, next);
+        haveNext = composer_.vtConfig.config->widths.nextSpanCluster(codepoints, count, position, next);
         for (size_t index = cluster.begin; index < cluster.begin + cluster.count; ++index) {
             columns[index] = column;
         }
@@ -551,10 +575,10 @@ void FontImpl::render(const u32* codepoints, size_t count, u16 cells, void* buf)
     u16 column = 0;
     SpanCluster cluster;
     SpanCluster next;
-    bool haveNext = composer_.opts->vt.widths.nextSpanCluster(codepoints, count, position, next);
+    bool haveNext = composer_.vtConfig.config->widths.nextSpanCluster(codepoints, count, position, next);
     while (haveNext && column < cells) {
         cluster = next;
-        haveNext = composer_.opts->vt.widths.nextSpanCluster(codepoints, count, position, next);
+        haveNext = composer_.vtConfig.config->widths.nextSpanCluster(codepoints, count, position, next);
         u16 width = cluster.cells;
         const bool blank = cluster.count == 1 && codepoints[cluster.begin] == ' ';
         if (blank) {
@@ -565,7 +589,7 @@ void FontImpl::render(const u32* codepoints, size_t count, u16 cells, void* buf)
         const bool nextBlank = haveNext && next.count == 1 && codepoints[next.begin] == ' ';
         if (width == 1 && cluster.count == 1 && puaSymbol(codepoints[cluster.begin]) && nextBlank && column + 1 < cells) {
             width = 2;
-            haveNext = composer_.opts->vt.widths.nextSpanCluster(codepoints, count, position, next);
+            haveNext = composer_.vtConfig.config->widths.nextSpanCluster(codepoints, count, position, next);
         }
         width = (u16)(minimum(width, cells - column));
         if (width == 1 && cluster.count == 1 && !hasColor_ && puaSymbol(codepoints[cluster.begin]) && renderFittedSymbol(codepoints[cluster.begin], (u8*)(buf) + (size_t)(column)*metrics_.width, stride)) {
@@ -697,7 +721,7 @@ u16 FontImpl::fitCells(u16 cells) {
         --size;
         fit = measureAt(size, representative);
     }
-    if (composer_.opts->vt.verbose && !fitLogged_) {
+    if (composer_.vtConfig.config->verbose && !fitLogged_) {
         sysO << StringView(u8"fitted fallback font to ") << size << StringView(u8"px for ") << (u64)(cells) << StringView(u8"-cell glyphs\n");
         fitLogged_ = true;
     }
@@ -1080,7 +1104,7 @@ bool FontImpl::rasterize(const u32* codepoints, size_t count) {
 
 Font* FreeTypeRenderer::render(ObjPool& owner, IntrusivePtr<FontFace> face, u16 pixels, FontKind kind, FontMetrics& metrics) {
     Font* const font = owner.make<FontImpl>(composer, face, pixels, kind, metrics, FontStyle::Regular);
-    if (composer.opts->vt.verbose) {
+    if (composer.vtConfig.config->verbose) {
         sysO << StringView(u8"freetype face: kind ") << (u64)((u8)(kind)) << StringView(u8" at ") << pixels << StringView(u8"px, cell ") << metrics.width << StringView(u8"x") << metrics.height << StringView(u8" baseline ") << metrics.baseline << StringView(u8"\n");
     }
     return font;

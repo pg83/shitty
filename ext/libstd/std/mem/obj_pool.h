@@ -22,9 +22,17 @@ namespace stl {
             }
         }
 
+        // stl:: on purpose. An unqualified forward() here is subject to ADL,
+        // and any argument from namespace std - make<T>(someStdString) -
+        // drags std::forward in as a second, equally good candidate. libc++
+        // spells its own signature with the __remove_reference_t builtin,
+        // which is enough for clang to prefer stl::forward and say nothing,
+        // so macOS never sees it; libstdc++ writes the class trait and both
+        // gcc and clang then call it ambiguous. Same for the two calls in
+        // make() below.
         template <typename T, typename... A>
         T* makeImpl(A&&... a) {
-            return new (allocFor<sizeof(T), alignof(T)>()) T(forward<A>(a)...);
+            return new (allocFor<sizeof(T), alignof(T)>()) T(stl::forward<A>(a)...);
         }
 
     public:
@@ -48,13 +56,13 @@ namespace stl {
             if constexpr (stdHasTrivialDestructor(T)) {
                 static_assert(sizeof(Wrapper1) == sizeof(T));
 
-                return &makeImpl<Wrapper1>(forward<A>(a)...)->t;
+                return &makeImpl<Wrapper1>(stl::forward<A>(a)...)->t;
             } else {
                 struct Wrapper2: public Disposable, public Wrapper1 {
                     using Wrapper1::Wrapper1;
                 };
 
-                auto res = makeImpl<Wrapper2>(forward<A>(a)...);
+                auto res = makeImpl<Wrapper2>(stl::forward<A>(a)...);
 
                 submit(res);
 

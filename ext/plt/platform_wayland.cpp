@@ -198,11 +198,39 @@ namespace {
         bool primary = false;
     };
 
-    struct WindowImpl final: public Window, public TimerCallback {
+    // One of the chrome's shared-memory pictures. Buffers are kept until the
+    // compositor releases them, and reused at the same size.
+    struct ChromeBuffer {
+        struct wl_buffer* buffer = nullptr;
+        void* data = nullptr;
+        size_t size = 0;
+        u32 width = 0;
+        u32 height = 0;
+        bool busy = false;
+    };
+
+    // A surface of the chrome: the toplevel's own (layer 0), the overlay
+    // subsurface above the content (layer 1), or the menu above that
+    // (layer 3).
+    struct ChromeLayer {
+        struct wl_surface* surface = nullptr;
+        struct wl_subsurface* subsurface = nullptr;
+        struct wp_viewport* viewport = nullptr;
+        Vector<ChromeBuffer*> buffers;
+        i32 x = 0;
+        i32 y = 0;
+        u32 width = 0;
+        u32 height = 0;
+        bool shown = false;
+    };
+
+    struct WindowImpl final: public Window, public WindowChrome, public TimerCallback {
         WindowImpl(PlatformImpl& platform, const WindowOptions& options);
         ~WindowImpl();
 
         void requestShow() override;
+        void requestHide() override;
+        void requestShowAt(ShowPlacement placement) override;
         void requestClose() override;
         void requestFrame() override;
         void ready() override;
@@ -214,10 +242,12 @@ namespace {
         void requestFocus() override;
         void requestMaximized(bool maximized) override;
         void requestFullscreen(bool fullscreen) override;
+        void requestCornerRadius(u16 radius) override;
         void requestResize(u32 width, u32 height) override;
         void requestMinimumSize(u32 width, u32 height) override;
         void requestResizeUnit(u32 width, u32 height, u32 baseWidth, u32 baseHeight) override;
         WindowInfo info() const override;
+        bool visible() const override;
         bool inLiveResize() const override;
         Clipboard* primary() override;
         Clipboard* secondary() override;
@@ -225,10 +255,33 @@ namespace {
         void requestOpenUri(StringView uri) override;
         void requestTextInputRect(i32 x, i32 y, u32 width, u32 height) override;
         RenderContext renderContext() const override;
+        WindowChrome* chrome() override;
 
+        void setSink(ChromeSink* sink) override;
+        void setInsets(u32 left, u32 top, u32 right, u32 bottom, u32 margin) override;
+        ChromeState state() const override;
+        void present(u8 layer, const u8* pixels, u32 pixelWidth, u32 pixelHeight) override;
+        void setOverlay(bool shown, i32 x, i32 y, u32 width, u32 height) override;
+        void setMenu(bool shown, i32 x, i32 y, u32 width, u32 height) override;
+        void placeLayer(ChromeLayer& layer, bool shown, i32 x, i32 y, u32 width, u32 height);
+        ChromeLayer& chromeLayer(u8 layer);
+        u8 pointerLayer() const;
+        bool capturingKeys() const;
+        void setCursor(PointerIcon icon) override;
+        void startMove() override;
+        void startResize(u32 edges) override;
+
+        void createChrome();
+        void destroyLayer(ChromeLayer& layer);
+        ChromeBuffer* chromeBuffer(ChromeLayer& layer, u32 width, u32 height);
+        void chromeEvent(ChromeEvent::Kind kind, u32 button = 0);
+        bool pointerOnChrome() const;
+        u32 toplevelWidth() const;
+        u32 toplevelHeight() const;
+        u32 toplevelPixels(u32 logical) const;
         void configure();
         void contentScale(u32 numerator);
-        void pointerEntered(u32 serial, wl_fixed_t x, wl_fixed_t y);
+        void pointerEntered(u32 serial, struct wl_surface* entered, wl_fixed_t x, wl_fixed_t y);
         void pointerLeft();
         void pointerMoved(wl_fixed_t x, wl_fixed_t y);
         void pointerButton(u32 time, u32 button, u32 state);
@@ -253,6 +306,27 @@ namespace {
         FrameCallback* frame = nullptr;
         DropTarget* dropTarget = nullptr;
         struct wl_surface* surface = nullptr;
+        // Where the renderer draws: the toplevel's surface, or with client
+        // chrome a subsurface at the insets.
+        struct wl_surface* contentSurface = nullptr;
+        struct wl_subsurface* contentSubsurface = nullptr;
+        struct wp_viewport* contentViewport = nullptr;
+        ChromeLayer baseLayer;
+        ChromeLayer overlayLayer;
+        ChromeLayer menuLayer;
+        ChromeSink* chromeSink = nullptr;
+        struct wl_surface* pointerSurface = nullptr;
+        float chromePointerX = 0;
+        float chromePointerY = 0;
+        u32 chromeClicks = 0;
+        u32 chromeLastPress = 0;
+        u32 insetLeft = 0;
+        u32 insetTop = 0;
+        u32 insetRight = 0;
+        u32 insetBottom = 0;
+        u32 insetMargin = 0;
+        PointerIcon chromeCursor = PointerIcon::Default;
+        bool chromeOn = false;
         struct xdg_surface* xdgSurface = nullptr;
         struct xdg_toplevel* toplevel = nullptr;
         struct zxdg_toplevel_decoration_v1* decoration = nullptr;
@@ -373,6 +447,8 @@ namespace {
         struct wl_display* display = nullptr;
         struct wl_registry* registry = nullptr;
         struct wl_compositor* compositor = nullptr;
+        struct wl_subcompositor* subcompositor = nullptr;
+        struct wl_shm* shm = nullptr;
         struct xdg_wm_base* wmBase = nullptr;
         struct wl_seat* seat = nullptr;
         struct wl_keyboard* keyboard = nullptr;
@@ -890,7 +966,7 @@ namespace {
         WindowImpl* const window = surface == nullptr ? nullptr : (WindowImpl*)(wl_proxy_get_user_data((struct wl_proxy*)(surface)));
         platform.pointerGrab.enter(window);
         if (window != nullptr) {
-            window->pointerEntered(serial, x, y);
+            window->pointerEntered(serial, surface, x, y);
         }
         pointerFrameFallback(platform);
     }
@@ -1104,6 +1180,12 @@ namespace {
     const struct wp_fractional_scale_v1_listener fractionalScaleListener{
         .preferred_scale = [](void* data, struct wp_fractional_scale_v1*, u32 numerator) {
         ((WindowImpl*)(data))->contentScale(numerator);
+    },
+    };
+
+    const struct wl_buffer_listener chromeBufferListener{
+        .release = [](void* data, struct wl_buffer*) {
+        ((ChromeBuffer*)(data))->busy = false;
     },
     };
 
@@ -1565,6 +1647,10 @@ void PlatformImpl::ready(PollFD event) {
 void PlatformImpl::bindRegistry(u32 name, const char* interface, u32 version) {
     if (StringView(interface) == StringView(wl_compositor_interface.name)) {
         compositor = (struct wl_compositor*)(wl_registry_bind(registry, name, &wl_compositor_interface, min(version, 6u)));
+    } else if (StringView(interface) == StringView(wl_subcompositor_interface.name)) {
+        subcompositor = (struct wl_subcompositor*)(wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
+    } else if (StringView(interface) == StringView(wl_shm_interface.name)) {
+        shm = (struct wl_shm*)(wl_registry_bind(registry, name, &wl_shm_interface, 1));
     } else if (StringView(interface) == StringView(xdg_wm_base_interface.name)) {
         wmBase = (struct xdg_wm_base*)(wl_registry_bind(registry, name, &xdg_wm_base_interface, min(version, 6u)));
         xdg_wm_base_add_listener(wmBase, &wmBaseListener, this);
@@ -2000,25 +2086,39 @@ void PlatformImpl::keyboardKey(u32 serial, u32 time, u32 key, u32 state, bool re
         composedCount = 1;
     }
     const u16 activeModifiers = modifiers();
-    keyboardFocus->input->key({
+    const KeyInput keyInput{
         .key = inputKey(symbol),
         .action = action,
         .modifiers = activeModifiers,
         .layoutCodepoint = layoutCodepoint(keycode),
         .baseCodepoint = baseCodepoint(keycode),
         .shiftedCodepoint = activeModifiers & InputShift ? codepoint : 0,
-    });
-    if (action != InputAction::Release && !(activeModifiers & (InputControl | InputSuper))) {
-        for (size_t index = 0; index != composedCount; ++index) {
-            if (composed[index] >= 0x20 && composed[index] != 0x7f) {
-                keyboardFocus->input->text({
-                    .codepoint = composed[index],
-                    .modifiers = activeModifiers,
-                });
+    };
+    const bool typed = action != InputAction::Release && !(activeModifiers & (InputControl | InputSuper));
+    if (keyboardFocus->capturingKeys()) {
+        // A name being typed into the chrome: the content hears nothing.
+        if (action != InputAction::Release) {
+            keyboardFocus->chromeSink->chromeKey(keyInput);
+            for (size_t index = 0; typed && index != composedCount && keyboardFocus->capturingKeys(); ++index) {
+                if (composed[index] >= 0x20 && composed[index] != 0x7f) {
+                    keyboardFocus->chromeSink->chromeText(composed[index]);
+                }
             }
         }
+    } else {
+        keyboardFocus->input->key(keyInput);
+        if (typed) {
+            for (size_t index = 0; index != composedCount; ++index) {
+                if (composed[index] >= 0x20 && composed[index] != 0x7f) {
+                    keyboardFocus->input->text({
+                        .codepoint = composed[index],
+                        .modifiers = activeModifiers,
+                    });
+                }
+            }
+        }
+        keyboardFocus->input->flush();
     }
-    keyboardFocus->input->flush();
 
     if (!repeated && state == WL_KEYBOARD_KEY_STATE_PRESSED && repeatRate != 0 && keymap != nullptr && xkb_keymap_key_repeats(keymap, keycode)) {
         repeatWindow = keyboardFocus;
@@ -2399,7 +2499,7 @@ void PlatformImpl::setCursor(WindowImpl& window) {
     if (cursorShapeDevice == nullptr || pointerGrab.focusTarget() != &window || pointerEnterSerial == 0) {
         return;
     }
-    wp_cursor_shape_device_v1_set_shape(cursorShapeDevice, pointerEnterSerial, cursorShape(window.cursor, cursorShapeVersion));
+    wp_cursor_shape_device_v1_set_shape(cursorShapeDevice, pointerEnterSerial, cursorShape(window.pointerOnChrome() ? window.chromeCursor : window.cursor, cursorShapeVersion));
 }
 
 void PlatformImpl::activate(WindowImpl& window) {
@@ -2527,7 +2627,9 @@ void PlatformImpl::textInputRectChanged(WindowImpl& window, bool commit) {
     if (textInput == nullptr || textInputWindow != &window) {
         return;
     }
-    zwp_text_input_v3_set_cursor_rectangle(textInput, window.logicalCoordinate(window.textInputX), window.logicalCoordinate(window.textInputY), (i32)(window.logicalForPixel(window.textInputWidth)), (i32)(window.logicalForPixel(window.textInputHeight)));
+    const i32 offsetX = window.chromeOn ? (i32)(window.insetLeft) : 0;
+    const i32 offsetY = window.chromeOn ? (i32)(window.insetTop) : 0;
+    zwp_text_input_v3_set_cursor_rectangle(textInput, window.logicalCoordinate(window.textInputX) + offsetX, window.logicalCoordinate(window.textInputY) + offsetY, (i32)(window.logicalForPixel(window.textInputWidth)), (i32)(window.logicalForPixel(window.textInputHeight)));
     if (commit) {
         zwp_text_input_v3_commit(textInput);
         flushDisplay();
@@ -2554,6 +2656,7 @@ WindowImpl::WindowImpl(PlatformImpl& platform_, const WindowOptions& options)
     }
     wl_proxy_set_user_data((struct wl_proxy*)(surface), this);
     wl_surface_add_listener(surface, &surfaceListener, this);
+    contentSurface = surface;
     xdgSurface = xdg_wm_base_get_xdg_surface(platform.wmBase, surface);
     xdg_surface_add_listener(xdgSurface, &xdgSurfaceListener, this);
     toplevel = xdg_surface_get_toplevel(xdgSurface);
@@ -2563,7 +2666,7 @@ WindowImpl::WindowImpl(PlatformImpl& platform_, const WindowOptions& options)
         decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(platform.decorationManager, toplevel);
         zxdg_toplevel_decoration_v1_set_mode(
             decoration,
-            options.decorations
+            options.decorations && !(options.clientChrome && platform.subcompositor != nullptr && platform.shm != nullptr)
                 ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
                 : ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE
         );
@@ -2577,6 +2680,9 @@ WindowImpl::WindowImpl(PlatformImpl& platform_, const WindowOptions& options)
     }
     if (fractionalScale == nullptr) {
         contentScale((u32)(platform.outputScale) * scaleDenominator);
+    }
+    if (options.clientChrome && platform.subcompositor != nullptr && platform.shm != nullptr) {
+        createChrome();
     }
 
     Buffer appId(options.appId);
@@ -2602,6 +2708,22 @@ WindowImpl::~WindowImpl() {
     }
     platform.pointerGrab.remove(this);
     cancelFrame();
+    if (chromeOn) {
+        destroyLayer(menuLayer);
+        destroyLayer(overlayLayer);
+        if (contentViewport != nullptr) {
+            wp_viewport_destroy(contentViewport);
+        }
+        if (contentSubsurface != nullptr) {
+            wl_subsurface_destroy(contentSubsurface);
+        }
+        if (contentSurface != nullptr && contentSurface != surface) {
+            wl_surface_destroy(contentSurface);
+        }
+        baseLayer.surface = nullptr;
+        baseLayer.viewport = nullptr;
+        destroyLayer(baseLayer);
+    }
     if (activationToken != nullptr) {
         xdg_activation_token_v1_destroy(activationToken);
     }
@@ -2661,11 +2783,36 @@ u32 WindowImpl::snappedLogical(u32 suggested, u32 unit, u32 base) const {
     return suggested;
 }
 
+u32 WindowImpl::toplevelWidth() const {
+    return logicalWidth + insetLeft + insetRight;
+}
+
+u32 WindowImpl::toplevelHeight() const {
+    return logicalHeight + insetTop + insetBottom;
+}
+
+u32 WindowImpl::toplevelPixels(u32 logical) const {
+    return max(1u, (u32)(((u64)(logical)*scaleNumerator + scaleDenominator / 2) / scaleDenominator));
+}
+
 void WindowImpl::setLogicalSize(u32 width, u32 height) {
     width = max(1u, width);
     height = max(1u, height);
     logicalWidth = width;
     logicalHeight = height;
+    if (chromeOn) {
+        // The shell's window is the toplevel less the outer margin; the
+        // content sits at the insets, sized in its own viewport.
+        const u32 margin = insetMargin;
+        xdg_surface_set_window_geometry(xdgSurface, (i32)(margin), (i32)(margin), max(1u, toplevelWidth() - 2 * margin), max(1u, toplevelHeight() - 2 * margin));
+        wl_subsurface_set_position(contentSubsurface, (i32)(insetLeft), (i32)(insetTop));
+        if (contentViewport != nullptr) {
+            wp_viewport_set_destination(contentViewport, (i32)(logicalWidth), (i32)(logicalHeight));
+        } else {
+            wl_surface_set_buffer_scale(contentSurface, max(1, (i32)(scaleNumerator / scaleDenominator)));
+        }
+        return;
+    }
     xdg_surface_set_window_geometry(xdgSurface, 0, 0, logicalWidth, logicalHeight);
     if (viewport != nullptr) {
         wp_viewport_set_destination(viewport, logicalWidth, logicalHeight);
@@ -2681,6 +2828,14 @@ void WindowImpl::configure() {
     tiled = pendingTiled;
     u32 width = pendingWidth == 0 ? logicalWidth : pendingWidth;
     u32 height = pendingHeight == 0 ? logicalHeight : pendingHeight;
+    if (chromeOn && pendingWidth != 0) {
+        const u32 aroundX = insetLeft + insetRight - 2 * insetMargin;
+        width = pendingWidth > aroundX ? pendingWidth - aroundX : 1;
+    }
+    if (chromeOn && pendingHeight != 0) {
+        const u32 aroundY = insetTop + insetBottom - 2 * insetMargin;
+        height = pendingHeight > aroundY ? pendingHeight - aroundY : 1;
+    }
     if (!maximized && !fullscreen && !tiled) {
         width = snappedLogical(width, resizeUnitWidth, resizeBaseWidth);
         height = snappedLogical(height, resizeUnitHeight, resizeBaseHeight);
@@ -2688,6 +2843,9 @@ void WindowImpl::configure() {
     const bool first = !configured;
     setLogicalSize(width, height);
     configured = true;
+    // The chrome is drawn to the new size before the content's first frame
+    // at it: without a buffer on the toplevel nothing of the window maps.
+    chromeEvent(ChromeEvent::Kind::Changed);
     if (first || shown) {
         requestFrame();
     }
@@ -2701,8 +2859,9 @@ void WindowImpl::contentScale(u32 numerator) {
     if (fractionalScale != nullptr) {
         wl_surface_set_buffer_scale(surface, 1);
     }
-    xdg_toplevel_set_min_size(toplevel, logicalForPixel(minimumWidth), logicalForPixel(minimumHeight));
+    requestMinimumSize(minimumWidth, minimumHeight);
     setLogicalSize(logicalWidth, logicalHeight);
+    chromeEvent(ChromeEvent::Kind::Changed);
     requestFrame();
 }
 
@@ -2712,6 +2871,21 @@ void WindowImpl::requestShow() {
     }
     shown = true;
     wl_surface_commit(surface);
+}
+
+void WindowImpl::requestHide() {
+    // Quick terminal is Cocoa-only for now: the global hotkey (Carbon
+    // RegisterEventHotKey) and WindowOptions::quick both have no Wayland
+    // counterpart yet. This stub exists only so the interface builds
+    // here too; there is no real hide to perform.
+}
+
+void WindowImpl::requestShowAt(ShowPlacement) {
+    // No Wayland placement story either - xdg-shell leaves positioning
+    // to the compositor, with no portable "top of the active screen"
+    // request. Every placement shows the same way requestShow() always
+    // has.
+    requestShow();
 }
 
 void WindowImpl::requestClose() {
@@ -2751,14 +2925,14 @@ void WindowImpl::ready() {
         return;
     }
     frameRetries = 0;
-    frameCallback = wl_surface_frame(surface);
+    frameCallback = wl_surface_frame(contentSurface);
     if (frameCallback != nullptr) {
         wl_callback_add_listener(frameCallback, &frameListener, this);
     }
     // The renderer's Vulkan WSI owns buffer attachment for this surface; this
     // is a state-only commit which latches the frame callback. Both run on
     // this thread, so the commit cannot interleave with a WSI present.
-    wl_surface_commit(surface);
+    wl_surface_commit(contentSurface);
 }
 
 void WindowImpl::cancelFrame() {
@@ -2825,15 +2999,21 @@ void WindowImpl::requestFullscreen(bool value) {
     }
 }
 
+// No xdg-shell hook for a per-window corner radius; same scope as
+// WindowOptions::quickCornerRadius already documents (window.h).
+void WindowImpl::requestCornerRadius(u16) {
+}
+
 void WindowImpl::requestResize(u32 width, u32 height) {
     setLogicalSize(logicalForPixel(width), logicalForPixel(height));
+    chromeEvent(ChromeEvent::Kind::Changed);
     requestFrame();
 }
 
 void WindowImpl::requestMinimumSize(u32 width, u32 height) {
     minimumWidth = max(1u, width);
     minimumHeight = max(1u, height);
-    xdg_toplevel_set_min_size(toplevel, logicalForPixel(minimumWidth), logicalForPixel(minimumHeight));
+    xdg_toplevel_set_min_size(toplevel, logicalForPixel(minimumWidth) + (chromeOn ? insetLeft + insetRight - 2 * insetMargin : 0), logicalForPixel(minimumHeight) + (chromeOn ? insetTop + insetBottom - 2 * insetMargin : 0));
 }
 
 void WindowImpl::requestResizeUnit(u32 width, u32 height, u32 baseWidth, u32 baseHeight) {
@@ -2859,6 +3039,13 @@ WindowInfo WindowImpl::info() const {
         .fullscreen = fullscreen,
         .tiled = tiled,
     };
+}
+
+bool WindowImpl::visible() const {
+    // requestHide() is a stub here (see its definition): nothing ever
+    // clears shown once requestShow() sets it, which is honest - a
+    // no-op hide leaves the window exactly as visible as it was.
+    return shown;
 }
 
 Clipboard* WindowImpl::primary() {
@@ -2939,7 +3126,31 @@ void WindowImpl::updateCursor() {
     platform.setCursor(*this);
 }
 
-void WindowImpl::pointerEntered(u32, wl_fixed_t x, wl_fixed_t y) {
+bool WindowImpl::pointerOnChrome() const {
+    return chromeOn && pointerSurface != nullptr && pointerSurface != contentSurface;
+}
+
+void WindowImpl::pointerEntered(u32, struct wl_surface* entered, wl_fixed_t x, wl_fixed_t y) {
+    pointerSurface = entered;
+    if (pointerOnChrome()) {
+        const ChromeLayer& under = chromeLayer(pointerLayer());
+        chromePointerX = (float)(wl_fixed_to_double(x)) + (float)(under.x);
+        chromePointerY = (float)(wl_fixed_to_double(y)) + (float)(under.y);
+        chromeEvent(ChromeEvent::Kind::Enter);
+        updateCursor();
+        return;
+    }
+    if (chromeOn) {
+        // The chrome hears that the pointer went over the content, as a
+        // leave from layer 2: what it put over the content can go.
+        ChromeEvent::Kind kind = ChromeEvent::Kind::Leave;
+        if (chromeSink != nullptr && configured) {
+            ChromeEvent event;
+            event.kind = kind;
+            event.layer = 2;
+            chromeSink->chrome(event);
+        }
+    }
     pointerMoved(x, y);
     updateCursor();
     if (input != nullptr) {
@@ -2948,12 +3159,25 @@ void WindowImpl::pointerEntered(u32, wl_fixed_t x, wl_fixed_t y) {
 }
 
 void WindowImpl::pointerLeft() {
+    if (pointerOnChrome()) {
+        chromeEvent(ChromeEvent::Kind::Leave);
+        pointerSurface = nullptr;
+        return;
+    }
+    pointerSurface = nullptr;
     if (input != nullptr) {
         input->pointerPresence(false);
     }
 }
 
 void WindowImpl::pointerMoved(wl_fixed_t x, wl_fixed_t y) {
+    if (pointerOnChrome()) {
+        const ChromeLayer& under = chromeLayer(pointerLayer());
+        chromePointerX = (float)(wl_fixed_to_double(x)) + (float)(under.x);
+        chromePointerY = (float)(wl_fixed_to_double(y)) + (float)(under.y);
+        chromeEvent(ChromeEvent::Kind::Motion);
+        return;
+    }
     pointerX = (i32)(((i64)(wl_fixed_to_double(x) * scaleNumerator)) / scaleDenominator);
     pointerY = (i32)(((i64)(wl_fixed_to_double(y) * scaleNumerator)) / scaleDenominator);
     if (input != nullptr) {
@@ -2966,6 +3190,29 @@ void WindowImpl::pointerMoved(wl_fixed_t x, wl_fixed_t y) {
 }
 
 void WindowImpl::pointerButton(u32 time, u32 button, u32 state) {
+    if (pointerOnChrome()) {
+        const u32 number = button == BTN_LEFT ? 1 : button == BTN_MIDDLE ? 2 : button == BTN_RIGHT ? 3 : 0;
+        if (number == 0) {
+            return;
+        }
+        if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            // Clicks count up while each follows the last within the
+            // double-click time most desktops use.
+            chromeClicks = chromeClicks != 0 && time - chromeLastPress < 400 ? chromeClicks + 1 : 1;
+            chromeLastPress = time;
+        }
+        chromeEvent(state == WL_POINTER_BUTTON_STATE_PRESSED ? ChromeEvent::Kind::Press : ChromeEvent::Kind::Release, number);
+        return;
+    }
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED && capturingKeys()) {
+        // A menu open or a name being typed: a press on the terminal ends
+        // it, as a click elsewhere ends either on a Mac.
+        ChromeEvent event;
+        event.kind = ChromeEvent::Kind::Press;
+        event.layer = 2;
+        event.button = button == BTN_LEFT ? 1 : button == BTN_MIDDLE ? 2 : button == BTN_RIGHT ? 3 : 0;
+        chromeSink->chrome(event);
+    }
     PointerButton mapped;
     switch (button) {
         case BTN_LEFT:
@@ -3048,7 +3295,7 @@ void WindowImpl::pointerAxisSteps(u32 axis, i32 value120) {
 }
 
 void WindowImpl::pointerFrame() {
-    if (input != nullptr) {
+    if (input != nullptr && !pointerOnChrome()) {
         // Wheel frames carry the intended step count in value120/discrete
         // units; prefer them over the continuous-axis heuristic, which only
         // approximates lines from smooth-scroll distance.
@@ -3079,11 +3326,291 @@ void WindowImpl::pointerFrame() {
     scrollPhase = ScrollPhase::None;
 }
 
+WindowChrome* WindowImpl::chrome() {
+    return chromeOn ? this : nullptr;
+}
+
+void WindowImpl::createChrome() {
+    contentSurface = wl_compositor_create_surface(platform.compositor);
+    overlayLayer.surface = wl_compositor_create_surface(platform.compositor);
+    menuLayer.surface = wl_compositor_create_surface(platform.compositor);
+    if (contentSurface == nullptr || overlayLayer.surface == nullptr || menuLayer.surface == nullptr) {
+        fail(u8"wl_compositor_create_surface failed");
+    }
+    wl_proxy_set_user_data((struct wl_proxy*)(contentSurface), this);
+    wl_proxy_set_user_data((struct wl_proxy*)(overlayLayer.surface), this);
+    wl_proxy_set_user_data((struct wl_proxy*)(menuLayer.surface), this);
+    // Both run on their own commits: the renderer presents without waiting
+    // for the chrome, and the chrome redraws without waiting for a frame.
+    contentSubsurface = wl_subcompositor_get_subsurface(platform.subcompositor, contentSurface, surface);
+    wl_subsurface_set_desync(contentSubsurface);
+    overlayLayer.subsurface = wl_subcompositor_get_subsurface(platform.subcompositor, overlayLayer.surface, surface);
+    wl_subsurface_place_above(overlayLayer.subsurface, contentSurface);
+    wl_subsurface_set_desync(overlayLayer.subsurface);
+    menuLayer.subsurface = wl_subcompositor_get_subsurface(platform.subcompositor, menuLayer.surface, surface);
+    wl_subsurface_place_above(menuLayer.subsurface, overlayLayer.surface);
+    wl_subsurface_set_desync(menuLayer.subsurface);
+    if (platform.viewporter != nullptr) {
+        contentViewport = wp_viewporter_get_viewport(platform.viewporter, contentSurface);
+        overlayLayer.viewport = wp_viewporter_get_viewport(platform.viewporter, overlayLayer.surface);
+        menuLayer.viewport = wp_viewporter_get_viewport(platform.viewporter, menuLayer.surface);
+    }
+    baseLayer.surface = surface;
+    baseLayer.viewport = viewport;
+    chromeOn = true;
+}
+
+void WindowImpl::destroyLayer(ChromeLayer& layer) {
+    for (ChromeBuffer* buffer : layer.buffers) {
+        wl_buffer_destroy(buffer->buffer);
+        munmap(buffer->data, buffer->size);
+        platform.allocator_->release(buffer);
+    }
+    layer.buffers.clear();
+    if (layer.viewport != nullptr) {
+        wp_viewport_destroy(layer.viewport);
+        layer.viewport = nullptr;
+    }
+    if (layer.subsurface != nullptr) {
+        wl_subsurface_destroy(layer.subsurface);
+        layer.subsurface = nullptr;
+    }
+    if (layer.surface != nullptr) {
+        wl_surface_destroy(layer.surface);
+        layer.surface = nullptr;
+    }
+}
+
+ChromeBuffer* WindowImpl::chromeBuffer(ChromeLayer& layer, u32 width, u32 height) {
+    // A free buffer of the size is reused; free ones of another size go.
+    ChromeBuffer* found = nullptr;
+    Vector<ChromeBuffer*> kept;
+    for (ChromeBuffer* buffer : layer.buffers) {
+        if (!buffer->busy && found == nullptr && buffer->width == width && buffer->height == height) {
+            found = buffer;
+            kept.pushBack(buffer);
+        } else if (!buffer->busy && (buffer->width != width || buffer->height != height)) {
+            wl_buffer_destroy(buffer->buffer);
+            munmap(buffer->data, buffer->size);
+            platform.allocator_->release(buffer);
+        } else {
+            kept.pushBack(buffer);
+        }
+    }
+    layer.buffers.clear();
+    for (ChromeBuffer* buffer : kept) {
+        layer.buffers.pushBack(buffer);
+    }
+    if (found != nullptr) {
+        return found;
+    }
+    const size_t stride = (size_t)(width) * 4;
+    const size_t size = stride * height;
+    const int fd = memfd_create("chrome", MFD_CLOEXEC);
+    if (fd < 0) {
+        return nullptr;
+    }
+    if (ftruncate(fd, (off_t)(size)) != 0) {
+        close(fd);
+        return nullptr;
+    }
+    void* const data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        close(fd);
+        return nullptr;
+    }
+    struct wl_shm_pool* const pool = wl_shm_create_pool(platform.shm, fd, (i32)(size));
+    struct wl_buffer* const buffer = wl_shm_pool_create_buffer(pool, 0, (i32)(width), (i32)(height), (i32)(stride), WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    ChromeBuffer* const made = platform.allocator_->make<ChromeBuffer>();
+    made->buffer = buffer;
+    made->data = data;
+    made->size = size;
+    made->width = width;
+    made->height = height;
+    wl_buffer_add_listener(buffer, &chromeBufferListener, made);
+    layer.buffers.pushBack(made);
+    return made;
+}
+
+void WindowImpl::chromeEvent(ChromeEvent::Kind kind, u32 button) {
+    // Before the first configure the toplevel may not carry a buffer: a
+    // picture drawn now would be a protocol error, and configure() asks
+    // for one anyway.
+    if (chromeSink == nullptr || !configured) {
+        return;
+    }
+    ChromeEvent event;
+    event.kind = kind;
+    event.layer = pointerLayer();
+    event.x = chromePointerX;
+    event.y = chromePointerY;
+    event.button = button;
+    event.clicks = chromeClicks;
+    chromeSink->chrome(event);
+}
+
+void WindowImpl::setSink(ChromeSink* sink) {
+    chromeSink = sink;
+}
+
+void WindowImpl::setInsets(u32 left, u32 top, u32 right, u32 bottom, u32 margin) {
+    if (left == insetLeft && top == insetTop && right == insetRight && bottom == insetBottom && margin == insetMargin) {
+        return;
+    }
+    // Once the shell has sized the window, it keeps its size: the content
+    // gives or takes what the chrome does not. Before that, the content
+    // keeps the size asked for and the window grows around it.
+    u32 width = logicalWidth;
+    u32 height = logicalHeight;
+    if (configured) {
+        const u32 geometryWidth = toplevelWidth() - 2 * insetMargin;
+        const u32 geometryHeight = toplevelHeight() - 2 * insetMargin;
+        const u32 aroundX = left + right - 2 * margin;
+        const u32 aroundY = top + bottom - 2 * margin;
+        width = geometryWidth > aroundX ? geometryWidth - aroundX : 1;
+        height = geometryHeight > aroundY ? geometryHeight - aroundY : 1;
+    }
+    insetLeft = left;
+    insetTop = top;
+    insetRight = right;
+    insetBottom = bottom;
+    insetMargin = margin;
+    requestMinimumSize(minimumWidth, minimumHeight);
+    setLogicalSize(width, height);
+    if (configured) {
+        requestFrame();
+    }
+}
+
+ChromeState WindowImpl::state() const {
+    ChromeState result;
+    result.width = toplevelWidth();
+    result.height = toplevelHeight();
+    result.pixelWidth = toplevelPixels(result.width);
+    result.pixelHeight = toplevelPixels(result.height);
+    result.scale = (float)(scaleNumerator) / scaleDenominator;
+    result.focused = focused;
+    result.maximized = maximized;
+    result.fullscreen = fullscreen;
+    result.tiled = tiled;
+    return result;
+}
+
+void WindowImpl::present(u8 layer, const u8* pixels, u32 width, u32 height) {
+    ChromeLayer& target = chromeLayer(layer);
+    if (!chromeOn || !configured || target.surface == nullptr || width == 0 || height == 0 || (layer != 0 && !target.shown)) {
+        return;
+    }
+    ChromeBuffer* const buffer = chromeBuffer(target, width, height);
+    if (buffer == nullptr) {
+        return;
+    }
+    memcpy(buffer->data, pixels, (size_t)(width) * height * 4);
+    buffer->busy = true;
+    wl_surface_attach(target.surface, buffer->buffer, 0, 0);
+    wl_surface_damage_buffer(target.surface, 0, 0, (i32)(width), (i32)(height));
+    const u32 logicalW = layer == 0 ? toplevelWidth() : target.width;
+    const u32 logicalH = layer == 0 ? toplevelHeight() : target.height;
+    if (target.viewport != nullptr) {
+        wp_viewport_set_destination(target.viewport, (i32)(logicalW), (i32)(logicalH));
+    } else {
+        wl_surface_set_buffer_scale(target.surface, max(1, (i32)(scaleNumerator / scaleDenominator)));
+    }
+    wl_surface_commit(target.surface);
+    platform.flushDisplay();
+}
+
+void WindowImpl::setOverlay(bool shown_, i32 x, i32 y, u32 width, u32 height) {
+    placeLayer(overlayLayer, shown_, x, y, width, height);
+}
+
+void WindowImpl::setMenu(bool shown_, i32 x, i32 y, u32 width, u32 height) {
+    placeLayer(menuLayer, shown_, x, y, width, height);
+}
+
+void WindowImpl::placeLayer(ChromeLayer& layer, bool shown_, i32 x, i32 y, u32 width, u32 height) {
+    if (!chromeOn) {
+        return;
+    }
+    layer.x = x;
+    layer.y = y;
+    layer.width = max(1u, width);
+    layer.height = max(1u, height);
+    if (!shown_ && layer.shown) {
+        wl_surface_attach(layer.surface, nullptr, 0, 0);
+        wl_surface_commit(layer.surface);
+    }
+    layer.shown = shown_;
+    wl_subsurface_set_position(layer.subsurface, x, y);
+    // The position is the parent's state: latched by its next commit.
+    wl_surface_commit(surface);
+    platform.flushDisplay();
+}
+
+ChromeLayer& WindowImpl::chromeLayer(u8 layer) {
+    return layer == 0 ? baseLayer : layer == 3 ? menuLayer : overlayLayer;
+}
+
+u8 WindowImpl::pointerLayer() const {
+    if (pointerSurface != nullptr && pointerSurface == menuLayer.surface) {
+        return 3;
+    }
+    return pointerSurface != nullptr && pointerSurface == overlayLayer.surface ? 1 : 0;
+}
+
+bool WindowImpl::capturingKeys() const {
+    return chromeOn && chromeSink != nullptr && configured && chromeSink->capturesKeys();
+}
+
+void WindowImpl::setCursor(PointerIcon icon) {
+    if (chromeCursor == icon) {
+        return;
+    }
+    chromeCursor = icon;
+    updateCursor();
+}
+
+void WindowImpl::startMove() {
+    if (platform.seat != nullptr && platform.latestSerial != 0) {
+        xdg_toplevel_move(toplevel, platform.seat, platform.latestSerial);
+    }
+}
+
+void WindowImpl::startResize(u32 edges) {
+    u32 edge = XDG_TOPLEVEL_RESIZE_EDGE_NONE;
+    const bool top = (edges & ChromeEdgeTop) != 0;
+    const bool bottom = (edges & ChromeEdgeBottom) != 0;
+    const bool left = (edges & ChromeEdgeLeft) != 0;
+    const bool right = (edges & ChromeEdgeRight) != 0;
+    if (top && left) {
+        edge = XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT;
+    } else if (top && right) {
+        edge = XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT;
+    } else if (bottom && left) {
+        edge = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT;
+    } else if (bottom && right) {
+        edge = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT;
+    } else if (top) {
+        edge = XDG_TOPLEVEL_RESIZE_EDGE_TOP;
+    } else if (bottom) {
+        edge = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
+    } else if (left) {
+        edge = XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
+    } else if (right) {
+        edge = XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
+    }
+    if (platform.seat != nullptr && platform.latestSerial != 0 && edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
+        xdg_toplevel_resize(toplevel, platform.seat, platform.latestSerial, edge);
+    }
+}
+
 RenderContext WindowImpl::renderContext() const {
     return {
         .backend = RenderBackend::Wayland,
         .connection = platform.display,
-        .window = surface,
+        .window = contentSurface,
     };
 }
 

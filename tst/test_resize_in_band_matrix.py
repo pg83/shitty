@@ -47,8 +47,6 @@ class ResizeInBandMatrixTest(unittest.TestCase):
             terminal.write(b"\x1b[?2048h")
             terminal.read_input()
             terminal.resize_pixels(27, 35)
-            self.assertEqual(terminal.read_input(), b"")
-            terminal.write(b"\x1b[?2048l\x1b[?2048h")
             self.assertEqual(terminal.read_input(), b"\x1b[48;3;5;24;20t")
 
 

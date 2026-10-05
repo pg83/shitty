@@ -22,6 +22,10 @@ build.flags.allow({
         "descr": "total number of test partitions",
         "default": "",
     },
+    "coverage": {
+        "descr": "instrument for llvm source-based coverage",
+        "default": "",
+    },
 })
 
 
@@ -91,6 +95,34 @@ build.cxxflags += [
     "-std=c++26",
     "-Og" if "-DDEBUG" in build.cppflags else "-O2",
 ]
+# -Dcoverage instruments what this graph compiles for llvm source-based
+# coverage, so a review wave can bring numbers instead of arguments about
+# what the suite reaches. The imported graphs (libstd, plt) stay out of
+# it, so the numbers cover lib/shitty, bin and tst:
+#
+#     ./build -Dcoverage unit_tests
+#     LLVM_PROFILE_FILE=/tmp/u.profraw ./.build/unit_tests --threads=1
+#     llvm-profdata merge -sparse /tmp/u.profraw -o /tmp/u.profdata
+#     llvm-cov report ./.build/unit_tests -instr-profile=/tmp/u.profdata
+#
+# Adding nothing when the flag is absent is the point: an ordinary build
+# stays the ordinary build, down to the bytes of its binaries.
+if build.flags.coverage or os.environ.get("SHITTY_COVERAGE"):
+    # The -D alone would instrument everything except the one binary worth
+    # measuring. Any -D makes the target configuration differ from the host
+    # one, and the runner then re-invokes this file for the host with no
+    # defines at all; every program the build itself runs - unit_tests among
+    # them - is taken from that second graph. The environment is what the
+    # re-invocation inherits, so the switch travels in it. Set here rather
+    # than lower down on purpose: the imported graphs (libstd, plt) are
+    # loaded further down and read no such variable, so they stay
+    # uninstrumented - and they have to, an all-instrumented binary dies in
+    # the profile runtime before the first test (which is what R2-test saw).
+    os.environ["SHITTY_COVERAGE"] = "1"
+    build.cxxflags += ["-fprofile-instr-generate", "-fcoverage-mapping"]
+    # The profile runtime that writes the .profraw lives on the linker's
+    # side of the flag, and every binary this graph links needs it.
+    build.ldflags += ["-fprofile-instr-generate"]
 production_path_flags = [
     "-ffile-prefix-map=$(S)/lib/vterm=lib/vterm",
     "-ffile-prefix-map=$(S)/lib/embed=lib/embed",
@@ -138,22 +170,85 @@ def command(**kwargs):
             kwargs["inputs"] = [*kwargs.get("inputs", []), "$(S)/tst/run_timed.py"]
     return untimed_command(**kwargs)
 
-freetype = pkg_config("freetype2", required=False)
-fontconfig = pkg_config("fontconfig", required=False)
-harfbuzz = pkg_config("harfbuzz", required=False)
-brotli_common = pkg_config("libbrotlicommon", required=False)
-simdutf = pkg_config("simdutf >= 6.5.0", required=False)
+# ponytail: on macOS the CoreText/Metal backend covers the four font packages,
+# and linking Homebrew dylibs only makes the built binary die on the next `brew
+# upgrade` that bumps a soname. This is what dev/build_brew_macos.sh already did
+# with an empty PKG_CONFIG_LIBDIR; 62cef373 made it the default instead. simdutf
+# is not a font package, but it is a Homebrew dylib on the same terms, and
+# base64.cpp has a portable path to fall back to.
+#
+# But "darwin" is not the property that reasoning is about. The property is
+# where the library lives: a Nix store path is immutable and no upgrade can
+# ever move it out from under a linked binary, while /opt/homebrew is rewritten
+# in place. Asking `darwin` answered the same for both and switched FreeType,
+# fontconfig and harfbuzz off inside the Nix CI too, where flake.nix puts them
+# in buildInputs on purpose - font_freetype.cpp was compiled zero times there
+# and eleven font tests failed for it (G13).
+#
+# So ask the paths pkg-config actually hands the compiler and the linker. A
+# package survives on darwin only when everything it contributes lives in the
+# store, which is exactly the case a `brew upgrade` cannot reach. NIX_STORE is
+# what a Nix builder exports; the literal default covers `nix develop`, where
+# it may be absent. Nothing here is Nix-specific by name: any store that hands
+# out immutable paths under that root passes.
+nix_store = os.environ.get("NIX_STORE") or "/nix/store"
+
+
+def from_immutable_store(dep):
+    paths = [
+        flag[flag.index("/"):]
+        for flag in [*dep.public_cflags, *dep.ldflags]
+        if "/" in flag
+    ]
+    return bool(paths) and all(path.startswith(nix_store + "/") for path in paths)
+
+
+def optional_pkg(*pkgs):
+    dep = pkg_config(*pkgs, required=False)
+    if darwin and not from_immutable_store(dep):
+        # A Homebrew or hand-built prefix, or nothing at all: the default macOS
+        # build stays the library-free one 62cef373 made it. Disabling the same
+        # object pkg_config returned keeps one dependency where there was one
+        # before - the runner drops a disabled target from compile flags and
+        # link flags alike, so no half of it can survive on its own.
+        dep.enabled = False
+    return dep
+
+
+freetype = optional_pkg("freetype2")
+fontconfig = optional_pkg("fontconfig")
+harfbuzz = optional_pkg("harfbuzz")
+brotli_common = optional_pkg("libbrotlicommon")
+simdutf = optional_pkg("simdutf >= 6.5.0")
+if simdutf:
+    # The define rides on the dependency that carries -lsimdutf, and the runner
+    # skips a disabled target for compile flags and link flags alike, so a
+    # translation unit can only see HAVE_SIMDUTF where the library is also on
+    # the link line. base64.cpp used to decide this for itself with
+    # __has_include, and under Nix on macOS - header on the include path from
+    # buildInputs, the pkg-config lookup above switched off by platform - it
+    # compiled calls into a library nobody linked.
+    simdutf.public_cppflags += ["-DHAVE_SIMDUTF=1"]
 
 have_freetype_backend = bool(freetype and harfbuzz)
 if have_freetype_backend:
-    build.cppflags += ["-DHAVE_FREETYPE=1", "-DHAVE_HARFBUZZ=1"]
+    # Each define rides on the dependency that carries its -l flag, the way
+    # HAVE_SIMDUTF does above: the runner walks a disabled target out of the
+    # compile flags and the link flags together, so "define set, library
+    # absent" has nowhere to live. The global build.cppflags these used to sit
+    # in were a second place to say the same thing.
+    freetype.public_cppflags += ["-DHAVE_FREETYPE=1"]
+    harfbuzz.public_cppflags += ["-DHAVE_HARFBUZZ=1"]
     if fontconfig:
-        build.cppflags += ["-DHAVE_FONTCONFIG=1"]
+        fontconfig.public_cppflags += ["-DHAVE_FONTCONFIG=1"]
 else:
-    freetype = dependency()
-    fontconfig = dependency()
-    harfbuzz = dependency()
-    brotli_common = dependency()
+    # No backend: switch the very objects pkg_config returned off, rather than
+    # replacing them with fresh empty ones. dependency() with no arguments is
+    # *enabled*, so the replacements were true in a boolean context - and
+    # SHITTY_TEST_FONTCONFIG below, which asks exactly that, reported a
+    # fontconfig that no target links and no translation unit can see (G13).
+    for font_dependency in (freetype, fontconfig, harfbuzz, brotli_common):
+        font_dependency.enabled = False
 
 if darwin:
     darwin_frameworks = os.path.join(os.environ["OSX_SDK"], "System", "Library", "Frameworks") if "OSX_SDK" in os.environ else None
@@ -314,7 +409,13 @@ for render_shader_name in render_shader_names:
     render_shader_outputs.append(render_shader_output)
     render_shader_targets.append(command(
         name=f"render_shader_{render_shader_name}",
-        inputs=["$(S)/lib/shitty/render.comp", "$(S)/lib/shitty/generate_render_shaders.py"],
+        # render_push_constants.h is an input because the generator reads
+        # the fill-pass bit and the transparency field out of it (R9-3,
+        # T10). Without it here, moving one of those numbers rebuilds the
+        # C++ and leaves the shader compiled from the old one - which is
+        # the very drift the single definition exists to prevent, arriving
+        # through the build graph instead of through a second declaration.
+        inputs=["$(S)/lib/shitty/render.comp", "$(S)/lib/shitty/render_push_constants.h", "$(S)/lib/shitty/generate_render_shaders.py"],
         outputs=[render_shader_output],
         cmd=[
             "python3",
@@ -348,7 +449,13 @@ render_spv = command(
 if darwin:
     render_msl = command(
         name="render_msl",
-        inputs=["$(S)/lib/shitty/render.comp", "$(S)/lib/shitty/generate_render_shaders.py"],
+        # render_push_constants.h is an input because the generator reads
+        # the fill-pass bit and the transparency field out of it (R9-3,
+        # T10). Without it here, moving one of those numbers rebuilds the
+        # C++ and leaves the shader compiled from the old one - which is
+        # the very drift the single definition exists to prevent, arriving
+        # through the build graph instead of through a second declaration.
+        inputs=["$(S)/lib/shitty/render.comp", "$(S)/lib/shitty/render_push_constants.h", "$(S)/lib/shitty/generate_render_shaders.py"],
         outputs=["$(B)/render_msl.h"],
         cmd=[
             "python3",
@@ -566,6 +673,47 @@ pretty_icon_data = command(
 )
 
 
+# The brand's example config, embedded so -printConfig can write it back
+# out. Same generator as the icons above - it takes any file and emits a
+# byte array - and per brand for the same reason: bin/pt/pretty.toml is
+# the one pt has to print, and shipping shitty.toml inside pt would put
+# the forbidden substring in it (tst/pretty_binary_branding.py).
+shitty_config_data = command(
+    name="shitty_config_data",
+    inputs=[
+        "$(S)/lib/shitty/generate_font_data.py",
+        "$(S)/bin/st/shitty.toml",
+    ],
+    outputs=["$(B)/shitty_config_data.h"],
+    cmd=[
+        "python3",
+        "$(S)/lib/shitty/generate_font_data.py",
+        "$(B)/shitty_config_data.h",
+        "shittyExampleConfig=$(S)/bin/st/shitty.toml",
+    ],
+    descr="EC",
+    color="magenta",
+)
+
+
+pretty_config_data = command(
+    name="pretty_config_data",
+    inputs=[
+        "$(S)/lib/shitty/generate_font_data.py",
+        "$(S)/bin/pt/pretty.toml",
+    ],
+    outputs=["$(B)/pretty_config_data.h"],
+    cmd=[
+        "python3",
+        "$(S)/lib/shitty/generate_font_data.py",
+        "$(B)/pretty_config_data.h",
+        "prettyExampleConfig=$(S)/bin/pt/pretty.toml",
+    ],
+    descr="EC",
+    color="magenta",
+)
+
+
 font_coverage = command(
     name="font_coverage",
     inputs=[
@@ -610,6 +758,29 @@ font_data = command(
 )
 
 
+# The shell integration's scripts (lib/shitty/shell_integration.cpp), written
+# out at startup for the shell to read. One copy for both brands: the scripts
+# name neither, which tst/pretty_binary_branding.py holds pt to.
+shell_integration_data = command(
+    name="shell_integration_data",
+    inputs=[
+        "$(S)/lib/shitty/generate_font_data.py",
+        "$(S)/lib/shitty/shell/zsh/.zshenv",
+        "$(S)/lib/shitty/shell/zsh/integration.zsh",
+    ],
+    outputs=["$(B)/shell_integration_data.h"],
+    cmd=[
+        "python3",
+        "$(S)/lib/shitty/generate_font_data.py",
+        "$(B)/shell_integration_data.h",
+        "zshIntegrationEnv=$(S)/lib/shitty/shell/zsh/.zshenv",
+        "zshIntegration=$(S)/lib/shitty/shell/zsh/integration.zsh",
+    ],
+    descr="SI",
+    color="magenta",
+)
+
+
 terminal_colors_data = command(
     inputs=[
         "$(S)/lib/shitty/terminal_colors.json",
@@ -642,6 +813,7 @@ platform_font_sources = {
 }
 platform_renderer_sources = {
     "$(S)/lib/shitty/render_vk.cpp",
+    "$(S)/lib/shitty/ui_wayland_chrome.cpp",
 }
 enabled_font_sources = set()
 if have_freetype_backend:
@@ -649,6 +821,7 @@ if have_freetype_backend:
 enabled_renderer_sources = set()
 if linux:
     enabled_renderer_sources.add("$(S)/lib/shitty/render_vk.cpp")
+    enabled_renderer_sources.add("$(S)/lib/shitty/ui_wayland_chrome.cpp")
 all_libshitty_sources = [
     source for source in build.glob("$(S)/lib/shitty/*.cpp") + build.glob("$(S)/lib/vterm/*.cpp")
     if source not in (heap_profile_source, *unit_sources)
@@ -661,10 +834,14 @@ if darwin:
         "inputs": ["$(B)/render_msl.h"],
     })
     all_libshitty_sources.append("$(S)/lib/shitty/ui_csd_tabs.mm")
+    all_libshitty_sources.append("$(S)/lib/shitty/ui_quick_hotkey.mm")
+    all_libshitty_sources.append("$(S)/lib/shitty/ui_sidebar_tabs.mm")
+    all_libshitty_sources.append("$(S)/lib/shitty/ui_palette.mm")
 vterm_source = "$(S)/lib/vterm/vterm.cpp"
 font_embedded_source = "$(S)/lib/shitty/font_embedded.cpp"
 application_source = "$(S)/lib/shitty/application.cpp"
 terminal_colors_source = "$(S)/lib/shitty/terminal_colors.cpp"
+shell_integration_source = "$(S)/lib/shitty/shell_integration.cpp"
 grapheme_source = "$(S)/lib/shitty/grapheme.cpp"
 unicode_source = "$(S)/lib/vterm/unicode.cpp"
 libshitty_sources = [
@@ -681,6 +858,9 @@ libshitty_sources = [
         "src": source,
         "inputs": ["$(B)/terminal_colors.json.h"],
     } if source == terminal_colors_source else {
+        "src": source,
+        "inputs": ["$(B)/shell_integration_data.h"],
+    } if source == shell_integration_source else {
         "src": source,
         "inputs": ["$(B)/unicode_data.h"],
     } if source == unicode_source else source
@@ -700,6 +880,9 @@ libshitty_test_sources = [
         "src": source,
         "inputs": ["$(B)/terminal_colors.json.h"],
     } if source == terminal_colors_source else {
+        "src": source,
+        "inputs": ["$(B)/shell_integration_data.h"],
+    } if source == shell_integration_source else {
         "src": source,
         "inputs": ["$(B)/unicode_data.h"],
     } if source == unicode_source else source
@@ -730,7 +913,7 @@ libshitty = library(
 st = program(
     srcs=[{
         "src": shitty_main_source,
-        "inputs": ["$(B)/shitty_icon_data.h"],
+        "inputs": ["$(B)/shitty_icon_data.h", "$(B)/shitty_config_data.h"],
     }],
     cxxflags=production_path_flags,
     deps=[libshitty],
@@ -742,7 +925,7 @@ pt = program(
     output="$(B)/pt",
     srcs=[{
         "src": pretty_main_source,
-        "inputs": ["$(B)/pretty_icon_data.h"],
+        "inputs": ["$(B)/pretty_icon_data.h", "$(B)/pretty_config_data.h"],
     }],
     cxxflags=production_path_flags,
     deps=[libshitty],
@@ -770,7 +953,7 @@ st_memprofile = program(
     output="$(B)/st_memprofile",
     srcs=[{
         "src": shitty_main_source,
-        "inputs": ["$(B)/shitty_icon_data.h"],
+        "inputs": ["$(B)/shitty_icon_data.h", "$(B)/shitty_config_data.h"],
     }, heap_profile_source],
     cxxflags=heap_profile_cxxflags,
     cppflags=["-DSHITTY_HEAP_PROFILE=1"],
@@ -805,7 +988,7 @@ st_test = program(
     output="$(B)/st_test",
     srcs=[{
         "src": shitty_main_source,
-        "inputs": ["$(B)/shitty_icon_data.h"],
+        "inputs": ["$(B)/shitty_icon_data.h", "$(B)/shitty_config_data.h"],
     }],
     cppflags=["-DSHITTY_FOR_TESTS=1"],
     deps=[libshitty_test],
@@ -817,7 +1000,7 @@ pt_test = program(
     output="$(B)/pt_test",
     srcs=[{
         "src": pretty_main_source,
-        "inputs": ["$(B)/pretty_icon_data.h"],
+        "inputs": ["$(B)/pretty_icon_data.h", "$(B)/pretty_config_data.h"],
     }],
     cppflags=["-DSHITTY_FOR_TESTS=1"],
     deps=[libshitty_test],
@@ -847,7 +1030,7 @@ st_test_prod_parser = program(
     output="$(B)/st_test_prod_parser",
     srcs=[{
         "src": shitty_main_source,
-        "inputs": ["$(B)/shitty_icon_data.h"],
+        "inputs": ["$(B)/shitty_icon_data.h", "$(B)/shitty_config_data.h"],
     }],
     cppflags=["-DSHITTY_FOR_TESTS=1"],
     deps=[libshitty_test_prod_parser],
@@ -859,7 +1042,7 @@ pt_test_prod_parser = program(
     output="$(B)/pt_test_prod_parser",
     srcs=[{
         "src": pretty_main_source,
-        "inputs": ["$(B)/pretty_icon_data.h"],
+        "inputs": ["$(B)/pretty_icon_data.h", "$(B)/pretty_config_data.h"],
     }],
     cppflags=["-DSHITTY_FOR_TESTS=1"],
     deps=[libshitty_test_prod_parser],
@@ -918,142 +1101,172 @@ core_perf = program(
 )
 
 
-# The C embedding facade over the VT core: shitty_vt_* in lib/embed,
-# linked with libstd and a headless-only libplt. `./build a` bundles
-# the three into one static archive, `./build so` links the shared
-# library with everything but the facade hidden by the version script.
-# Everything embed-side is compiled -fPIC: `build so` needs it, and a
-# position-independent static archive is what a consumer linking the
-# facade into their own shared object wants anyway.
-plt_headless = import_build(
-    plt_build,
-    "libplt_headless.a",
-    extra_cflags=[*embedded_path_flags, "-fPIC"],
-    extra_cxxflags=["-fPIC"],
-    extra_cppflags=["-Dno_vendored_std", "-I$(S)/../libstd", "-Dplatforms=headless"],
-)
-libstd_pic = import_build(
-    std_build,
-    "libstd_pic.a",
-    extra_cflags=[*embedded_path_flags, "-fPIC"],
-    extra_cxxflags=["-fPIC"],
-)
-libstd_pic.ldflags += libstd_backends
+# The C embedding facade links against a lib/vterm of its own now. It could
+# not before: vterm.cpp called Composer::contentInsets() and Composer::resize()
+# - the two symbols A1/A10 leave on the embedder's side - so an archive globbed
+# out of lib/vterm alone had two undefined symbols before the facade was even
+# compiled, and lib/embed/shitty_vt.cpp did not compile against our
+# eleven-parameter Vterm::create either.
+#
+# Both are closed: the window's insets, the in-band resize and the pane list's
+# cell count reach the core through VtHost (contentInsets, surfaceResized,
+# cellCapacityExcept), Vterm::create takes ten parameters and no Composer&, and
+# lib/vterm/vt_headless.cpp - the one other file in the core that reached into
+# lib/shitty - moved to lib/shitty, where the adapter it is has always
+# belonged.
+# That last move is what `./build so` needs specifically: link_shared.py takes
+# the core archive under --whole-archive with --no-undefined, so a single
+# object referring to lib/shitty fails the link whether or not anything calls
+# it.
+#
+# The flag stays as a switch rather than being dissolved, because it names
+# exactly what the facade costs: the targets below, `example` in the deps and
+# SHITTY_EMBED_EXAMPLE_BINARY in the env of every python test group (both
+# written out in make_python_test_groups below and conditional on `example is
+# not None`), and the class-level skip in tst/test_embed_example.py, which keys
+# on the artifact existing and so lifts itself the first time the binary is
+# built.
+embed_facade_links = True
 
-embed_sources = [
-    {
-        "src": source,
-        "inputs": ["$(B)/parser.rl.h"],
-    } if source == parser_source else {
-        "src": source,
-        "inputs": ["$(B)/unicode_data.h"],
-    } if source == unicode_source else source
-    for source in sorted(build.glob("$(S)/lib/vterm/*.cpp"))
-    if source not in unit_sources
-] + ["$(S)/lib/embed/shitty_vt.cpp"]
-
-libshitty_vt_core = library(
-    name="libshitty_vt_core",
-    srcs=embed_sources,
-    cflags=["-fPIC"],
-    cxxflags=[*production_path_flags, "-fPIC"],
-    deps=[plt_headless, libstd_pic, simdutf],
-    output="$(B)/libshitty_vt_core.a",
-)
-
-example = program(
-    name="example",
-    output="$(B)/example",
-    srcs=["$(S)/bin/example/main.c"],
-    deps=[libshitty_vt_core, plt_headless, libstd_pic, simdutf],
-)
-
-if linux:
-    shitty_vt_a = command(
-        name="shitty_vt_a",
-        inputs=[
-            "$(S)/lib/embed/merge_archives.py",
-            libshitty_vt_core.output,
-            plt_headless.output,
-            libstd_pic.output,
-        ],
-        outputs=["$(B)/libshitty_vt.a"],
-        deps=[libshitty_vt_core, libstd_pic, plt_headless],
-        cmd=[[
-            "python3",
-            "$(S)/lib/embed/merge_archives.py",
-            "$(B)/libshitty_vt.a",
-            libshitty_vt_core.output,
-            plt_headless.output,
-            libstd_pic.output,
-        ]],
-        descr="AR",
-        color="magenta",
+if embed_facade_links:
+    # The C embedding facade over the VT core: shitty_vt_* in lib/embed,
+    # linked with libstd and a headless-only libplt. `./build a` bundles
+    # the three into one static archive, `./build so` links the shared
+    # library with everything but the facade hidden by the version script.
+    # Everything embed-side is compiled -fPIC: `build so` needs it, and a
+    # position-independent static archive is what a consumer linking the
+    # facade into their own shared object wants anyway.
+    plt_headless = import_build(
+        plt_build,
+        "libplt_headless.a",
+        extra_cflags=[*embedded_path_flags, "-fPIC"],
+        extra_cxxflags=["-fPIC"],
+        extra_cppflags=["-Dno_vendored_std", "-I$(S)/../libstd", "-Dplatforms=headless"],
     )
-    group("a", shitty_vt_a)
-
-    shitty_vt_so = command(
-        name="shitty_vt_so",
-        inputs=[
-            "$(S)/lib/embed/link_shared.py",
-            "$(S)/lib/embed/shitty_vt.map",
-            libshitty_vt_core.output,
-            plt_headless.output,
-            libstd_pic.output,
-        ],
-        outputs=["$(B)/libshitty_vt.so"],
-        deps=[libshitty_vt_core, libstd_pic, plt_headless],
-        cmd=[[
-            "python3",
-            "$(S)/lib/embed/link_shared.py",
-            "$(B)/libshitty_vt.so",
-            "$(S)/lib/embed/shitty_vt.map",
-            libshitty_vt_core.output,
-            plt_headless.output,
-            libstd_pic.output,
-            *simdutf.ldflags,
-            # libstd's hash, atomic and io_uring backends are probed, so the
-            # shared link needs whatever the probe chose; --no-undefined
-            # rejects the library outright without them.
-            *libstd_backends,
-        ]],
-        descr="SO",
-        color="magenta",
+    libstd_pic = import_build(
+        std_build,
+        "libstd_pic.a",
+        extra_cflags=[*embedded_path_flags, "-fPIC"],
+        extra_cxxflags=["-fPIC"],
     )
-    group("so", shitty_vt_so)
+    libstd_pic.ldflags += libstd_backends
 
-    # The release tarball: both libraries, the header, and a pkg-config
-    # file carrying the link flags this build probed - the discovery
-    # story of issue 102. Relocatable; point PKG_CONFIG_PATH at its
-    # lib/pkgconfig after unpacking.
-    shitty_vt_tgz = command(
-        name="shitty_vt_tgz",
-        inputs=[
-            "$(S)/lib/embed/make_release.py",
-            "$(S)/lib/embed/shitty_vt.h",
-            "$(B)/libshitty_vt.a",
-            "$(B)/libshitty_vt.so",
-        ],
-        outputs=["$(B)/shitty_vt.tgz"],
-        deps=[shitty_vt_a, shitty_vt_so],
-        cmd=[[
-            "python3",
-            "$(S)/lib/embed/make_release.py",
-            "$(B)/shitty_vt.tgz",
-            shitty_version,
-            "$(S)/lib/embed/shitty_vt.h",
-            "$(B)/libshitty_vt.a",
-            "$(B)/libshitty_vt.so",
-            "--",
-            *simdutf.ldflags,
-            *libstd_backends,
-            "-lpthread",
-            "-lm",
-        ]],
-        descr="TZ",
-        color="magenta",
+    embed_sources = [
+        {
+            "src": source,
+            "inputs": ["$(B)/parser.rl.h"],
+        } if source == parser_source else {
+            "src": source,
+            "inputs": ["$(B)/unicode_data.h"],
+        } if source == unicode_source else source
+        for source in sorted(build.glob("$(S)/lib/vterm/*.cpp"))
+        if source not in unit_sources
+    ] + ["$(S)/lib/embed/shitty_vt.cpp"]
+
+    libshitty_vt_core = library(
+        name="libshitty_vt_core",
+        srcs=embed_sources,
+        cflags=["-fPIC"],
+        cxxflags=[*production_path_flags, "-fPIC"],
+        deps=[plt_headless, libstd_pic, simdutf],
+        output="$(B)/libshitty_vt_core.a",
     )
-    group("tgz", shitty_vt_tgz)
+
+    example = program(
+        name="example",
+        output="$(B)/example",
+        srcs=["$(S)/bin/example/main.c"],
+        deps=[libshitty_vt_core, plt_headless, libstd_pic, simdutf],
+    )
+
+    if linux:
+        shitty_vt_a = command(
+            name="shitty_vt_a",
+            inputs=[
+                "$(S)/lib/embed/merge_archives.py",
+                libshitty_vt_core.output,
+                plt_headless.output,
+                libstd_pic.output,
+            ],
+            outputs=["$(B)/libshitty_vt.a"],
+            deps=[libshitty_vt_core, libstd_pic, plt_headless],
+            cmd=[[
+                "python3",
+                "$(S)/lib/embed/merge_archives.py",
+                "$(B)/libshitty_vt.a",
+                libshitty_vt_core.output,
+                plt_headless.output,
+                libstd_pic.output,
+            ]],
+            descr="AR",
+            color="magenta",
+        )
+        group("a", shitty_vt_a)
+
+        shitty_vt_so = command(
+            name="shitty_vt_so",
+            inputs=[
+                "$(S)/lib/embed/link_shared.py",
+                "$(S)/lib/embed/shitty_vt.map",
+                libshitty_vt_core.output,
+                plt_headless.output,
+                libstd_pic.output,
+            ],
+            outputs=["$(B)/libshitty_vt.so"],
+            deps=[libshitty_vt_core, libstd_pic, plt_headless],
+            cmd=[[
+                "python3",
+                "$(S)/lib/embed/link_shared.py",
+                "$(B)/libshitty_vt.so",
+                "$(S)/lib/embed/shitty_vt.map",
+                libshitty_vt_core.output,
+                plt_headless.output,
+                libstd_pic.output,
+                *simdutf.ldflags,
+                # libstd's hash, atomic and io_uring backends are probed, so the
+                # shared link needs whatever the probe chose; --no-undefined
+                # rejects the library outright without them.
+                *libstd_backends,
+            ]],
+            descr="SO",
+            color="magenta",
+        )
+        group("so", shitty_vt_so)
+
+        # The release tarball: both libraries, the header, and a pkg-config
+        # file carrying the link flags this build probed - the discovery
+        # story of issue 102. Relocatable; point PKG_CONFIG_PATH at its
+        # lib/pkgconfig after unpacking.
+        shitty_vt_tgz = command(
+            name="shitty_vt_tgz",
+            inputs=[
+                "$(S)/lib/embed/make_release.py",
+                "$(S)/lib/embed/shitty_vt.h",
+                "$(B)/libshitty_vt.a",
+                "$(B)/libshitty_vt.so",
+            ],
+            outputs=["$(B)/shitty_vt.tgz"],
+            deps=[shitty_vt_a, shitty_vt_so],
+            cmd=[[
+                "python3",
+                "$(S)/lib/embed/make_release.py",
+                "$(B)/shitty_vt.tgz",
+                shitty_version,
+                "$(S)/lib/embed/shitty_vt.h",
+                "$(B)/libshitty_vt.a",
+                "$(B)/libshitty_vt.so",
+                "--",
+                *simdutf.ldflags,
+                *libstd_backends,
+                "-lpthread",
+                "-lm",
+            ]],
+            descr="TZ",
+            color="magenta",
+        )
+        group("tgz", shitty_vt_tgz)
+else:
+    example = None
 
 
 # Each shard is an independent graph node with its own hard timeout.
@@ -1072,6 +1285,9 @@ python_test_inputs = [
     *build.glob("$(S)/lib/vterm/*_ut.cpp"),
     *build.glob("$(S)/tst/*.py"),
     *build.glob("$(S)/tst/*.md"),
+    # test_zsh_integration.py runs these under a real zsh.
+    "$(S)/lib/shitty/shell/zsh/.zshenv",
+    "$(S)/lib/shitty/shell/zsh/integration.zsh",
     "$(S)/tst/pty_test_helper.c",
     *build.glob("$(S)/ext/fonts/*"),
     # The color-scheme suite reads the imported theme licenses, the
@@ -1160,7 +1376,10 @@ def make_python_test_groups(name, output_directory, test_binary, test_target, pr
             name=f"{name}_group_{group_index:02}",
             inputs=python_test_inputs,
             outputs=[output],
-            deps=[test_target, pretty_test_target, toml_dump, example],
+            # example joins this list with embed_facade_links above; until
+            # then tst/test_embed_example.py runs without a binary and
+            # reports the gap instead of hiding it.
+            deps=[test_target, pretty_test_target, toml_dump, *([example] if example is not None else [])],
             cmd=[
                 [
                     "python3",
@@ -1173,7 +1392,7 @@ def make_python_test_groups(name, output_directory, test_binary, test_target, pr
             cwd="$(S)",
             env={
                 "SHITTY_TEST_BINARY": test_binary,
-                "SHITTY_EMBED_EXAMPLE_BINARY": "$(B)/example",
+                **({"SHITTY_EMBED_EXAMPLE_BINARY": "$(B)/example"} if example is not None else {}),
                 "SHITTY_PRETTY_TEST_BINARY": pretty_test_binary,
                 "SHITTY_TOML_DUMP_BINARY": "$(B)/toml_dump",
                 "SHITTY_TEST_FONTCONFIG": "1" if fontconfig else "0",
@@ -1293,6 +1512,616 @@ wayland_title_fallback = command(
     color="cyan",
 )
 
+
+# A1 says the scalar border is the user's option and Composer::contentInsets()
+# is the only source of layout geometry. Nothing in the tree enforced that: the
+# migration off the scalar was checked by grep once, and a single call put back
+# anywhere would compile, link, pass every test, and silently lay out a window
+# as if no chrome reserved anything (R3-test, I3). This is that grep, wired to
+# a build step so it runs again on every change instead of once in a review.
+#
+# Both names, not one. The node was written against borderPixels() alone, and
+# the same commit published Composer::scaledPixels() - which *is* the body of
+# borderPixels(), one multiplication away from the option. A layout that reads
+# `composer.scaledPixels(composer.opts->border)` is the exact rollback this
+# node exists to stop, and it passed the node green (R4-test, I1) while looking
+# sanctioned: the name is public, documented and new.
+#
+# The allowance is per file, and a count where a count is what makes it tight:
+# composer.{h,cpp} own both functions and are the only place layout may spell
+# them, so their allowance is the number of times they do it today - a count
+# there is what keeps Composer::resize() from quietly growing a scalar of its
+# own (R4-qa, Q4). test_mode.cpp reports the option's value in its FONT_STATE
+# answer, which is a report and not a layout (R3-arch examined it and let it
+# stand), and one is how many of those there is. The two _ut.cpp files read the
+# scalar back to check it against the insets, which is the one legitimate
+# reason to name it outside Composer, and there is no useful number to write
+# down for a test file that grows.
+#
+# T2.1: what is counted is a *call*, through blanked source, and that is three
+# separate repairs to the same scan (T0.3, section 3.2 and 3.4).
+#
+# The scan used to be str.count on raw text, so prose counted. Two thirds of
+# composer.h's old allowance of five was the file explaining itself, and
+# grid_geometry.h's whole allowance of one was a comment - G1 walked into this
+# from the other side and found that a file could spend its allowance on prose
+# and let a real call through for free. Reading blanked source, the way the
+# other three guards already do, ends both halves of that: the numbers below
+# are calls and only calls, which is why they went down and why
+# grid_geometry.h left the map rather than being re-keyed by T5.2 later.
+#
+# Requiring the bracket is what keeps the guard usable across the merge at all.
+# The upstream core carries a VtGeometry::borderPixels field, so every
+# `geometry.borderPixels` read in upstream code contains the name: measured on
+# a clean origin/master tree, about 37 substring hits in 8 files, not one of
+# them an A1 violation. A guard that red-lines on legitimate upstream code is a
+# guard someone widens the allowance to silence, which is how A1 dies quietly
+# inside a green node. Ours are methods and are always spelled with the
+# bracket; the field is always read without one, so the bracket separates them
+# and no allowance had to grow.
+border_pixels_names = ("borderPixels", "scaledPixels")
+border_pixels_allowance = {
+    "lib/shitty/composer.h": 2,
+    "lib/shitty/composer.cpp": 8,
+    "lib/shitty/composer_ut.cpp": None,
+    "lib/shitty/mouse_frontend_ut.cpp": None,
+    "lib/shitty/test_mode.cpp": 1,
+}
+
+# The roots the scan walks and the files the node depends on have to be the
+# same set, or a call could be added where nothing re-runs the check. They are
+# now one expression rather than two lists that agreed by hand and had already
+# stopped agreeing on the subdirectories (R4-test, Z3). libstd is left out of
+# both on purpose: it is a vendored standard library and has never heard of
+# Composer.
+#
+# All three source-scanning guards below share this one set: a file that can
+# hide a border call can hide a single-pane pointer geometry or an unguarded
+# darwin call just as easily, and three lists that had to agree by hand is how
+# Z3 happened once already.
+#
+# lib/vterm joined the set in T2.1, with M3. The VT core is moving out of
+# lib/shitty a commit at a time, and a root the scan does not walk is a root
+# where every one of these four checks passes by having nothing to read.
+#
+# lib/embed joined it in T6.1, for the same reason one merge later: the C
+# facade is a new product directory, and until it was named here nothing
+# guarded it at all. Probed rather than reasoned about - the line
+# `mouseGeometry(composer); createCsdTabsUi(composer); composer.borderPixels()`
+# written as code into lib/embed/shitty_vt.cpp left all four guards green (M7,
+# probe 6; re-measured in T6.1 before this line changed).
+#
+# .c joined the suffixes in the same task, and it is the other half of the same
+# hole seen from the other side: bin has been a root since the beginning, but
+# bin/example/main.c is the tree's only .c file and the scan walked straight
+# past it. A root the scan does not walk and a file the scan does not read are
+# the same blindness, and the second one is worse for being invisible - the
+# directory is right there in the list.
+guard_scan_roots = ("lib/shitty", "lib/vterm", "lib/embed", "ext/plt", "bin")
+guard_scan_suffixes = (".cpp", ".h", ".mm", ".c")
+guard_scan_sources = sorted(set(
+    source
+    for root in guard_scan_roots
+    for suffix in guard_scan_suffixes
+    for source in build.glob(f"$(S)/{root}/**/*{suffix}")
+))
+
+# Every guard below reads source rather than symbols, so each has to see it the
+# way the compiler does: comments and string bodies are replaced by spaces, one
+# character for one character, and never deleted. R5-qa's own one-off audit
+# collapsed block comments instead, moved every line after them, and reported
+# three calls on the wrong side of an #if - an instrument that "finds problems"
+# is more convincing than a silent one, which is exactly why it needs controls
+# on both sides.
+#
+# border_pixels_guard joined the other three here in T2.1; it had been counting
+# raw substrings, prose included, which is the whole of G1's second finding.
+guard_source_reader = r"""
+import pathlib
+import re
+import sys
+
+
+def blanked(text):
+    out = list(text)
+    index = 0
+    size = len(text)
+    while index < size:
+        char = text[index]
+        if char == "/" and index + 1 < size and text[index + 1] == "/":
+            while index < size and text[index] != "\n":
+                out[index] = " "
+                index += 1
+        elif char == "/" and index + 1 < size and text[index + 1] == "*":
+            out[index] = out[index + 1] = " "
+            index += 2
+            while index < size and not (text[index] == "*" and index + 1 < size and text[index + 1] == "/"):
+                if text[index] != "\n":
+                    out[index] = " "
+                index += 1
+            if index < size:
+                out[index] = out[index + 1] = " "
+                index += 2
+        elif char in "\"'":
+            quote = char
+            index += 1
+            while index < size and text[index] != quote:
+                if text[index] == "\\" and index + 1 < size:
+                    out[index] = " "
+                    index += 1
+                if index < size:
+                    if text[index] != "\n":
+                        out[index] = " "
+                    index += 1
+            index += 1
+        else:
+            index += 1
+    return "".join(out)
+
+
+def scanned(roots, suffixes):
+    for root in roots:
+        for path in sorted(pathlib.Path(root).rglob("*")):
+            if path.suffix in suffixes and path.is_file():
+                yield path, blanked(path.read_text())
+
+
+def closing(text, at):
+    depth = 0
+    while at < len(text):
+        if text[at] == "(":
+            depth += 1
+        elif text[at] == ")":
+            depth -= 1
+            if depth == 0:
+                return at
+        at += 1
+    return None
+"""
+
+
+border_pixels_guard_program = guard_source_reader + r"""
+allowance = %r
+names = %r
+bad = []
+seen = set()
+for path, text in scanned(%r, %r):
+    key = path.as_posix()
+    seen.add(key)
+    # Whole-text and not line-by-line: `borderPixels\n()` is absurd to write
+    # and trivial to hide behind, and a guard has to survive being written
+    # around on purpose.
+    hits = [
+        f"{key}:{line}"
+        for line in sorted(
+            text.count(chr(10), 0, match.start()) + 1
+            for name in names
+            for match in re.finditer(r"\b" + name + r"\s*\(", text)
+        )
+    ]
+    if not hits:
+        continue
+    if key not in allowance:
+        bad += hits
+    elif allowance[key] is not None and len(hits) > allowance[key]:
+        bad += hits[allowance[key]:]
+if bad:
+    sys.stderr.write(
+        "borderPixels()/scaledPixels() are the border option and its scale, "
+        "not the layout (A1): contentInsets() is what layout reads.\n"
+        "Unallowed uses:\n  " + "\n  ".join(bad) + "\n"
+    )
+    sys.exit(1)
+stale = sorted(set(allowance) - seen)
+if stale:
+    sys.stderr.write(
+        "the border audit is allowing files the scan never reached, so it is "
+        "guarding a tree that no longer exists: re-key the allowance onto "
+        "where these live now, or drop them.\n"
+        "Unreachable:\n  " + "\n  ".join(stale) + "\n"
+    )
+    sys.exit(1)
+""" % (border_pixels_allowance, border_pixels_names, guard_scan_roots, guard_scan_suffixes)
+
+border_pixels_guard = untimed_command(
+    name="border_pixels_guard",
+    inputs=["$(S)/build.py", *guard_scan_sources],
+    outputs=["$(B)/tst/border-pixels-guard.stamp"],
+    cmd=[
+        ["python3", "-c", border_pixels_guard_program],
+        touch_stamp("$(B)/tst/border-pixels-guard.stamp"),
+    ],
+    cwd="$(S)",
+    descr="BP",
+    color="cyan",
+)
+
+
+# T5-4 (R5-test). mouseGeometry(const Composer&) means "the pane fills the
+# window", and it has no production caller: the four real ones all hand over an
+# origin. Nothing said so, though, and the day "pane == window" stops being true
+# a new single-argument call from production compiles, links, passes every test
+# and silently maps a pointer as if every pane began at the window's own origin -
+# the loss A8 spends a separate pair of fields to prevent.
+#
+# Tests keep the form unmetered - _ut.cpp is skipped outright - because a
+# MouseGeometry for a whole-window pane is a thing a test may still want to
+# spell. Everything else is counted.
+#
+# T6.1 re-measured that skip rather than inheriting it, on the widened scan:
+# lifting it costs nothing today, because there is not one single-argument call
+# anywhere in the tree, _ut.cpp included - the thirteen call sites are all
+# two-argument. The skip is kept anyway, and the reason is what it meters and
+# not what it currently finds: A8 is about what production may assume, a test
+# is not production, and a guard that red-lines a legitimate test is a guard
+# whose allowance grows a test-file key - which is the failure this file spends
+# three comments warning about. The number that would change if that reasoning
+# ever stops holding is zero, so lifting it stays cheap.
+#
+# Comments cannot trip this: the source is blanked before it is read, so a
+# comment naming mouseGeometry() is spaces by the time the scan gets there.
+#
+# M6b is the day it moved: the keys followed mouse_frontend into lib/vterm and
+# the counts stayed 1 and 1, metering the declaration and the definition, which
+# were single-argument then. T2.1 built the stale-key red for precisely that
+# moment, and the alternative it was built against - a key nothing reaches,
+# green over a violation it can no longer see - is what T0.3 proved by probe.
+#
+# T5.1 is the day the subject of those two counts stopped existing. The
+# single-argument overload was not moved but deleted: mouse_frontend.h declares
+# one mouseGeometry and it takes the pane's geometry and the window's, and
+# mouse_frontend.cpp defines that one. Measured on this tree, the scan finds
+# zero single-argument uses anywhere outside _ut.cpp - so both counts had
+# become a pardon for an offence nobody was committing, and an allowance no
+# subject supports is the same shape of blindness the stale-key red was built
+# against, one step further along.
+#
+# T5.8 narrows them to zero, which is where the form's absence puts them. It is
+# not cosmetic: an allowance of 1 pardons the *first* hit in the file it names,
+# and the first hit in mouse_frontend.h is exactly where the overload would
+# come back. Re-declaring `MouseGeometry mouseGeometry(const VtGeometry&);`
+# there costs one hit, stays under a count of 1, and leaves the guard green
+# over the return of the very form it exists to forbid - probed both ways in
+# the T5.8 report. The keys stay rather than being dropped, so the stale-key
+# check keeps asserting that the guard can still see the two files that form
+# would come back to.
+mouse_geometry_allowance = {
+    "lib/vterm/mouse_frontend.h": 0,
+    "lib/vterm/mouse_frontend.cpp": 0,
+}
+
+mouse_geometry_guard_program = guard_source_reader + r"""
+allowance = %r
+bad = []
+seen = set()
+for path, text in scanned(%r, %r):
+    key = path.as_posix()
+    seen.add(key)
+    if key.endswith("_ut.cpp"):
+        continue
+    hits = []
+    for match in re.finditer(r"\bmouseGeometry\s*\(", text):
+        end = closing(text, match.end() - 1)
+        if end is None:
+            continue
+        arguments = text[match.end():end]
+        # Brackets only, and no angle brackets: `terminal->composer` carries
+        # a `>` that would take the depth negative and hide the commas after
+        # it, which is how the first version of this scan called the four
+        # three-argument sites single-argument ones.
+        depth = 0
+        for char in arguments:
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                depth -= 1
+            elif char == "," and depth == 0:
+                break
+        else:
+            hits.append(f"{key}:{text.count(chr(10), 0, match.start()) + 1}")
+    if not hits:
+        continue
+    if key not in allowance:
+        bad += hits
+    elif len(hits) > allowance[key]:
+        bad += hits[allowance[key]:]
+if bad:
+    sys.stderr.write(
+        "mouseGeometry(const Composer&) is the pane that fills the window (A8), "
+        "which production no longer gets to assume: pass the pane's origin.\n"
+        "Unallowed uses:\n  " + "\n  ".join(bad) + "\n"
+    )
+    sys.exit(1)
+stale = sorted(set(allowance) - seen)
+if stale:
+    sys.stderr.write(
+        "the pointer-geometry audit is allowing files the scan never reached, "
+        "so the form it exists to meter now lives somewhere it cannot see: "
+        "re-key the allowance onto where these live now.\n"
+        "Unreachable:\n  " + "\n  ".join(stale) + "\n"
+    )
+    sys.exit(1)
+""" % (mouse_geometry_allowance, guard_scan_roots, guard_scan_suffixes)
+
+mouse_geometry_guard = untimed_command(
+    name="mouse_geometry_guard",
+    inputs=["$(S)/build.py", *guard_scan_sources],
+    outputs=["$(B)/tst/mouse-geometry-guard.stamp"],
+    cmd=[
+        ["python3", "-c", mouse_geometry_guard_program],
+        touch_stamp("$(B)/tst/mouse-geometry-guard.stamp"),
+    ],
+    cwd="$(S)",
+    descr="MG",
+    color="cyan",
+)
+
+
+# A9 (R6-arch, A6-1). Every backend used to take the size of a pane's grid from
+# the window: 7 reads in render_metal.mm, 23 in render_reference.cpp, 8 in
+# render_vk.cpp, and not one of them legitimately about the window - they were
+# grid walks, cell indexing, bounds checks and push constants. The size now
+# travels with the data it describes, in TerminalUpdate::gridColumns/gridRows.
+#
+# There are no allowances and there is no number to grow into. A renderer has no
+# business asking the composer for a grid at all: the composer's grid is the one
+# the window would have if it held a single pane, which is exactly the
+# assumption A9 removed. The window-sized quantities a renderer legitimately
+# reads are pixelWidth/pixelHeight, and those are not spelled like this.
+#
+# Restricted to render*, because everyone else - Composer::resize(), the mouse
+# frontend, the test harness - is asking about the window and is right to.
+# T6.1 put a number on that "everyone else" rather than leaving it an
+# assertion: dropping the restriction red-lines 98 hits across 10 files -
+# composer_ut.cpp 31, ui_csd_tabs_ut.cpp 23, vt_headless_ut.cpp and
+# ui_sidebar_tabs_ut.cpp 12 each, session_ut.cpp 8, then application.cpp,
+# span_shaper.cpp, test_mode.cpp, ui_csd_tabs.mm and application_ut.cpp - and
+# every one of them is a window question asked by something that is not a
+# renderer. The restriction stays. What it costs is written down instead: it
+# selects by filename, and the backends check below only knows three names, so
+# a fourth renderer that is not called render* would be read by nothing and
+# missed by the self-check too. Naming it render* is therefore load-bearing.
+# Scanned through blanked source, so a comment naming the field (this file aside,
+# several of them do) is spaces by the time the check reads it.
+#
+# T2.1 added the second half of this list, and it is the half that matters for
+# the merge. Upstream took columns and rows off Composer and put them inside
+# VtGeometry, so the window's grid is now spelled composer.geometry.columns and
+# the four names above appear nowhere in it. This is not a hypothetical:
+# running these four guards against a clean origin/master tree, where
+# render_reference.cpp reads composer_.geometry.columns/rows twenty-four times
+# - the precise behaviour A9 exists to forbid - returns rc=0 and an empty
+# report (T0.3, section 3.1). Adding a root would not have touched it, because
+# the renderers never move. The old names stay: they are cheap, and they catch
+# code that has not made the crossing yet.
+#
+# M6 added the third half. T2.1 had guessed the crossing would be spelled
+# composer.geometry.columns, from the plan's reading of upstream; the commit
+# that actually made it (25dbda61) named the embedding surface VtState and
+# spelled the window grid composer.vt.columns instead, and with only the eight
+# names above a probe reading composer.vt.columns from render_reference.cpp
+# returned rc=0 and an empty report - A9 unguarded behind a green guard, the
+# failure T2.1 was written to close, arriving through the spelling nobody had
+# yet seen.
+#
+# M6c (bd86ed38) dissolved VtState, and the window grid is spelled
+# composer.geometry.columns again - the spelling T2.1 guessed, arriving one
+# merge step later than it expected. Re-measured by probe on the merged tree,
+# both ways round: composer.geometry.columns/rows planted in
+# render_reference.cpp red-lines on both, and so does the now-dead
+# composer.vt.columns. All twelve names stay. The vt.* four cost nothing and
+# name a spelling this tree carried for two merge steps; deleting them buys
+# only the chance of needing them back.
+#
+# The list is deliberately qualified rather than a bare "geometry.columns". A
+# renderer reading the *pane's* geometry off the update it is drawing is what
+# A9 asks for, and the day that field exists a bare name would red-line it.
+# What is still open, and is written down rather than guessed at: a renderer
+# could bind `const auto& g = composer.geometry;` and read g.columns, and no
+# spelling in this list sees that. It is one alias away and worth revisiting if
+# it ever appears; it does not appear today, in our tree or upstream's.
+pane_grid_names = (
+    "composer.columns",
+    "composer.rows",
+    "composer_.columns",
+    "composer_.rows",
+    "composer.geometry.columns",
+    "composer.geometry.rows",
+    "composer_.geometry.columns",
+    "composer_.geometry.rows",
+    "composer.vt.columns",
+    "composer.vt.rows",
+    "composer_.vt.columns",
+    "composer_.vt.rows",
+)
+
+# The three backends A9 is about. A guard that scans no renderer is not a green
+# guard, it is an absent one, and the whole failure mode T2.1 exists to close is
+# a scan that quietly addresses an empty set - which is what "the renderers
+# moved and the roots did not follow" looks like from the outside.
+pane_grid_backends = ("render_metal.mm", "render_reference.cpp", "render_vk.cpp")
+
+pane_grid_guard_program = guard_source_reader + r"""
+names = %r
+backends = set(%r)
+bad = []
+seen = set()
+for path, text in scanned(%r, %r):
+    if not path.name.startswith("render"):
+        continue
+    seen.add(path.name)
+    key = path.as_posix()
+    for number, line in enumerate(text.splitlines(), 1):
+        for name in names:
+            bad += [f"{key}:{number}"] * line.count(name)
+if bad:
+    sys.stderr.write(
+        "A renderer takes the grid of the pane it is drawing from the update "
+        "that carries its cells (A9: TerminalUpdate::gridColumns/gridRows), "
+        "never from the window - the composer's grid is the window with one "
+        "pane in it.\n"
+        "Unallowed uses:\n  " + "\n  ".join(bad) + "\n"
+    )
+    sys.exit(1)
+missing = sorted(backends - seen)
+if missing:
+    sys.stderr.write(
+        "the renderer grid audit never reached a renderer it is meant to "
+        "cover, so it passed by reading nothing: point the scan roots at "
+        "where these live now.\n"
+        "Unreachable:\n  " + "\n  ".join(missing) + "\n"
+    )
+    sys.exit(1)
+""" % (pane_grid_names, pane_grid_backends, guard_scan_roots, guard_scan_suffixes)
+
+pane_grid_guard = untimed_command(
+    name="pane_grid_guard",
+    inputs=["$(S)/build.py", *guard_scan_sources],
+    outputs=["$(B)/tst/pane-grid-guard.stamp"],
+    cmd=[
+        ["python3", "-c", pane_grid_guard_program],
+        touch_stamp("$(B)/tst/pane-grid-guard.stamp"),
+    ],
+    cwd="$(S)",
+    descr="PG",
+    color="cyan",
+)
+
+
+# L1 was an unresolved symbol in every non-Apple build: a call into a
+# darwin-only translation unit, from a portable one, outside any #if. It was
+# found by an audit written for the occasion - and then written again, from
+# scratch, by T5, T6, R4-qa, R5-qa and T7, five times, because it lived in a
+# scratchpad and never in the tree. At least two of those five had holes their
+# authors found only by controlling them: one was blind to calls that stand
+# alone as a statement, the other moved its own line numbers by deleting
+# comments. This is that audit, once, wired to a build step.
+#
+# What it tracks it derives rather than lists: every top-level non-static
+# definition in a darwin-only unit (*.mm), intersected with what some header
+# declares - a portable unit can only call what it can see - minus anything a
+# portable unit also defines. Five symbols today, and the five are exactly the
+# doors L1 came through. Listing them by hand would have been a sixth thing to
+# keep in step with the tree.
+#
+# A call is told from a prototype by what stands before the name: a type for a
+# prototype, and nothing, a bracket, an operator or a keyword for a call. The
+# other way round - requiring an optional type - swallows every call that is a
+# statement of its own, which is the hole R5-qa found in its own instrument and
+# the shape of one of the two controls in the report.
+#
+# HAVE_METAL_RENDERER and HAVE_CORETEXT count as darwin conditions: build.py
+# defines them in the darwin branch only, and an audit that looked for
+# __APPLE__ alone reports render.cpp's Metal call as a false alarm (R2-qa,
+# round 4).
+darwin_guard_macros = ("__APPLE__", "HAVE_METAL_RENDERER", "HAVE_CORETEXT")
+
+darwin_call_guard_program = guard_source_reader + r"""
+macros = %r
+keywords = frozenset((
+    "return", "if", "while", "for", "switch", "case", "do", "else", "and", "or", "not",
+    "sizeof", "new", "delete", "throw", "static_cast", "const_cast", "reinterpret_cast",
+))
+head = r"(?m)^([A-Za-z_][A-Za-z_0-9:<>,&*\[\] \t]*?)\b([A-Za-z_][A-Za-z_0-9]*)\s*\("
+
+
+def named(text, terminator):
+    found = set()
+    for match in re.finditer(head, text):
+        if not match.group(1).strip():
+            continue
+        if terminator == "{" and "static" in match.group(1).split():
+            continue
+        end = closing(text, match.end() - 1)
+        if end is None:
+            continue
+        rest = re.sub(r"^(const|noexcept|override|final)\s*", "", text[end + 1:end + 200].lstrip())
+        if rest.startswith(terminator):
+            found.add(match.group(2))
+    return found
+
+
+def darwin(expression):
+    return "!" not in expression and any(macro in expression for macro in macros)
+
+
+def guarded(text):
+    state = []
+    result = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            directive = stripped[1:].strip()
+            word = directive.split(None, 1)[0] if directive else ""
+            rest = directive[len(word):].strip()
+            if word in ("if", "ifdef", "ifndef"):
+                now = rest in macros if word == "ifdef" else (False if word == "ifndef" else darwin(rest))
+                otherwise = rest in macros if word == "ifndef" else False
+                state.append([now, otherwise])
+            elif word == "elif" and state:
+                state[-1][0] = darwin(rest)
+            elif word == "else" and state:
+                state[-1][0] = state[-1][1]
+            elif word == "endif" and state:
+                state.pop()
+        result.append(any(frame[0] for frame in state))
+    return result
+
+
+sources = list(scanned(%r, %r))
+darwin_defined = set()
+portable_defined = set()
+declared = set()
+for path, text in sources:
+    if path.suffix == ".mm":
+        darwin_defined |= named(text, "{")
+    else:
+        portable_defined |= named(text, "{")
+    if path.suffix == ".h":
+        declared |= named(text, ";")
+tracked = (darwin_defined & declared) - portable_defined
+
+bad = []
+for path, text in sources:
+    if path.suffix == ".mm":
+        continue
+    inside = guarded(text)
+    for number, line in enumerate(text.splitlines(), 1):
+        if inside[number - 1]:
+            continue
+        for name in sorted(tracked):
+            for match in re.finditer(r"\b" + name + r"\s*\(", line):
+                before = line[:match.start()].rstrip()
+                if before.endswith(("*", "&")):
+                    continue
+                if re.search(r"[A-Za-z_0-9]$", before) and before.split()[-1] not in keywords:
+                    continue
+                bad.append(f"{path.as_posix()}:{number}  {name}")
+if bad:
+    sys.stderr.write(
+        "A darwin-only symbol is called where a non-Apple build reaches it, "
+        "which is an unresolved symbol on every platform but macOS (R2-test, L1).\n"
+        f"Tracked: {' '.join(sorted(tracked))}\n"
+        "Unguarded calls:\n  " + "\n  ".join(bad) + "\n"
+    )
+    sys.exit(1)
+if not tracked:
+    sys.stderr.write("the darwin call audit tracks nothing at all, which means it stopped working\n")
+    sys.exit(1)
+""" % (darwin_guard_macros, guard_scan_roots, guard_scan_suffixes)
+
+darwin_call_guard = untimed_command(
+    name="darwin_call_guard",
+    inputs=["$(S)/build.py", *guard_scan_sources],
+    outputs=["$(B)/tst/darwin-call-guard.stamp"],
+    cmd=[
+        ["python3", "-c", darwin_call_guard_program],
+        touch_stamp("$(B)/tst/darwin-call-guard.stamp"),
+    ],
+    cwd="$(S)",
+    descr="DA",
+    color="cyan",
+)
 
 test_suite = untimed_command(
     inputs=["$(S)/build.py"],
@@ -3866,9 +4695,12 @@ vterm_boundary = command(
     color="magenta",
 )
 
-add_test(production_surface, pretty_binary_branding, vterm_boundary, instrumented=False)
+add_test(production_surface, pretty_binary_branding, vterm_boundary, border_pixels_guard, mouse_geometry_guard, pane_grid_guard, darwin_call_guard, instrumented=False)
 if linux:
     add_test(wayland_frame_stall, wayland_title_fallback, instrumented=False)
+# The perf programs link no test of their own, so nothing else builds them:
+# they went uncompilable for a whole merge without CI noticing (T5.11).
+add_test(parser_perf, core_perf, instrumented=False)
 
 add_test(
     *([plt_tests] if plt_tests is not None else []),

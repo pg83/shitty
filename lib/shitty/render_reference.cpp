@@ -10,6 +10,8 @@
 #include "composer.h"
 #include "font_pack.h"
 #include "span_shaper.h"
+#include "render_blend.h"
+#include "grid_geometry.h"
 #include "render_synthesis.h"
 
 #include <lib/vterm/hex.h>
@@ -86,6 +88,23 @@ namespace {
         return cellFlags(cell.source, cell.lineAttribute);
     }
 
+    // A6-3: one pane's grid inside the retained store - which pane it
+    // is, what shape it had, and where its cells begin. The panes lie
+    // back to back in one vector, the way the Metal backend lays them
+    // out, so a frame retains every pane it drew instead of the last one
+    // of them.
+    struct PaneRetain {
+        // The Screen the pane shapes through, as an opaque handle: the
+        // same identity the arena mirror keys on (render_arena.h). A
+        // frame whose panes changed identity has nothing to retain, even
+        // when it has as many panes of the same shape as the one before
+        // it.
+        const void* shapes = nullptr;
+        u16 columns = 0;
+        u16 rows = 0;
+        size_t offset = 0;
+    };
+
     struct ModelDigest {
         u64 first = 14695981039346656037ull;
         u64 second = 1099511628211ull;
@@ -102,8 +121,11 @@ namespace {
     struct ReferenceRendererImpl final: ReferenceRenderer {
         ReferenceRendererImpl(Composer& composer, const plt::RenderContext& context);
 
+        bool update(const PaneUpdate* panes, size_t count) override;
         bool update(const TerminalUpdate& update) override;
-        bool updateOnce(const TerminalUpdate& update);
+        void setSeams(const PixelRect* seams, size_t count, Color ink) override;
+        bool reshape(const PaneUpdate* panes, size_t count);
+        bool updateOnce(const PaneUpdate& pane, size_t index);
         bool repaint() override;
         void attach(TestApi& testApi) override;
         ReferenceImage image() const override;
@@ -132,24 +154,66 @@ namespace {
         static Color blend(Color foreground, Color background, u8 coverage);
         static bool sameColor(Color left, Color right);
         bool targetReady() const;
-        void clearTarget(Color background);
+        // T10: the alpha the rectangle is filled at, and the reason
+        // this takes one at all - the seam between two panes is filled
+        // by the same call and must stay solid while the panes it
+        // separates go see-through.
+        void clearPane(Color background, u8 alpha);
+        // The background's alpha for this frame, from -backgroundOpacity.
+        u8 backgroundAlpha() const;
+        void paintSeams();
         void putPixel(int x, int y, Color color);
         ReferenceCell materialize(const TerminalCell& cell, u8 lineAttribute, const TerminalColors& colors) const;
         void captureStrips(const TerminalUpdate& update);
-        void captureSpan(SpanShaper& shaper, u16 row, const ScreenRowSpan& span);
-        void renderCell(const TerminalUpdate& update, const ReferenceCell& cell, u16 column, u16 row);
-        bool render(const TerminalUpdate& update, const Vector<ReferenceCell>& cells);
+        void captureSpan(SpanShaper& shaper, u16 columns, u16 row, const ScreenRowSpan& span);
+        void renderCell(const TerminalUpdate& update, const ReferenceCell& cell, u16 columns, u16 column, u16 row, const Insets& insets);
+        bool render(const TerminalUpdate& update, const ReferenceCell* cells, u16 columns, u16 rows, const PixelRect& area);
         void captureModel();
-        void captureState(const TerminalUpdate& update);
+        void captureState(const TerminalUpdate& update, const ReferenceCell* cells, size_t count);
+
+        // A6-3: the retained cells of the pane drawn last - what the
+        // probes below (the snapshots, the model digest, renderUpdate())
+        // answer with. They are questions about a terminal, not about a
+        // window, and the terminal they mean is the one drawn last, as
+        // it was before panes existed.
+        const ReferenceCell* retained() const;
+        size_t retainedCount() const;
 
         Composer& composer_;
         plt::HeadlessRenderTarget* target_;
+        // A2: the pane being drawn - where its grid starts and the only
+        // pixels it may touch. repaint() redraws the last pane through
+        // it. A pane-less update() makes this the whole surface, which
+        // is what every pixel this renderer placed before panes existed
+        // was clipped to anyway.
+        PixelRect pane_;
+        // The pane rectangle met with the target, as putPixel wants to
+        // ask it: origin and extent, so each axis is one unsigned
+        // compare (a coordinate below the origin wraps past the extent).
+        // The shape of this test is worth the trouble - it runs once per
+        // pixel of every cell of every frame, and a pane clip *added* to
+        // the target clip, as eight comparisons where there were four,
+        // cost 18% of the frame of an 80x24 grid when measured.
+        int clipLeft_ = 0;
+        int clipTop_ = 0;
+        u32 clipWidth_ = 0;
+        u32 clipHeight_ = 0;
+        // F9: the seams of the frame being drawn, and their colour.
+        Vector<PixelRect> seams_;
+        Color seamInk_;
         Buffer coverage_;
         Buffer color_;
         Buffer stripStore_;
         Vector<CellStrip> cellStrips_;
         Vector<ScreenRowSpan> spanScratch_;
+        // Every pane's retained grid, one after another; panes_ says
+        // which pane owns which run. nextCells_ is the frame being
+        // built: a whole-store copy that only replaces the retain when
+        // every pane of the frame drew, so a refused frame retains what
+        // the last accepted one did.
         Vector<ReferenceCell> cells_;
+        Vector<ReferenceCell> nextCells_;
+        Vector<PaneRetain> panes_;
         Vector<TerminalCell> modelCells_;
         Vector<u8> modelLineAttributes_;
 
@@ -183,6 +247,9 @@ namespace {
         size_t graphemeCodepoints_ = 0;
         size_t lastUpdateCells_ = 0;
         size_t lastUpdateSpans_ = 0;
+        // Where the pane drawn last begins in cells_, and the shape it
+        // was drawn with: the pair the probes read through retained().
+        size_t lastOffset_ = 0;
         u16 columns_ = 0;
         u16 rows_ = 0;
         u8 selectionColorMask_ = 0;
@@ -243,25 +310,77 @@ bool ReferenceRendererImpl::targetReady() const {
     if (target_ == nullptr || target_->pixels == nullptr || target_->format != plt::HeadlessPixelFormat::RGB8) {
         return false;
     }
-    if (target_->width != composer_.layout.pixelWidth || target_->height != composer_.layout.pixelHeight || target_->stride < target_->width * 3) {
+    if (target_->width != composer_.geometry.pixelWidth || target_->height != composer_.geometry.pixelHeight || target_->stride < target_->width * 3) {
         return false;
     }
     return target_->length >= (size_t)(target_->stride) * target_->height;
 }
 
-void ReferenceRendererImpl::clearTarget(Color background) {
-    for (u32 y = 0; y < target_->height; ++y) {
+void ReferenceRendererImpl::setSeams(const PixelRect* seams, size_t count, Color ink) {
+    seams_.clear();
+    for (size_t at = 0; at < count; ++at) {
+        seams_.pushBack(seams[at]);
+    }
+    seamInk_ = ink;
+}
+
+void ReferenceRendererImpl::paintSeams() {
+    // F9: last, and on purpose. The band lies in the air two neighbours
+    // leave between their grids, which each of them has just cleared with
+    // its own background - so the seam has to go on after both, or the
+    // second pane would wipe half of it.
+    for (const PixelRect& seam : seams_) {
+        clipLeft_ = seam.x;
+        clipTop_ = seam.y;
+        const u32 right = min<u32>(target_->width, (u32)(seam.x) + seam.width);
+        const u32 bottom = min<u32>(target_->height, (u32)(seam.y) + seam.height);
+        clipWidth_ = right > (u32)(seam.x) ? right - seam.x : 0;
+        clipHeight_ = bottom > (u32)(seam.y) ? bottom - seam.y : 0;
+        clearPane(seamInk_, 255);
+    }
+}
+
+u8 ReferenceRendererImpl::backgroundAlpha() const {
+    return backgroundAlphaFromPercent(composer_.opts->backgroundOpacity);
+}
+
+void ReferenceRendererImpl::clearPane(Color background, u8 alpha) {
+    // A2: the pane's rectangle, not the frame's. A pane carries its own
+    // background (its terminal's live OSC 11), so a clear that covered
+    // the whole target would paint over every pane drawn before it with
+    // this pane's colour. One pane filling the surface clears the
+    // surface, which is what this did before there were panes.
+    //
+    // T10: premultiplied, like every colour that leaves this renderer.
+    // The target has no alpha channel to carry the other half - a
+    // headless RGB buffer has no desktop behind it - but the colour
+    // bytes are the same ones the shader writes, which is what keeps
+    // the two comparable at all.
+    const Color fill = premultiply(background, alpha);
+    const int bottom = clipTop_ + (int)(clipHeight_);
+    const int right = clipLeft_ + (int)(clipWidth_);
+    for (int y = clipTop_; y < bottom; ++y) {
         u8* row = target_->pixels + (size_t)(y)*target_->stride;
-        for (u32 x = 0; x < target_->width; ++x) {
-            row[3 * x] = background.red;
-            row[3 * x + 1] = background.green;
-            row[3 * x + 2] = background.blue;
+        for (int x = clipLeft_; x < right; ++x) {
+            row[3 * x] = fill.red;
+            row[3 * x + 1] = fill.green;
+            row[3 * x + 2] = fill.blue;
         }
     }
 }
 
 void ReferenceRendererImpl::putPixel(int x, int y, Color color) {
-    if (x < 0 || y < 0 || x >= (int)(target_->width) || y >= (int)(target_->height)) {
+    // A2: outside the pane is another pane's business. The grid fits
+    // inside the pane by construction, but a double-width line in the
+    // last column draws one glyph box further right than its own cell,
+    // which is a pixel of padding today and the neighbour's first column
+    // once panes exist. The GPU backends clip the same way, by handing
+    // the shader the pane's edge as the output bounds it already tests.
+    //
+    // The pane's rectangle replaces the target's here rather than being
+    // asked after it: the bounds below are already the two met (see
+    // clipLeft_), so a pane cannot escape the target either.
+    if ((u32)(x - clipLeft_) >= clipWidth_ || (u32)(y - clipTop_) >= clipHeight_) {
         return;
     }
     u8* const pixel = target_->pixels + (size_t)(y)*target_->stride + 3 * x;
@@ -270,15 +389,15 @@ void ReferenceRendererImpl::putPixel(int x, int y, Color color) {
     pixel[2] = color.blue;
 }
 
-void ReferenceRendererImpl::captureSpan(SpanShaper& shaper, u16 row, const ScreenRowSpan& span) {
-    if (span.end <= span.begin || span.end > composer_.geometry.columns) {
+void ReferenceRendererImpl::captureSpan(SpanShaper& shaper, u16 columns, u16 row, const ScreenRowSpan& span) {
+    if (span.end <= span.begin || span.end > columns) {
         return;
     }
     if (span.missing) {
         // A synthesized run: renderCell draws its coverage from the
         // codepoint, matching the GPU shader.
         for (u16 column = span.begin; column < span.end; ++column) {
-            cellStrips_.mut((size_t)(row)*composer_.geometry.columns + column) = {0, 0, stripSynthesized};
+            cellStrips_.mut((size_t)(row)*columns + column) = {0, 0, stripSynthesized};
         }
         return;
     }
@@ -301,7 +420,7 @@ void ReferenceRendererImpl::captureSpan(SpanShaper& shaper, u16 row, const Scree
     const size_t base = stripStore_.used();
     stripStore_.append(source, pixels * pixel);
     for (u16 column = span.begin; column < span.end; ++column) {
-        cellStrips_.mut((size_t)(row)*composer_.geometry.columns + column) = {
+        cellStrips_.mut((size_t)(row)*columns + column) = {
             (u32)(base + (size_t)(column - span.begin) * width * pixel),
             (u32)(span.end - span.begin) * width,
             span.color ? stripColor : stripMask,
@@ -310,7 +429,10 @@ void ReferenceRendererImpl::captureSpan(SpanShaper& shaper, u16 row, const Scree
 }
 
 void ReferenceRendererImpl::captureStrips(const TerminalUpdate& update) {
-    const size_t count = (size_t)(composer_.geometry.columns) * composer_.geometry.rows;
+    // A9: the pane's own grid, which is the shape of the cells this
+    // update carries - not the window's.
+    const u16 columns = update.gridColumns;
+    const size_t count = (size_t)(columns)*update.gridRows;
     cellStrips_.clear();
     cellStrips_.zero(count);
     stripStore_.reset();
@@ -319,7 +441,7 @@ void ReferenceRendererImpl::captureStrips(const TerminalUpdate& update) {
     }
     Screen& shapes = *update.shapes;
     SpanShaper& shaper = *composer_.shaper;
-    resizeVector(spanScratch_, composer_.geometry.columns);
+    resizeVector(spanScratch_, columns);
     // Shaping a row can reset the arenas and move every strip shaped so
     // far; the byte copies stay valid, the held offsets do not, so redo
     // the pass until it completes within one arena generation.
@@ -334,30 +456,30 @@ void ReferenceRendererImpl::captureStrips(const TerminalUpdate& update) {
             // screen rows do not participate.
             for (size_t index = 0; index < update.rowCount; ++index) {
                 const TerminalRow& row = update.rows[index];
-                const size_t spans = shaper.shapeCells(row.cells, composer_.geometry.columns, 0, spanScratch_.mutData());
+                const size_t spans = shaper.shapeCells(row.cells, columns, 0, spanScratch_.mutData());
                 for (size_t entry = 0; entry < spans; ++entry) {
-                    captureSpan(shaper, row.row, spanScratch_[entry]);
+                    captureSpan(shaper, columns, row.row, spanScratch_[entry]);
                 }
             }
             continue;
         }
-        for (u16 row = 0; row < composer_.geometry.rows; ++row) {
+        for (u16 row = 0; row < update.gridRows; ++row) {
             const ScreenRowRef rowRef = shapes.viewRow(row);
-            const size_t spans = shaper.rowSpans(rowRef.cells, composer_.geometry.columns, rowRef.id, spanScratch_.mutData());
+            const size_t spans = shaper.rowSpans(rowRef.cells, columns, rowRef.id, spanScratch_.mutData());
             for (size_t index = 0; index < spans; ++index) {
-                captureSpan(shaper, row, spanScratch_[index]);
+                captureSpan(shaper, columns, row, spanScratch_[index]);
             }
         }
         if (update.overlayCount != 0) {
             // The preedit preview covers the underlying strips wholesale:
             // its blank cells hide the text below them.
-            const size_t base = (size_t)(update.overlayRow) * composer_.geometry.columns + update.overlayColumn;
+            const size_t base = (size_t)(update.overlayRow) * columns + update.overlayColumn;
             for (u16 index = 0; index < update.overlayCount; ++index) {
                 cellStrips_.mut(base + index) = {};
             }
             const size_t spans = shaper.shapeCells(update.overlayCells, update.overlayCount, update.overlayColumn, spanScratch_.mutData());
             for (size_t index = 0; index < spans; ++index) {
-                captureSpan(shaper, update.overlayRow, spanScratch_[index]);
+                captureSpan(shaper, columns, update.overlayRow, spanScratch_[index]);
             }
         }
     } while (generation != shaper.spanGeneration());
@@ -383,7 +505,7 @@ ReferenceCell ReferenceRendererImpl::materialize(const TerminalCell& cell, u8 li
     return result;
 }
 
-void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const ReferenceCell& cell, u16 column, u16 row) {
+void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const ReferenceCell& cell, u16 columns, u16 column, u16 row, const Insets& insets) {
     const TerminalCell& source = cell.source;
     const bool doubleLine = cell.lineAttribute != 0;
     const int cellWidth = composer_.geometry.cellPixelWidth;
@@ -391,7 +513,7 @@ void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const Refer
     coverage_.zero((size_t)(cellWidth)*cellHeight);
     color_.zero((size_t)(cellWidth)*cellHeight * 4);
     hasColor_ = false;
-    const CellStrip strip = cellStrips_[(size_t)(row)*composer_.geometry.columns + column];
+    const CellStrip strip = cellStrips_[(size_t)(row)*columns + column];
     if (strip.kind == stripSynthesized) {
         for (int y = 0; y < cellHeight; ++y) {
             for (int x = 0; x < cellWidth; ++x) {
@@ -455,8 +577,24 @@ void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const Refer
         background = cursor;
     }
 
-    const int outputX = composer_.layout.originX + column * composer_.geometry.cellPixelWidth;
-    const int outputY = composer_.layout.originY + row * composer_.geometry.cellPixelHeight;
+    // T10. Only the *background* goes translucent, and these two are not
+    // it even though they arrive as one: a selection and a block cursor
+    // are marks placed on top of the text, and a mark you can see the
+    // desktop through stops marking anything. Everything else the shader
+    // treats as background - an SGR colour, a reversed cell - follows
+    // the option, because there is no way to tell "the default
+    // background" apart from "a colour that happens to equal it" by the
+    // time either reaches a pixel.
+    const bool solidCell = selectedCell || (cursorHere && update.cursor.style == TerminalCursor::Style::filled_block);
+    const u8 cellAlpha = solidCell ? (u8)(255) : backgroundAlpha();
+    const Color premultipliedBackground = premultiply(background, cellAlpha);
+
+    // The insets place the grid inside the pane; the pane places it on
+    // the surface. cellOrigin() stays the one place that pairs `left`
+    // with x and `top` with y (R4-test, wave 3's debt).
+    const CellOrigin origin = cellOrigin(column, row, insets, composer_.geometry.cellPixelWidth, composer_.geometry.cellPixelHeight);
+    const int outputX = (int)(pane_.x) + origin.x;
+    const int outputY = (int)(pane_.y) + origin.y;
     const auto* coverage = (const u8*)(coverage_.data());
     const auto* color = (const u8*)(color_.data());
     const bool hidden = source.conceal || (source.blink && !update.blinkVisible);
@@ -470,18 +608,18 @@ void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const Refer
                     outputX + x,
                     outputY + y,
                     {
-                        (u8)((unsigned)(color[4 * index]) * strength / 255 + (unsigned)(background.red) * (255 - alpha) / 255),
-                        (u8)((unsigned)(color[4 * index + 1]) * strength / 255 + (unsigned)(background.green) * (255 - alpha) / 255),
-                        (u8)((unsigned)(color[4 * index + 2]) * strength / 255 + (unsigned)(background.blue) * (255 - alpha) / 255),
+                        (u8)((unsigned)(color[4 * index]) * strength / 255 + (unsigned)(premultipliedBackground.red) * (255 - alpha) / 255),
+                        (u8)((unsigned)(color[4 * index + 1]) * strength / 255 + (unsigned)(premultipliedBackground.green) * (255 - alpha) / 255),
+                        (u8)((unsigned)(color[4 * index + 2]) * strength / 255 + (unsigned)(premultipliedBackground.blue) * (255 - alpha) / 255),
                     }
                 );
             } else {
-                putPixel(outputX + x, outputY + y, blend(foreground, background, coverage[index]));
+                putPixel(outputX + x, outputY + y, blendOverBackground(foreground, background, coverage[index], cellAlpha).color);
             }
         }
     }
 
-    const u32 cellIndex = (u32)(row)*composer_.geometry.columns + column;
+    const u32 cellIndex = (u32)(row)*columns + column;
     const bool explicitLink = cell.hyperlink != 0 && cell.hyperlink == update.hoveredHyperlink;
     const bool plainLink = cellIndex >= update.hoveredLinkBegin && cellIndex < update.hoveredLinkEnd;
     const bool hyperlinkUnderline = !source.underlined() && (explicitLink || plainLink);
@@ -541,17 +679,36 @@ void ReferenceRendererImpl::renderCell(const TerminalUpdate& update, const Refer
     }
 }
 
-bool ReferenceRendererImpl::render(const TerminalUpdate& update, const Vector<ReferenceCell>& cells) {
+bool ReferenceRendererImpl::render(const TerminalUpdate& update, const ReferenceCell* cells, u16 columns, u16 rows, const PixelRect& area) {
     if (!targetReady()) {
         return false;
     }
+    pane_ = area;
+    // Saturating, both of them: a pane whose origin is off the target
+    // (a resize caught mid-flight) has an empty extent, and an extent
+    // that went negative through an unsigned subtraction would be an
+    // enormous one - a pane clip that clips nothing at all.
+    const u32 right = min<u32>(target_->width, (u32)(area.x) + area.width);
+    const u32 bottom = min<u32>(target_->height, (u32)(area.y) + area.height);
+    clipLeft_ = area.x;
+    clipTop_ = area.y;
+    clipWidth_ = right > (u32)(area.x) ? right - area.x : 0;
+    clipHeight_ = bottom > (u32)(area.y) ? bottom - area.y : 0;
     // The padding follows the live default background (OSC 11), matching
     // xterm, kitty, foot, and the rest.
-    clearTarget(update.colors != nullptr ? update.colors->defaultBackground : composer_.opts->vt.bg);
-    for (u16 row = 0; row < composer_.geometry.rows; ++row) {
-        for (u16 column = 0; column < composer_.geometry.columns; ++column) {
-            const ReferenceCell& cell = cells[(size_t)(row)*composer_.geometry.columns + column];
-            renderCell(update, cell, column, row);
+    clearPane(update.colors != nullptr ? update.colors->defaultBackground : composer_.vtConfig.config->bg, backgroundAlpha());
+    // The insets belong to the frame, not to the cell: they cannot change
+    // between two cells of the same frame, and reading them per cell cost
+    // one call and a four-field struct on every one of them.
+    // A10: the pane's rectangle plus the border, and nothing else. The
+    // chrome reserve came off the window before the rectangle was cut,
+    // so charging it again here would push every pane but the first one
+    // inwards by the width of a sidebar it is not next to.
+    const Insets insets = composer_.paneInsets();
+    for (u16 row = 0; row < rows; ++row) {
+        for (u16 column = 0; column < columns; ++column) {
+            const ReferenceCell& cell = cells[(size_t)(row)*columns + column];
+            renderCell(update, cell, columns, column, row, insets);
         }
     }
     return true;
@@ -580,7 +737,7 @@ void ReferenceRendererImpl::captureModel() {
     }
 }
 
-void ReferenceRendererImpl::captureState(const TerminalUpdate& update) {
+void ReferenceRendererImpl::captureState(const TerminalUpdate& update, const ReferenceCell* cells, size_t count) {
     cursor_ = update.cursor;
     selection_ = update.selection;
     snappedSelection_ = update.snappedSelection;
@@ -597,7 +754,8 @@ void ReferenceRendererImpl::captureState(const TerminalUpdate& update) {
     hoveredLinkEnd_ = update.hoveredLinkEnd;
     graphemeCells_ = 0;
     graphemeCodepoints_ = 0;
-    for (const ReferenceCell& cell : cells_) {
+    for (size_t index = 0; index < count; ++index) {
+        const ReferenceCell& cell = cells[index];
         if (cell.grapheme == 0) {
             continue;
         }
@@ -609,84 +767,170 @@ void ReferenceRendererImpl::captureState(const TerminalUpdate& update) {
     }
 }
 
-bool ReferenceRendererImpl::update(const TerminalUpdate& update) {
+bool ReferenceRendererImpl::update(const PaneUpdate* panes, size_t count) {
     for (;;) {
         try {
-            return updateOnce(update);
+            if (count == 0 || !reshape(panes, count)) {
+                return false;
+            }
+            for (size_t index = 0; index < count; ++index) {
+                if (!updateOnce(panes[index], index)) {
+                    return false;
+                }
+            }
+            paintSeams();
+            // Every pane of the frame drew: the frame becomes the retain
+            // in one step, so a frame refused halfway retains what the
+            // last accepted one did rather than half of two frames.
+            cells_.xchg(nextCells_);
+            return true;
         } catch (const FontFaceMiss& miss) {
             // Lost-surface style: adopt a face for the missed cluster (or
-            // record that nothing serves it) and re-run the frame.
+            // record that nothing serves it) and re-run the frame. The
+            // whole frame, panes already drawn included: drawing a pane
+            // twice costs a frame nobody presented yet, and picking up
+            // where the miss happened would leave the earlier panes
+            // shaped through the fontpack that lost.
             composer_.fonts->adoptFaceFor(miss);
         }
     }
 }
 
-bool ReferenceRendererImpl::updateOnce(const TerminalUpdate& update) {
-    if (!targetReady() || update.colors == nullptr) {
+bool ReferenceRendererImpl::update(const TerminalUpdate& update) {
+    const PaneUpdate pane = surfacePane(composer_, update);
+    return this->update(&pane, 1);
+}
+
+// A6-3, A9: the frame's shape, settled once for the whole frame before
+// a single pane draws. A pane keeps the cells it was retaining only when
+// it is the same pane (the same Screen), of the same grid, in the same
+// place in the store as in the frame before it. Anything else and
+// nothing in the store is where it was, so the frame owes every row of
+// every pane - the same rule the Metal backend states for its flat cell
+// vector, and for the same reason.
+//
+// Before this, one `cells_` served every pane and each pane began from
+// the cells of the pane drawn before it. A partially damaged frame -
+// which is the ordinary case, TerminalUpdate::rows being the damaged
+// rows - then showed pane 0's undamaged rows inside pane 1.
+bool ReferenceRendererImpl::reshape(const PaneUpdate* panes, size_t count) {
+    if (!targetReady()) {
         return false;
     }
-    const size_t count = (size_t)(composer_.geometry.columns) * composer_.geometry.rows;
-    const bool shapeChanged = columns_ != composer_.geometry.columns || rows_ != composer_.geometry.rows;
-    if (shapeChanged) {
-        // A reshaped grid needs every row before the retained cells mean
-        // anything.
-        if (update.rowCount != composer_.geometry.rows) {
+    size_t total = 0;
+    bool shapeChanged = panes_.length() != count;
+    for (size_t index = 0; index < count; ++index) {
+        const TerminalUpdate& update = panes[index].update;
+        if (update.colors == nullptr) {
             return false;
         }
-        for (size_t index = 0; index < update.rowCount; ++index) {
-            if (update.rows[index].cells == nullptr || update.rows[index].row != index) {
+        // A9: zero is a refused frame, not a window-sized default. The
+        // grid the update names is the width of TerminalRow::cells and
+        // the height row.row indexes into; without it every read below
+        // is a read of an unknown length.
+        if (update.gridColumns == 0 || update.gridRows == 0) {
+            return false;
+        }
+        if (!shapeChanged) {
+            const PaneRetain& previous = panes_[index];
+            shapeChanged = previous.shapes != update.shapes || previous.columns != update.gridColumns || previous.rows != update.gridRows || previous.offset != total;
+        }
+        total += (size_t)(update.gridColumns) * update.gridRows;
+    }
+    shapeChanged = shapeChanged || cells_.length() != total;
+    if (shapeChanged) {
+        // A reshaped grid needs every row of every pane before the
+        // retained cells mean anything.
+        for (size_t index = 0; index < count; ++index) {
+            const TerminalUpdate& update = panes[index].update;
+            if (update.rowCount != update.gridRows) {
                 return false;
+            }
+            for (size_t row = 0; row < update.rowCount; ++row) {
+                if (update.rows[row].cells == nullptr || update.rows[row].row != row) {
+                    return false;
+                }
             }
         }
     }
-    for (size_t index = 0; index < update.rowCount; ++index) {
-        const TerminalRow& row = update.rows[index];
-        if (row.cells == nullptr || row.row >= composer_.geometry.rows) {
+    panes_.clear();
+    size_t offset = 0;
+    for (size_t index = 0; index < count; ++index) {
+        const TerminalUpdate& update = panes[index].update;
+        panes_.pushBack({update.shapes, update.gridColumns, update.gridRows, offset});
+        offset += (size_t)(update.gridColumns) * update.gridRows;
+    }
+    nextCells_.clear();
+    if (shapeChanged) {
+        nextCells_.zero(total);
+        return true;
+    }
+    // The frame is built beside the retain rather than on top of it, so
+    // a pane that refuses halfway leaves the last accepted frame whole.
+    nextCells_.append(cells_.data(), cells_.length());
+    return true;
+}
+
+// The captured model and the presentation state belong to the pane drawn
+// last: the probes this renderer answers (columns(), screenText(), the
+// model snapshots) are questions about a terminal, not about a window,
+// and the terminal they mean is that one. The retained *cells*, since
+// A6-3, belong to every pane at once - see reshape() above.
+bool ReferenceRendererImpl::updateOnce(const PaneUpdate& pane, size_t index) {
+    const TerminalUpdate& update = pane.update;
+    const PaneRetain& retain = panes_[index];
+    for (size_t entry = 0; entry < update.rowCount; ++entry) {
+        const TerminalRow& row = update.rows[entry];
+        if (row.cells == nullptr || row.row >= retain.rows) {
             return false;
         }
     }
-    if (update.overlayCount != 0 && (update.overlayCells == nullptr || update.overlayRow >= composer_.geometry.rows || (size_t)(update.overlayColumn) + update.overlayCount > composer_.geometry.columns)) {
+    if (update.overlayCount != 0 && (update.overlayCells == nullptr || update.overlayRow >= retain.rows || (size_t)(update.overlayColumn) + update.overlayCount > retain.columns)) {
         return false;
     }
 
-    Vector<ReferenceCell> next(cells_);
-    if (shapeChanged) {
-        next.clear();
-        next.zero(count);
-    }
-    for (size_t index = 0; index < update.rowCount; ++index) {
-        const TerminalRow& row = update.rows[index];
-        for (u16 column = 0; column < composer_.geometry.columns; ++column) {
-            next.mut((size_t)(row.row) * composer_.geometry.columns + column) = materialize(row.cells[column], row.lineAttribute, *update.colors);
+    ReferenceCell* const cells = nextCells_.mutData() + retain.offset;
+    for (size_t entry = 0; entry < update.rowCount; ++entry) {
+        const TerminalRow& row = update.rows[entry];
+        for (u16 column = 0; column < retain.columns; ++column) {
+            cells[(size_t)(row.row) * retain.columns + column] = materialize(row.cells[column], row.lineAttribute, *update.colors);
         }
     }
     if (update.overlayCount != 0) {
         // The preview covers the row content beneath it.
-        const size_t base = (size_t)(update.overlayRow) * composer_.geometry.columns + update.overlayColumn;
-        for (u16 index = 0; index < update.overlayCount; ++index) {
-            next.mut(base + index) = materialize(update.overlayCells[index], 0, *update.colors);
+        const size_t base = (size_t)(update.overlayRow) * retain.columns + update.overlayColumn;
+        for (u16 entry = 0; entry < update.overlayCount; ++entry) {
+            cells[base + entry] = materialize(update.overlayCells[entry], 0, *update.colors);
         }
     }
     captureStrips(update);
-    if (!render(update, next)) {
+    if (!render(update, cells, retain.columns, retain.rows, pane.area)) {
         return false;
     }
 
-    columns_ = composer_.geometry.columns;
-    rows_ = composer_.geometry.rows;
-    cells_.xchg(next);
+    lastOffset_ = retain.offset;
+    columns_ = retain.columns;
+    rows_ = retain.rows;
     colors_ = update.colors;
     lastUpdateCells_ = update.rowCount * columns_;
     lastUpdateSpans_ = update.rowCount;
     lastUpdateRows_.clear();
-    for (size_t index = 0; index < update.rowCount; ++index) {
-        lastUpdateRows_.pushBack(update.rows[index].row);
+    for (size_t entry = 0; entry < update.rowCount; ++entry) {
+        lastUpdateRows_.pushBack(update.rows[entry].row);
     }
     captureModel();
-    captureState(update);
+    captureState(update, cells, (size_t)(retain.columns) * retain.rows);
     havePresentation_ = true;
     ++refreshCount_;
     return true;
+}
+
+const ReferenceCell* ReferenceRendererImpl::retained() const {
+    return cells_.data() + lastOffset_;
+}
+
+size_t ReferenceRendererImpl::retainedCount() const {
+    return (size_t)(columns_)*rows_;
 }
 
 bool ReferenceRendererImpl::repaint() {
@@ -694,7 +938,7 @@ bool ReferenceRendererImpl::repaint() {
         return false;
     }
     TerminalUpdate update = renderUpdate();
-    return render(update, cells_);
+    return render(update, retained(), columns_, rows_, pane_);
 }
 
 void ReferenceRendererImpl::attach(TestApi& testApi) {
@@ -716,9 +960,10 @@ ReferenceImage ReferenceRendererImpl::image() const {
 TerminalUpdate ReferenceRendererImpl::renderUpdate() const {
     renderRows_.clear();
     renderRows_.grow(rows_);
-    resizeVector(renderCells_, cells_.length());
-    for (size_t index = 0; index < cells_.length(); ++index) {
-        renderCells_.mut(index) = cells_[index].source;
+    const size_t count = retainedCount();
+    resizeVector(renderCells_, count);
+    for (size_t index = 0; index < count; ++index) {
+        renderCells_.mut(index) = retained()[index].source;
         // Extra-cell references age out with store collections; the
         // grapheme codepoints captured at update time re-materialize so a
         // shaping consumer of these retained cells resolves the full
@@ -733,12 +978,18 @@ TerminalUpdate ReferenceRendererImpl::renderUpdate() const {
         renderRows_.pushBack({
             renderCells_.data() + offset,
             row,
-            cells_[offset].lineAttribute,
+            retained()[offset].lineAttribute,
         });
     }
     return {
         .rows = renderRows_.data(),
         .rowCount = renderRows_.length(),
+        // A9: this update carries the grid of the pane drawn last, which
+        // is the shape of the cells it hands out. test_mode.cpp's shadow
+        // mirror forwards it to another renderer verbatim, so the two
+        // fields have to be here and not filled in by the consumer.
+        .gridColumns = columns_,
+        .gridRows = rows_,
         .colors = colors_,
         .viewOffset = viewOffset_,
         .historyRows = historyRows_,
@@ -760,7 +1011,8 @@ TerminalUpdate ReferenceRendererImpl::renderUpdate() const {
 void ReferenceRendererImpl::snapshot(Buffer& out) const {
     StringBuilder output;
     output << StringView(u8"OK ") << columns_ << StringView(u8" ") << rows_ << StringView(u8" ") << cursor_.posX << StringView(u8" ") << cursor_.posY << StringView(u8" ") << (unsigned)(cursor_.style) << StringView(u8" ") << viewOffset_ << StringView(u8" ") << refreshCount_ << StringView(u8" ") << selection_.tl.x << StringView(u8" ") << selection_.tl.y << StringView(u8" ") << selection_.br.x << StringView(u8" ") << selection_.br.y << StringView(u8" ") << (unsigned)(selection_.rectangular) << StringView(u8" ");
-    for (const ReferenceCell& cell : cells_) {
+    for (size_t index = 0; index < retainedCount(); ++index) {
+        const ReferenceCell& cell = retained()[index];
         const unsigned flags = cellFlags(cell);
         const u32 codepoint = cell.source.uc_pt ? cell.source.uc_pt : ' ';
         output << Hex{codepoint, 8} << Hex{flags, 8} << Hex{cell.foreground.red, 2} << Hex{cell.foreground.green, 2} << Hex{cell.foreground.blue, 2} << Hex{cell.background.red, 2} << Hex{cell.background.green, 2} << Hex{cell.background.blue, 2} << Hex{cell.underlineColor.red, 2} << Hex{cell.underlineColor.green, 2} << Hex{cell.underlineColor.blue, 2} << Hex{cell.hyperlink, 8} << Hex{cell.source.semantic, 8};
@@ -772,8 +1024,8 @@ void ReferenceRendererImpl::snapshot(Buffer& out) const {
 void ReferenceRendererImpl::modelSnapshot(Buffer& out) const {
     StringBuilder output;
     output << StringView(u8"OK ") << columns_ << StringView(u8" ") << rows_ << StringView(u8" ") << cursor_.posX << StringView(u8" ") << cursor_.posY << StringView(u8" ") << (unsigned)(cursor_.style) << StringView(u8" ") << viewOffset_ << StringView(u8" ") << refreshCount_ << StringView(u8" ") << selection_.tl.x << StringView(u8" ") << selection_.tl.y << StringView(u8" ") << selection_.br.x << StringView(u8" ") << selection_.br.y << StringView(u8" ") << (unsigned)(selection_.rectangular) << StringView(u8" ");
-    for (size_t index = 0; index < cells_.length(); ++index) {
-        const ReferenceCell& cell = cells_[index];
+    for (size_t index = 0; index < retainedCount(); ++index) {
+        const ReferenceCell& cell = retained()[index];
         const TerminalCell& modelCell = modelCells_[index];
         const unsigned flags = cellFlags(modelCell, modelLineAttributes_[index]);
         const u32 codepoint = cell.source.uc_pt ? cell.source.uc_pt : ' ';
@@ -799,9 +1051,9 @@ void ReferenceRendererImpl::modelDigest(Buffer& out) const {
     digest.add(selection_.br.x);
     digest.add(selection_.br.y);
     digest.add(selection_.rectangular);
-    digest.add(cells_.length());
-    for (size_t index = 0; index < cells_.length(); ++index) {
-        const ReferenceCell& cell = cells_[index];
+    digest.add(retainedCount());
+    for (size_t index = 0; index < retainedCount(); ++index) {
+        const ReferenceCell& cell = retained()[index];
         const TerminalCell& modelCell = modelCells_[index];
         digest.add(cell.source.uc_pt ? cell.source.uc_pt : ' ');
         digest.add(cellFlags(modelCell, modelLineAttributes_[index]));
@@ -849,8 +1101,8 @@ void ReferenceRendererImpl::scrollbackState(Buffer& out) const {
 
 void ReferenceRendererImpl::screenText(Buffer& out) const {
     out.reset();
-    for (size_t index = 0; index < cells_.length(); ++index) {
-        const u32 codepoint = cells_[index].source.uc_pt;
+    for (size_t index = 0; index < retainedCount(); ++index) {
+        const u32 codepoint = retained()[index].source.uc_pt;
         const char printable = codepoint >= 0x20 && codepoint <= 0x7e ? (char)(codepoint) : ' ';
         out.append(&printable, 1);
         if ((index + 1) % columns_ == 0) {

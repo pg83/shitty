@@ -35,7 +35,13 @@ class SixelTest(unittest.TestCase):
         self.assertNotEqual(pixel(image, BORDER + 6, BORDER), (255, 0, 0))
 
     def test_transparent_pixels_show_pen_background(self):
-        with Shitty(columns=8, rows=4, glyph_px=6, glyph_py=12) as terminal:
+        # T8: opacity pinned back to 100, the same as
+        # test_dynamic_colors.test_border_follows_dynamic_background. The
+        # pen *background* is the thing measured here, and the shipped
+        # 60% default scales exactly that and nothing else - the painted
+        # red column above it is unaffected either way.
+        with Shitty(columns=8, rows=4, glyph_px=6, glyph_py=12,
+                    extra_arguments=("-backgroundOpacity", "100", "-backgroundBlur", "off")) as terminal:
             # One painted column; the pen background is VGA blue, so the
             # transparent remainder of the cell must show it.
             terminal.write(b"\x1b[?25l\x1b[44m\x1bPq#1;2;100;0;0#1~\x1b\\")

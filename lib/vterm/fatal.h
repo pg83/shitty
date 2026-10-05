@@ -25,8 +25,14 @@ struct FatalError final: public stl::Exception {
 
 [[noreturn]] void raiseFatal(stl::Buffer&& text);
 
-// raiseError(u8"-border: expected unsigned, max. ", limit) - every part
-// streams through StringBuilder, so anything Outable works.
+// raiseError(StringView(u8"-border: expected unsigned, max. "), limit) -
+// every part streams through StringBuilder, so anything Outable works.
+//
+// Wrap literals in StringView. A bare u8"..." deduces as char8_t[N], and
+// stl::output is declared for every type but defined only for the named
+// ones (std/ios/outable.h), so the array instantiation survives the
+// compiler and dies in the linker - on whichever platform happens to
+// build the caller.
 template <typename... Part>
 [[noreturn]] void raiseError(const Part&... part) {
     stl::StringBuilder text;

@@ -10,11 +10,12 @@
 #include <std/ios/output.h>
 #include <std/lib/buffer.h>
 
-#if __has_include(<simdutf.h>)
+// Not __has_include: the header can be on the include path - Nix puts every
+// build input there - while pkg-config, and with it -lsimdutf, is switched off.
+// build.py hangs HAVE_SIMDUTF on the same dependency that carries the link
+// flag, so the two decisions cannot drift apart.
+#if defined(HAVE_SIMDUTF)
     #include <simdutf.h>
-    #define SHITTY_BASE64_SIMDUTF 1
-#else
-    #define SHITTY_BASE64_SIMDUTF 0
 #endif
 
 using namespace stl;
@@ -165,7 +166,7 @@ bool base64DecodeInPlace(u8* data, size_t& size) noexcept {
 }
 
 Buffer& base64Encode(StringView input, Buffer& output) {
-#if SHITTY_BASE64_SIMDUTF
+#if defined(HAVE_SIMDUTF)
     output.reset();
     output.grow(simdutf::base64_length_from_binary(input.length()));
     const size_t size = simdutf::binary_to_base64((const char*)(input.data()), input.length(), (char*)(output.mutData()));

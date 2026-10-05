@@ -38,12 +38,26 @@
 #define PLT_SDK_MACOS_15 0
 #endif
 
+#if defined(MAC_OS_VERSION_26_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_26_0
+#define PLT_SDK_MACOS_26 1
+#else
+#define PLT_SDK_MACOS_26 0
+#endif
 
+#if defined(MAC_OS_VERSION_27_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_27_0
+#define PLT_SDK_MACOS_27 1
+#else
+#define PLT_SDK_MACOS_27 0
+#endif
+
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
 #include <new>
 #include <poll.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 using namespace stl;
 using namespace plt;
@@ -130,6 +144,34 @@ void cocoaWakeReady(CFMachPortRef port, void* message, CFIndex size, void* owner
 @property(nonatomic, strong) NSTrackingArea* tracking;
 @end
 
+
+// T10. The blurred backdrop -backgroundBlur asks for: the desktop
+// behind the window, blurred, sitting under everything the window draws
+// so a translucent terminal shows blur instead of raw wallpaper.
+@interface PltBackdropView: NSVisualEffectView
+@end
+
+#if PLT_SDK_MACOS_26
+// The same job as PltBackdropView above, in the same place, out of the
+// system's own glass instead of a frosted pane: -backgroundBlur glass.
+//
+// The name carries no product brand on purpose. Two binaries are built
+// from this tree under two brands, and strip removes symbols but not
+// Objective-C class names or selector literals, so a class named after
+// one brand would still be a substring of the other's binary - which
+// tst/pretty_binary_branding.py rejects. Plt* is the neutral prefix
+// this file already uses.
+API_AVAILABLE(macos(26.0))
+@interface PltGlassView: NSGlassEffectView {
+@public
+    // The floor a macOS 27 corner configuration falls back to; see the
+    // -cornerConfiguration override below for why the radius stops being a
+    // plain number there. Written by WindowImpl::applyCornerRadius(), which
+    // owns every other statement of this window's corner radius too.
+    CGFloat concentricFloor;
+}
+@end
+#endif
 
 @interface PltDisplayLinkTarget: NSObject {
 @public
@@ -225,6 +267,16 @@ void cocoaWakeReady(CFMachPortRef port, void* message, CFIndex size, void* owner
     return YES;
 }
 
+// NSTrackingActiveInKeyWindow, and it stays that way: this area is what
+// feeds the terminal's pointer reporting (cocoaPointerImpl and the
+// enter/leave pair below), and a program running inside a window the
+// user is not typing into has no business being told the pointer swept
+// across it on its way somewhere else. Chrome that has to react in an
+// inactive window - the auto-hiding title bar, which must reveal its
+// buttons before they can be clicked (A7, ui_csd_tabs.mm) - brings its
+// own NSTrackingActiveAlways area for its own strip rather than
+// widening this one, so that behaviour is scoped to the option that
+// asked for it instead of landing on every window.
 - (void)updateTrackingAreas {
     if (self.tracking != nil) {
         [self removeTrackingArea:self.tracking];
@@ -419,6 +471,65 @@ void cocoaWakeReady(CFMachPortRef port, void* message, CFIndex size, void* owner
 
 @end
 
+@implementation PltBackdropView
+
+// Invisible to the event system, the same nil TerminalTitlebarFillView
+// returns (ui_csd_tabs.mm) and for a stricter reason. This view is the
+// full size of the window's frame, so it lies under the content view,
+// under the title bar container, and under whatever the sidebar and the
+// title-bar strip put in either. It draws and nothing else: two defects
+// of the class "input arrived somewhere it was not aimed" have already
+// cost this plan a review, and a backdrop that could take a click would
+// be a third waiting to happen. Returning nil is not merely
+// click-through - it removes this view from hit testing entirely, so
+// every gesture lands exactly where it landed before the view existed.
+- (NSView*)hitTest:(NSPoint)point {
+    (void)point;
+    return nil;
+}
+
+@end
+
+#if PLT_SDK_MACOS_26
+@implementation PltGlassView
+
+// Invisible to the event system for exactly the reasons spelled out on
+// PltBackdropView's own hitTest: above. NSGlassEffectView is an ordinary
+// NSView subclass and hit-tests like one, so the reasoning carries over
+// unchanged - this view is the full size of the window's frame, and
+// without this every gesture that missed everything above it would land
+// on a decoration.
+- (NSView*)hitTest:(NSPoint)point {
+    (void)point;
+    return nil;
+}
+
+#if PLT_SDK_MACOS_27
+// macOS 27 shapes a glass view from NSView.cornerConfiguration rather than
+// from the cornerRadius property, and that property is readonly - a view
+// states its shape by overriding this getter, the way it states a size by
+// overriding intrinsicContentSize. Measured on a probe: where both are set,
+// the configuration is what the glass takes (a 260x84 sheet with
+// cornerRadius 6 and a capsule configuration comes out a capsule).
+//
+// Concentric rather than fixed, because this view's container is AppKit's
+// own frame view and that view knows the window's real shape while this
+// process only knows the number an option asked for. Measured on the same
+// probe: inside a titled window NSThemeFrame reports 16 points of radius on
+// this machine, and a glass sibling of the content view asking for
+// containerConcentric with a floor of 12 resolves to 16 - the window's
+// shape, not the guess. Inside a borderless window NSNextStepFrame declares
+// no shape at all, the floor resolves unchanged, and the result is exactly
+// the number cornerRadius carried before.
+- (NSViewCornerConfiguration*)cornerConfiguration API_AVAILABLE(macos(27.0)) {
+    return [NSViewCornerConfiguration configurationWithRadius:
+        [NSViewCornerRadius containerConcentricRadiusWithMinimum:concentricFloor]];
+}
+#endif
+
+@end
+#endif
+
 @implementation PltDisplayLinkTarget
 @end
 
@@ -535,6 +646,8 @@ namespace {
         ~WindowImpl();
 
         void requestShow() override;
+        void requestHide() override;
+        void requestShowAt(ShowPlacement placement) override;
         void requestClose() override;
         void requestFrame() override;
         void requestTitle(StringView title) override;
@@ -545,10 +658,12 @@ namespace {
         void requestFocus() override;
         void requestMaximized(bool maximized) override;
         void requestFullscreen(bool fullscreen) override;
+        void requestCornerRadius(u16 radius) override;
         void requestResize(u32 width, u32 height) override;
         void requestMinimumSize(u32 width, u32 height) override;
         void requestResizeUnit(u32 width, u32 height, u32 baseWidth, u32 baseHeight) override;
         WindowInfo info() const override;
+        bool visible() const override;
         bool inLiveResize() const override;
         Clipboard* primary() override;
         Clipboard* secondary() override;
@@ -560,6 +675,7 @@ namespace {
         void close();
         void resized();
         void resizeFrame();
+        NSRect topOfActiveScreenFrame() const;
         void startDisplayLink();
         void screenChanged();
         NSRect textInputScreenRect() const;
@@ -582,14 +698,34 @@ namespace {
         void dragExited();
         BOOL performDrop(id<NSDraggingInfo> sender);
         void applySizeConstraints();
+        void applyCornerRadius();
+        // The one-time hand-off of window.backgroundColor, described at
+        // its definition. Two unrelated options need it and neither may
+        // take it twice.
+        void establishFrameTransparency();
 
         PlatformImpl& platform;
         InputSink* input = nullptr;
         WindowEvents* events = nullptr;
         FrameCallback* frame = nullptr;
         DropTarget* dropTarget = nullptr;
+        // Mirrors WindowOptions::quick: gates the quick-terminal-only
+        // behavior added in focused() (hide on key resign) since that
+        // path has no options struct at hand, only the live window state.
+        bool quick = false;
+        // Mirrors WindowOptions::quickGeometry; resolved against a live
+        // screen in topOfActiveScreenFrame(), the only reader.
+        QuickGeometry quickGeometry;
         NSWindow* window = nil;
         PltView* view = nil;
+        // The PltGlassView this window was given, or nil - either
+        // because the backdrop is the frosted PltBackdropView, or
+        // because there is no backdrop at all. Held only so
+        // applyCornerRadius() can keep the glass's own corners in step
+        // with the window's; typed NSView* so the field itself needs no
+        // availability annotation, and cast back inside the one
+        // @available scope that touches it.
+        NSView* glassBackdrop = nil;
         PltWindowDelegate* delegate = nil;
         CVDisplayLinkRef displayLink = nullptr;
         PltDisplayLinkTarget* displayLinkTarget = nil;
@@ -604,6 +740,11 @@ namespace {
         u32 resizeUnitHeight = 1;
         u32 resizeBaseWidth = 0;
         u32 resizeBaseHeight = 0;
+        // The radius requestCornerRadius() was last asked for, in points.
+        // Held rather than written straight through because the layer it
+        // lands on does not exist yet at the moment the option is read;
+        // see applyCornerRadius().
+        u16 cornerRadius = 0;
         ClipboardImpl primaryPasteboard;
         ClipboardImpl generalPasteboard;
         bool frameRequested = false;
@@ -651,7 +792,7 @@ namespace {
         void run() override;
         void stop() override;
 
-        void ensureApplication(StringView appName);
+        void ensureApplication(StringView appName, bool quick);
 
         PollerImpl* poller_ = nullptr;
         SmallObjAllocator* allocator_ = nullptr;
@@ -802,6 +943,70 @@ namespace {
         return kCVReturnSuccess;
     }
 
+    // Reads the environment variable lib/shitty/quick_companion.cpp sets
+    // on a spawned quick-terminal companion right before exec() (the
+    // literal is duplicated here on purpose - ext/plt never #includes a
+    // lib/shitty header, only names one in comments, same as the
+    // quick_geometry cross-references elsewhere in this file and in
+    // window.h), and if present, watches that pid for exit through a GCD
+    // proc source - GCD's supported wrapper over kqueue's EVFILT_PROC/
+    // NOTE_EXIT - delivered on the main queue, which already pumps
+    // cooperatively with this file's CFRunLoop (same context the hotkey
+    // module's Carbon handling runs in, so this adds no separate thread
+    // and no interference with it).
+    //
+    // This exists because application.cpp's stopQuickCompanion() only
+    // reaches the companion on the paths where the parent's own close()
+    // or destructor gets to run at all; a signal that skips those -
+    // SIGKILL, or a bare SIGTERM with no handler - skips that kill()
+    // too, and the companion would otherwise outlive a parent that no
+    // longer exists, holding onto the global hotkey with nothing left to
+    // show. This is the companion-side half that closes that gap
+    // regardless of how the parent went away.
+    static void watchParentForExit() {
+        const char* const parentPidText = getenv("TERMINAL_QUICK_COMPANION_PARENT_PID");
+        if (parentPidText == nullptr) {
+            return;
+        }
+        char* end = nullptr;
+        const long parsed = strtol(parentPidText, &end, 10);
+        // Unset either way, valid or not: this must not reach the shell
+        // this process spawns for itself further down in run(), the same
+        // reason application.cpp clears it in its own process right
+        // after fork().
+        unsetenv("TERMINAL_QUICK_COMPANION_PARENT_PID");
+        if (end == parentPidText || *end != '\0' || parsed <= 0) {
+            return;
+        }
+        const pid_t parentPid = (pid_t)(parsed);
+        // static, not a plain local: this file compiles with ARC (see
+        // -fobjc-arc), where a dispatch_source_t is an ordinary strong
+        // Objective-C reference - a local one would be released, and the
+        // watch torn down with it, the moment this function returns.
+        // static gives it process-duration storage instead, matching the
+        // "never released on purpose" intent below.
+        static dispatch_source_t parentWatch;
+        parentWatch = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)(parentPid), DISPATCH_PROC_EXIT, dispatch_get_main_queue());
+        if (parentWatch == nil) {
+            return;
+        }
+        dispatch_source_set_event_handler(parentWatch, ^{
+          _exit(0);
+        });
+        dispatch_resume(parentWatch);
+        // Never released on purpose: the watch has to outlive every other
+        // object in the process, and both ways this process can still end
+        // - the handler above, or something else killing it outright -
+        // make releasing it moot.
+        if (getppid() != parentPid) {
+            // Already reparented to launchd by the time the watch above
+            // registered - the parent died in the fork()/exec() window,
+            // before EVFILT_PROC had a live process left to attach to.
+            // Same outcome as the watch firing, forced by hand since the
+            // watch itself will never see it.
+            _exit(0);
+        }
+    }
 }
 
 PlatformImpl::PlatformImpl(ObjPool& owner)
@@ -837,10 +1042,17 @@ NSMenu* plt::cocoaBuildMainMenu(NSString* appName) {
     return bar;
 }
 
-void PlatformImpl::ensureApplication(StringView appName) {
+void PlatformImpl::ensureApplication(StringView appName, bool quick) {
     if (applicationReady_) {
         return;
     }
+    // Independent of quick below: a process re-exec'd by a
+    // quickCompanion spawn watches its parent regardless of what its own
+    // config happens to set, since the watch is about "something else
+    // manages this process's lifetime", not about being a quick window
+    // specifically. A no-op for every ordinary launch - the environment
+    // variable it looks for is simply absent.
+    watchParentForExit();
     // Press and Hold swallows the auto-repeat of every key the system
     // deems accent-capable - which keys those are shifts with layout
     // and OS release, so 'q' stops repeating while 'w' still does.  A
@@ -850,10 +1062,22 @@ void PlatformImpl::ensureApplication(StringView appName) {
         @"ApplePressAndHoldEnabled" : @NO
     }];
     [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    // A quick-terminal window gets no Dock icon and no Cmd-Tab entry:
+    // Accessory, not Regular. It still becomes the key window and takes
+    // keyboard input normally once shown - requestShowAt() already calls
+    // makeKeyAndOrderFront: and activateIgnoringOtherApps:, neither of
+    // which Accessory refuses - this only changes whether the process
+    // itself is Dock/switcher visible. A quickCompanion process is
+    // exactly this case: a second `st` process the user did not launch
+    // by hand and should not see a second icon for. Every other process
+    // (including the one that spawned a quickCompanion) stays Regular:
+    // this is gated on quick alone, never on quickCompanion.
+    [NSApp setActivationPolicy:quick ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular];
     // The embedder's name, or the process name - which Foundation
     // always supplies. A platform library has no name of its own to
-    // fall back on.
+    // fall back on, and naming one here would put a brand in the layer
+    // every brand built out of this tree links (see GenericBrand in
+    // lib/shitty/brand.cpp and tst/pretty_binary_branding.py).
     NSString* name = nil;
     if (appName.length() != 0) {
         name = [[NSString alloc] initWithBytes:appName.data() length:appName.length() encoding:NSUTF8StringEncoding];
@@ -867,7 +1091,7 @@ void PlatformImpl::ensureApplication(StringView appName) {
 }
 
 Window* PlatformImpl::createWindow(ObjPool& owner, const WindowOptions& options) {
-    ensureApplication(options.appName);
+    ensureApplication(options.appName, options.quick);
     return owner.make<WindowImpl>(*this, options);
 }
 
@@ -1088,6 +1312,8 @@ WindowImpl::WindowImpl(PlatformImpl& platform_, const WindowOptions& options)
     , events(options.events)
     , frame(options.frame)
     , dropTarget(options.drop)
+    , quick(options.quick)
+    , quickGeometry(options.quickGeometry)
 {
     primaryPasteboard.window = this;
     primaryPasteboard.primary = true;
@@ -1134,6 +1360,178 @@ WindowImpl::WindowImpl(PlatformImpl& platform_, const WindowOptions& options)
     view.wantsLayer = YES;
     view.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
     window.contentView = view;
+    if (options.backdrop != Backdrop::None && options.backgroundOpacity < 100) {
+        // Under the *frame* view rather than inside the content view.
+        //
+        // A subview of the content view could not do this job at all: it
+        // would draw above the content view's own layer, and that layer
+        // is the CAMetalLayer the terminal is rendered into - the
+        // backdrop would cover the terminal instead of backing it. The
+        // frame view is the one surface that is genuinely behind
+        // everything, and placing the backdrop at the bottom of it also
+        // puts the blur behind the title bar, which is where it has to be
+        // for a translucent title strip not to read as a step above a
+        // blurred body.
+        //
+        // Nothing else in the window moves. window.contentView keeps its
+        // identity, so ui_sidebar_tabs.mm still finds the same view to
+        // add its list to and Composer::setChromeReserve() still reserves
+        // the same edges; ui_csd_tabs.mm still reaches the title bar
+        // container through the zoom button, which is this file's
+        // precedent for touching the frame hierarchy at all. The
+        // alternative - making a visual effect view the content view and
+        // re-parenting PltView inside it - would move the view the
+        // sidebar reads, and was not taken for that reason.
+        NSView* const frameView = view.superview;
+        if (frameView != nil) {
+            NSView* backdrop = nil;
+#if PLT_SDK_MACOS_26
+            if (options.backdrop == Backdrop::Glass) {
+                if (@available(macOS 26.0, *)) {
+                    PltGlassView* const glass = [[PltGlassView alloc] initWithFrame:frameView.bounds];
+                    // Regular, not Clear: Clear is the style meant for
+                    // glass laid over imagery the user is looking at,
+                    // and this pane has a terminal on top of it.
+                    glass.style = NSGlassEffectViewStyleRegular;
+                    // Left without a contentView deliberately. That
+                    // property is the one placement NSGlassEffectView's
+                    // header actually guarantees, and it is also the one
+                    // that was measured to drive the *window's* size
+                    // through Auto Layout - a 640x440 window came up
+                    // 640x43. Nothing needs to live inside this glass:
+                    // the terminal is a sibling above it, which is
+                    // where the recon measured the glass to show
+                    // through.
+                    //
+                    // Which also means the autoresizing mask below has
+                    // to be honoured rather than ignored: a glass view
+                    // ships translatesAutoresizingMaskIntoConstraints
+                    // set NO, and a view in that state takes its frame
+                    // from constraints nobody here writes.
+                    glass.translatesAutoresizingMaskIntoConstraints = YES;
+                    glassBackdrop = glass;
+                    backdrop = glass;
+                }
+            }
+#endif
+            if (backdrop == nil) {
+                // Either -backgroundBlur blur, or glass on a system that
+                // has none. The fallback is silent: a warning here would
+                // fire on every start for anyone who wrote glass into a
+                // config once, on a machine that can never satisfy it.
+                PltBackdropView* const frosted = [[PltBackdropView alloc] initWithFrame:frameView.bounds];
+                // "What is under the window" is literally the question
+                // this option asks, and it is the one material named for
+                // a position rather than for a role: Sidebar,
+                // HeaderView, Menu and the rest each carry the tint of
+                // the AppKit element they belong to, which would put a
+                // system control's colour cast between the terminal and
+                // the desktop.
+                frosted.material = NSVisualEffectMaterialUnderWindowBackground;
+                // Behind the window, not within it: the pixels to blur
+                // are the desktop's, not this window's own.
+                frosted.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+                // Held active instead of following the window's key
+                // state. The default stops blurring the moment the
+                // window is not key, which for a terminal means the blur
+                // disappears every time the user looks at another
+                // application - the window would flicker between blurred
+                // and clear as focus moves. NSGlassEffectView exposes no
+                // counterpart to this: its whole API is contentView,
+                // cornerRadius, tintColor and style, so whatever it does
+                // when the window stops being key, it does unasked.
+                frosted.state = NSVisualEffectStateActive;
+                backdrop = frosted;
+            }
+            backdrop.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+            // The superview owns it from here. This file is compiled
+            // under ARC (unlike lib/shitty's Objective-C++, which is
+            // not), so the local reference needs no release of its own.
+            [frameView addSubview:backdrop positioned:NSWindowBelow relativeTo:view];
+        }
+    }
+    if (options.backgroundOpacity < 100) {
+        // T10. Both halves of the decision, in one call, from one
+        // reading of the option - the same discipline requestCornerRadius()
+        // keeps for its own pair.
+        //
+        // The layer's half is not optional and not a duplicate of the
+        // window's: a CAMetalLayer marked opaque has its drawable's alpha
+        // channel discarded by CoreAnimation, so a renderer writing alpha
+        // into it produces a *darker* background rather than a
+        // see-through one - the colour has been multiplied down and
+        // nothing composites it back. render_metal.mm reads this flag
+        // back off the live layer for exactly that reason, instead of
+        // trusting an option that a reload can have moved since.
+        view.layer.opaque = NO;
+        establishFrameTransparency();
+    }
+    if (options.transparentTitlebar && options.decorations) {
+        // A borderless window (no-decorations) has no title bar to make
+        // transparent; setting the property there would be a no-op, but
+        // the guard keeps the option's effect scoped to where it means
+        // something. The actual fill color - matching the terminal
+        // background - is app-level (Options::bg) and applied by
+        // ui_csd_tabs.mm once the window exists, not here: this plt layer
+        // has no Color type to draw with.
+        window.titlebarAppearsTransparent = YES;
+    }
+    if (options.quick) {
+        // Scoped to quick windows only, matching quickCornerRadius's own
+        // name and doc - requestCornerRadius() itself is a general
+        // primitive (also used live by the fullscreen chord,
+        // ui_quick_hotkey.mm), the scoping happens here at the one
+        // construction-time call site.
+        requestCornerRadius(options.quickCornerRadius);
+    }
+    if (options.quick) {
+        // A quick-terminal window has no business minimizing to the
+        // Dock: it starts hidden and is meant to be summoned and
+        // dismissed by hotkey only. Dropping the style bit makes both
+        // the (absent) minimize button and Cmd-M's performMiniaturize:
+        // no-ops (verified live: miniaturized/visible stay unchanged
+        // through both), which also sidesteps a real ordering hazard -
+        // window.miniaturized only flips true on windowDidMiniaturize:,
+        // one notification *after* windowDidResignKey: - that would
+        // otherwise let the hide-on-blur below race a Cmd-M genie
+        // animation on a window that was never supposed to allow one.
+        window.styleMask &= ~NSWindowStyleMaskMiniaturizable;
+        // collectionBehavior is permanent, unlike window.level below
+        // (see requestShowAt(TopOfActiveScreen)/requestHide()), which IS
+        // toggled per show/hide. Toggling both together raced AppKit's
+        // own frame relayout - a collectionBehavior change triggers one -
+        // against the setFrame: call right after it in
+        // requestShowAt(TopOfActiveScreen): about a third of shows
+        // landed at a plain window's default frame instead of
+        // topOfActiveScreenFrame() (measured live: 11/36 anomalies with
+        // it toggled, 0/24 with it held constant here - window-chrome
+        // R3-qa-final, F4).
+        //
+        // FullScreenAuxiliary's job is membership: it is what lets
+        // AppKit place this window on a *different* app's fullscreen
+        // Space at all, which a plain window can't join. It is NOT
+        // about winning stacking order against that app's content - a
+        // fullscreen app's own window sits at the ordinary level 0
+        // itself (measured live), so a quick window that reaches that
+        // Space already outranks nothing there by level; the elevated
+        // level granted in requestShowAt(TopOfActiveScreen) exists to
+        // clear the fullscreen app's *own* status-level chrome and the
+        // system menu bar, not its content (an earlier version of this
+        // comment claimed the opposite - wrong, see window-chrome
+        // R3-sec-round2, finding S3-r).
+        //
+        // Being constant means this membership is technically reachable
+        // from the data stream too, even while the window is hidden -
+        // R3-sec-round2 flagged this as S3-r/S6. The guard isn't here
+        // though: requestFocus(), requestRestore() and
+        // requestFullscreen() below each refuse to touch a hidden quick
+        // window (F5/F6) - together the only VtermImpl::windowOperation
+        // calls (CSI 5t/1t/10t) that could otherwise put a hidden one on
+        // screen. requestMove() (CSI 3t) still reaches a hidden window,
+        // but only repositions it; requestShowAt(TopOfActiveScreen)
+        // overwrites that position on the next real show regardless.
+        window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+    }
     window.acceptsMouseMovedEvents = YES;
     [view registerForDraggedTypes:@[ NSPasteboardTypeString, NSPasteboardTypeFileURL ]];
     requestTitle(options.title);
@@ -1180,7 +1578,156 @@ void WindowImpl::requestShow() {
     [window center];
     [window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+    // Ordering the window front is what gets its frame view a layer to
+    // round; see applyCornerRadius(). Re-applied on every show rather
+    // than only the first, because that view is AppKit's and nothing
+    // here owns whether it keeps a layer, or the same one, across a hide.
+    applyCornerRadius();
     resized();
+}
+
+void WindowImpl::requestHide() {
+    if (quick) {
+        // Undoes the level grant made in requestShowAt(TopOfActiveScreen)
+        // on every hide, quick-window or not shown yet - see the comment
+        // there. NSNormalWindowLevel is AppKit's own default for an
+        // untouched window, not a value invented here. collectionBehavior
+        // is not touched: it is held constant from creation, not toggled
+        // per show/hide - see the constructor for why.
+        window.level = NSNormalWindowLevel;
+    }
+    [window orderOut:nil];
+}
+
+// The screen under the mouse pointer, not the window's own .screen - the
+// quick-terminal window starts hidden (off any screen's active area) and
+// TopOfActiveScreen means "wherever the user is right now", which the
+// window's last-known screen cannot answer on a fresh show.
+static NSScreen* screenUnderPointer() {
+    const NSPoint pointer = [NSEvent mouseLocation];
+    for (NSScreen* screen in [NSScreen screens]) {
+        if (NSMouseInRect(pointer, screen.frame, NO)) {
+            return screen;
+        }
+    }
+    return [NSScreen mainScreen];
+}
+
+namespace {
+
+    // dim.value / 100.0 first, extent second: the same two floating-point
+    // operations quickGeometry's hard default (100%/40%) used to be
+    // spelled as literals (extent itself, extent * 0.4), computed in the
+    // same order. A single combined expression like extent * value / 100
+    // would round twice and was measured to occasionally disagree with
+    // that literal form in the last bit - resolveQuickGeometryDim keeps
+    // the default's frame bit-for-bit identical to the pre-quickGeometry
+    // behavior, which the option is required to reproduce exactly.
+    static CGFloat resolveQuickGeometryDim(const QuickGeometryDim& dim, CGFloat extent) {
+        if (!dim.percent) {
+            return (CGFloat)(dim.value);
+        }
+        return extent * ((CGFloat)(dim.value) / (CGFloat)(100.0));
+    }
+
+    static CGFloat clampRange(CGFloat value, CGFloat lo, CGFloat hi) {
+        return max(lo, min(value, hi));
+    }
+}
+
+// A rect on the pointer's screen, sized and offset by quickGeometry
+// against visibleFrame (which already excludes the menu bar and Dock, so
+// this never sits under either). The default - 100% width, 40% height,
+// zero offset - reproduces the placement this replaced, bit-for-bit; see
+// resolveQuickGeometryDim.
+//
+// width/height/x/y are each clamped into the screen after resolving:
+// quick_geometry.cpp validates every component in isolation (a percent
+// within 0..100, a pixel count within 0..UINT16_MAX), but has no
+// NSScreen to check the four against each other or against a specific
+// display - a 1200px width plus a 90% x offset is each individually
+// valid and can still overshoot a screen narrower than that. Clamping
+// here, against the one screen this call actually targets, is simpler
+// and more honest than rejecting such a config at startup on every
+// machine regardless of its actual displays: min/max keep the window
+// fully on screen without ever discarding a value the user didn't ask to
+// have clamped (the defaults hit every clamp's already-satisfied branch,
+// which is what keeps them exact - see resolveQuickGeometryDim).
+NSRect WindowImpl::topOfActiveScreenFrame() const {
+    const NSRect visible = screenUnderPointer().visibleFrame;
+    const CGFloat rawWidth = resolveQuickGeometryDim(quickGeometry.width, visible.size.width);
+    const CGFloat rawHeight = resolveQuickGeometryDim(quickGeometry.height, visible.size.height);
+    const CGFloat width = clampRange(rawWidth, (CGFloat)(1), visible.size.width);
+    const CGFloat height = clampRange(rawHeight, (CGFloat)(1), visible.size.height);
+    const CGFloat rawX = resolveQuickGeometryDim(quickGeometry.x, visible.size.width);
+    const CGFloat rawY = resolveQuickGeometryDim(quickGeometry.y, visible.size.height);
+    const CGFloat x = clampRange(rawX, (CGFloat)(0), visible.size.width - width);
+    const CGFloat y = clampRange(rawY, (CGFloat)(0), visible.size.height - height);
+    // y is measured from visibleFrame's top-left corner (the option's
+    // documented origin), but AppKit's y axis grows upward from the
+    // screen's bottom-left, hence the subtraction - matching the
+    // unconfigurable placement this replaces, which was always anchored
+    // to the top edge.
+    return NSMakeRect(visible.origin.x + x, visible.origin.y + visible.size.height - height - y, width, height);
+}
+
+void WindowImpl::requestShowAt(ShowPlacement placement) {
+    if (placement == ShowPlacement::TopOfActiveScreen) {
+        if (quick) {
+            // Only the level is granted per show (and undone in
+            // requestHide()) - collectionBehavior is constant from
+            // creation instead; see the constructor for why toggling
+            // both together is a real bug, not a style choice
+            // (window-chrome R3-qa-final, F4).
+            //
+            // Granted here rather than held for the window's whole
+            // lifetime: this is the one call site a real user action
+            // (the global hotkey, application.cpp's toggleQuickWindow)
+            // reaches. requestFocus() - the other call that can raise
+            // this window - has exactly one caller in the whole tree,
+            // VtermImpl::windowOperation, which only runs from the
+            // terminal's own data stream (CSI 5t/CSI 3t) and only when
+            // allowWindowOps is on. requestMove() picked up a second
+            // caller with quickRememberFrame - application.cpp's
+            // applySavedQuickFrame(), reached only from toggleQuickWindow()
+            // itself (a human hotkey press) as a fallback for a backend
+            // without a concrete NSWindow to reach through
+            // Window::renderContext() (headless; on Cocoa,
+            // applyQuickFrameToWindow() in ui_quick_hotkey.mm always
+            // succeeds instead, so this call site is unreached here) -
+            // not the data stream either way. requestFocus(), requestRestore() and
+            // requestFullscreen() below each refuse to touch a hidden
+            // quick window (F5/F6 - the three calls that could
+            // otherwise put a hidden one on screen: CSI 5t/1t/10t), so
+            // that path can only re-raise a window a human already
+            // summoned - never conjure one out of hiding at a level
+            // this call didn't already grant it (window-chrome R3-sec
+            // finding S3, tightened by S3-r/S6/S7 in
+            // R3-sec-round2/round3, closed there for those three ops).
+            //
+            // NSStatusWindowLevel (used by menu-bar-extra style panels)
+            // sits above NSFloatingWindowLevel and above the main menu
+            // itself; that headroom is what makes the window reliably
+            // clear a fullscreen app's *own* status-level chrome and the
+            // system menu bar. It is not competing with that app's
+            // regular content for stacking order - a fullscreen window
+            // sits at ordinary level 0 itself (measured live) - so this
+            // grant only matters once collectionBehavior (constant, see
+            // the constructor) has already let the window onto that
+            // app's Space.
+            window.level = NSStatusWindowLevel;
+        }
+        [window setFrame:topOfActiveScreenFrame() display:NO];
+        [window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        // See requestShow(): before the window is ordered front there is
+        // no frame-view layer for the radius to land on. This is the
+        // path a quick window actually takes.
+        applyCornerRadius();
+        resized();
+        return;
+    }
+    requestShow();
 }
 
 void WindowImpl::requestClose() {
@@ -1238,6 +1785,15 @@ void WindowImpl::requestAttention() {
 }
 
 void WindowImpl::requestRestore() {
+    if (quick && !window.visible) {
+        // Same invariant as the guard in requestFocus() below: CSI 1t is
+        // VtermImpl::windowOperation's other call that could put a
+        // hidden quick window on screen (deminiaturize: on an
+        // orderOut:'d-but-not-miniaturized window), so it needs the same
+        // refusal rather than relying on requestFocus() alone
+        // (window-chrome R3-sec-round3, finding S7).
+        return;
+    }
     [window deminiaturize:nil];
     if ((window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
         [window toggleFullScreen:nil];
@@ -1257,6 +1813,19 @@ void WindowImpl::requestMove(i32 x, i32 y) {
 }
 
 void WindowImpl::requestFocus() {
+    if (quick && !window.visible) {
+        // The only caller of requestFocus() is VtermImpl::windowOperation
+        // (CSI 5t), reachable from the terminal's own data stream under
+        // allowWindowOps. Without this guard it un-hid a fully hidden
+        // quick window (measured live) at plain NSNormalWindowLevel, but
+        // still carrying the permanent FullScreenAuxiliary|CanJoinAllSpaces
+        // membership from the constructor - technically reachable on a
+        // fullscreen Space a human never asked to show anything on
+        // (window-chrome R3-sec-round2, findings S3-r and S6). The data
+        // stream may still re-raise a window a human already summoned
+        // through the hotkey; it can no longer conjure one out of hiding.
+        return;
+    }
     [window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 }
@@ -1268,10 +1837,158 @@ void WindowImpl::requestMaximized(bool value) {
 }
 
 void WindowImpl::requestFullscreen(bool value) {
+    if (quick && !window.visible) {
+        // Same invariant as requestRestore() above / requestFocus()
+        // below: CSI 10;1t is the third VtermImpl::windowOperation call
+        // that could put a hidden quick window on screen - toggleFullScreen:
+        // on a hidden window has current == false, so without this guard
+        // it would run unconditionally (window-chrome R3-sec-round3,
+        // finding S7).
+        return;
+    }
     const bool current = (window.styleMask & NSWindowStyleMaskFullScreen) != 0;
     if (current != value) {
         [window toggleFullScreen:nil];
     }
+}
+
+// Rounds the window's frame view, not the content view's own layer.
+//
+// The content view's layer is the CAMetalLayer the renderer presents
+// drawables to (makeBackingLayer above), and rounding *that* is the shape
+// this option shipped in. It cannot round this window, and the reason is
+// geometric rather than anything to do with Metal: measured live on a
+// quick window with the option on, the content view is 1728x402 inside a
+// 1728x434 frame, sitting 32pt below the top, because the window is
+// titled (styleMask 0xb). Its two top corners are therefore interior
+// points hidden under the title bar, not corners of the window at all -
+// so rounding that layer can only ever produce two round corners at the
+// bottom plus, if the clip lands, two notches carved into the content
+// under the title bar. Never the window.
+//
+// Whether a CAMetalLayer honors its own rounded-rect clip at all is left
+// deliberately unanswered here: it was measured that the radius reaches
+// that layer and stays (cornerRadius=12.00, masksToBounds=1, unchanged
+// two seconds after the show), but reading the composited pixels back is
+// not possible from this process, and the change does not depend on the
+// answer either way.
+//
+// One view up, the frame view owns the entire window rect, backs an
+// ordinary NSViewBackingLayer rather than a Metal one, and holds both the
+// content view and the title bar container in its subtree (measured:
+// NSTitlebarView two levels under it). Clipping there is the plain
+// ancestor masking CoreAnimation applies to a sublayer tree, it reaches
+// all four corners of the actual window, and it leaves the title bar in
+// place - which ui_csd_tabs.mm's transparentTitlebar tint needs, since
+// that tint lives in a fill view inside NSTitlebarView.
+//
+// The radius is in points and so is the layer's own geometry - no
+// contentScale multiplication here, unlike the pixel-denominated Options
+// fields composer.h warns about. Toggling it costs a layer property and
+// a shadow invalidation, which is what lets the geometric fullscreen
+// chord (ui_quick_hotkey.mm) square the window off and restore it per
+// keypress; it never runs mid-resize, so it stays clear of the
+// displayLayer:/presentsWithTransaction handshake in render_metal.mm.
+void WindowImpl::applyCornerRadius() {
+    // The layer is read live, never cached: the frame view is AppKit's,
+    // and it is not layer-backed yet when the constructor reads the
+    // option - measured -layer nil at that point, which is exactly why
+    // writing the radius there went nowhere and this had to become a
+    // remember-then-apply pair. Both callers below run after the window
+    // has been ordered front, or are a later re-request against a window
+    // that already is.
+#if PLT_SDK_MACOS_26
+    // Ahead of the early return below, and unconditionally: this one is
+    // our own view, not AppKit's frame view, so there is no "leave it as
+    // we found it" to honour - and the first caller runs from the
+    // constructor, where the frame view has no layer yet and the return
+    // below would otherwise skip the radius the option just asked for.
+    if (glassBackdrop != nil) {
+        if (@available(macOS 26.0, *)) {
+            ((NSGlassEffectView*)(glassBackdrop)).cornerRadius = (CGFloat)(cornerRadius);
+        }
+#if PLT_SDK_MACOS_27
+        // Still written above, and deliberately: cornerRadius is the whole
+        // statement on macOS 26, and on 27 it is the fallback should the
+        // configuration below ever return nil. Here the same number becomes
+        // the floor of a concentric configuration, and the invalidation is
+        // what makes AppKit read the getter again - it caches the answer.
+        if (@available(macOS 27.0, *)) {
+            PltGlassView* const glass = (PltGlassView*)(glassBackdrop);
+            glass->concentricFloor = (CGFloat)(cornerRadius);
+            [glass invalidateCornerConfiguration];
+        }
+#endif
+    }
+#endif
+    CALayer* const layer = view.superview.layer;
+    if (layer == nil || (cornerRadius == 0 && layer.cornerRadius == 0)) {
+        // Nothing asked for and nothing to undo: an ordinary window that
+        // never rounds anything leaves AppKit's own frame view exactly
+        // as it found it, invalidateShadow() included.
+        return;
+    }
+    layer.cornerRadius = (CGFloat)(cornerRadius);
+    // Raised, never lowered: AppKit already ships this YES on its own
+    // frame view (measured), the view is not ours to reconfigure, and a
+    // radius of 0 is spelled by the radius alone.
+    if (cornerRadius > 0) {
+        layer.masksToBounds = YES;
+    }
+    // The window shadow is traced from the window's shape and cached;
+    // without this the square shadow of the un-rounded frame stays as a
+    // rectangular halo behind the new corners.
+    [window invalidateShadow];
+}
+
+void WindowImpl::requestCornerRadius(u16 radius) {
+    cornerRadius = radius;
+    applyCornerRadius();
+    // window.opaque/backgroundColor are NOT this call's to keep
+    // re-touching on every toggle: an opaque window would show its own
+    // background color as square corners poking out past the round
+    // content, so the *window as a whole* needs to go transparent
+    // behind it - but window.backgroundColor is also ui_csd_tabs.mm's
+    // (transparentTitlebar tints it to match the terminal background),
+    // and clobbering it back to windowBackgroundColor on every
+    // fullscreen fold-back reset that tint until the next config reload
+    // (F2's report, I7). Transparency capability is established exactly
+    // once - the first time this window is asked to round its corners
+    // at all, window.opaque still at the AppKit default - and left
+    // alone after that regardless of later radius changes; whatever
+    // owns backgroundColor by then (this function, or ui_csd_tabs.mm
+    // having run since) keeps owning it. window.opaque is what
+    // ui_csd_tabs.mm reads to decide whether the window background is
+    // still its to tint - it is the live record of this decision, and
+    // it is set here in the same call that rounds the layer, so both
+    // sides of that arbitration always see one moment in time. Its own
+    // tint for the transparentTitlebar option went to a fill view
+    // inside the title bar for that reason: the strip can be painted
+    // while the frame behind the rounded corners stays clear.
+    if (radius > 0) {
+        establishFrameTransparency();
+    }
+}
+
+// Hands window.backgroundColor over to transparency, once and for
+// whoever asks first. Two options need a transparent window frame and
+// they need exactly the same thing from it: rounded corners, so the
+// window's own background does not poke square ears past the rounded
+// content, and -backgroundOpacity, so what shows through the content is
+// the desktop and not a solid rectangle underneath it.
+//
+// Once, and never re-touched, for the reason the comment in
+// requestCornerRadius() gives at length: window.backgroundColor is also
+// ui_csd_tabs.mm's while the window is opaque, and window.opaque is the
+// live record of which of them owns it. Re-establishing on every toggle
+// reset that module's tint until the next config reload (F2's report,
+// I7). Whoever owns the colour by the time this runs keeps owning it.
+void WindowImpl::establishFrameTransparency() {
+    if (!window.opaque) {
+        return;
+    }
+    window.opaque = NO;
+    window.backgroundColor = [NSColor clearColor];
 }
 
 void WindowImpl::requestResize(u32 width, u32 height) {
@@ -1336,6 +2053,10 @@ WindowInfo WindowImpl::info() const {
         .maximized = (bool)([window isZoomed]),
         .fullscreen = (window.styleMask & NSWindowStyleMaskFullScreen) != 0,
     };
+}
+
+bool WindowImpl::visible() const {
+    return window.visible;
 }
 
 size_t CocoaDropOffer::formats() const {
@@ -1615,6 +2336,15 @@ void WindowImpl::focused(bool value) {
     if (input != nullptr) {
         input->focus(value);
         input->flush();
+    }
+    // Quick-terminal windows hide themselves on losing key status, after
+    // the terminal above has already seen the same blur it would get on
+    // an ordinary window. window.miniaturized is a defensive check, not
+    // the real guard - the constructor drops Miniaturizable from the
+    // style mask, so a quick window should never actually get here with
+    // it set; this is a fallback in case something iconifies it anyway.
+    if (!value && quick && !window.miniaturized && visible()) {
+        requestHide();
     }
 }
 

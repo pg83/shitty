@@ -62,6 +62,10 @@ class FontFallbackTest(unittest.TestCase):
         width, height, pixels = self.render_with_fixture("͸")
         self.assertTrue(has_ink(pixels))
 
+    @unittest.skipIf(
+        TEST_PLATFORM == "cocoa",
+        "Core Text precedes the Fontconfig fixture on Darwin",
+    )
     def test_symbol_font_range_beats_primary_coverage(self):
         # The primary covers "M" with a blank outline; a [[symbolFont]]
         # range for that codepoint must beat the coverage walk and take
@@ -101,6 +105,10 @@ class FontFallbackTest(unittest.TestCase):
         self.assertFalse(has_ink(plain))
         self.assertTrue(has_ink(assigned))
 
+    @unittest.skipIf(
+        TEST_PLATFORM == "cocoa",
+        "Core Text precedes the Fontconfig fixture on Darwin",
+    )
     def test_symbol_font_defaults_to_private_use_pictograms(self):
         # Issue #107's shape: the primary nerd font covers the powerline
         # triangle itself, so the coverage walk alone never consults the
@@ -140,6 +148,10 @@ class FontFallbackTest(unittest.TestCase):
         # ink from the same text.
         self.assertGreater(ink_weight(assigned), ink_weight(plain))
 
+    @unittest.skipIf(
+        TEST_PLATFORM == "cocoa",
+        "Core Text precedes the Fontconfig fixture on Darwin",
+    )
     def test_symbol_font_that_misses_the_range_leaves_it_alone(self):
         # Fontconfig matches unconditionally, so an unknown [[symbolFont]]
         # name resolves to a substitute that does not cover the assigned

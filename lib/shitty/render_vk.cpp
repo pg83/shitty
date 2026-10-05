@@ -12,7 +12,9 @@
 #include "composer.h"
 #include "font_pack.h"
 #include "span_shaper.h"
+#include "render_blend.h"
 #include "render_damage.h"
+#include "render_push_constants.h"
 
 #include <lib/vterm/utf8.h>
 #include <lib/vterm/fatal.h>
@@ -110,11 +112,19 @@ namespace {
 
     static_assert(sizeof(GpuCellUpdate) == 48, "Vulkan cell update layout mismatch");
 
+    // F9: the seams of the frame being drawn, and their colour.
+    struct SeamBands {
+        Vector<PixelRect> bands;
+        Color ink;
+    };
+
     struct RendererImpl final: public Renderer {
         RendererImpl(Composer& composer, const plt::RenderContext& context);
         ~RendererImpl();
 
+        bool update(const PaneUpdate* frame, size_t count) override;
         bool update(const TerminalUpdate& update) override;
+        void setSeams(const PixelRect* seams, size_t count, Color ink) override;
         bool repaint() override;
         bool repaintFrame();
 
@@ -142,40 +152,10 @@ namespace {
             VkFence fence = VK_NULL_HANDLE;
         };
 
-        struct PushConstants {
-            u32 glyphWidth;
-            u32 glyphHeight;
-            float boxDrawingStroke;
-            u32 columns;
-            u32 rows;
-            u32 outputWidth;
-            u32 outputHeight;
-            u32 originX;
-            u32 originY;
-            u32 cursorColor;
-            i32 cursorX;
-            i32 cursorY;
-            u32 cursorStyle;
-            u32 screenReverseVideo;
-            i32 selectionLeft;
-            i32 selectionTop;
-            i32 selectionRight;
-            i32 selectionBottom;
-            u32 rectangularSelection;
-            u32 showWraps;
-            u32 selectionForeground;
-            u32 selectionBackground;
-            u32 selectionColorMask;
-            u32 blinkVisible;
-            u32 cursorBlink;
-            u32 hoveredHyperlink;
-            u32 hoveredLinkBegin;
-            u32 hoveredLinkEnd;
-            u32 updateCount;
-            u32 cursorKeepSelectionFg;
-        };
-
-        static_assert(sizeof(PushConstants) == 120, "Vulkan push constant layout mismatch");
+        // R9-1: the block lives in render_push_constants.h now - one
+        // definition for both backends, so the two cannot drift apart.
+        // The assertion that guards its size lives there with it.
+        using PushConstants = GpuPushConstants;
 
         // The strip arenas mirrored on the device; append-only between
         // collections, so only the tail uploads each frame.
@@ -208,6 +188,10 @@ namespace {
             u64 outputGeneration = 0;
             bool direct = false;
             bool readback = false;
+            // The mode vkCreateSwapchainKHR was given. Alpha reaches the
+            // compositor through this and nothing else, so it is what
+            // backgroundOpacity() answers from.
+            VkCompositeAlphaFlagBitsKHR compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
             // Without swapchain maintenance there is no presentation fence:
             // destroy after this many further presented frames instead of
             // piling retirees up to a device-wide wait.
@@ -247,6 +231,10 @@ namespace {
         // semaphore still has a pending signal, and a second acquire
         // through it is undefined behavior some drivers survive silently.
         bool presentPending = false;
+        // One warning per renderer, not one per swapchain: a resize
+        // rebuilds the chain and would otherwise repeat it every frame of
+        // a drag.
+        bool opaqueSurfaceWarned = false;
         u32 lastPresentedImage = UINT32_MAX;
         VkQueue queue = VK_NULL_HANDLE;
         VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -262,6 +250,22 @@ namespace {
         FontResources* fontResources = nullptr;
         // The arena generation the device copies mirror; a mismatch means
         // the strips moved wholesale and everything re-uploads.
+        //
+        // A3: one scalar, and the day this backend presents two panes
+        // it stays one. There is one SpanShaper per window, so there is
+        // one arena per plane for the whole window, and the strip
+        // offsets every pane hands out are already offsets into it: the
+        // generation is the window's, not a screen's, and there is no
+        // second one to compare it against. Paired with the per-plane
+        // `uploaded` in FontResources this is the same pair Metal
+        // spells as ArenaMirror (render_arena.h) - the tail while the
+        // generation holds, the whole arena when it moves. What a
+        // second pane costs is elsewhere on that list; what this pair
+        // costs is the assumption underneath it, unguarded by types and
+        // narrower than it reads: one shaper per window. Give a window
+        // two - an overlay's, a pane with its own font - and one number
+        // stops meaning one arena, here exactly as in Metal, and
+        // render_arena.h says at length what that does.
         u32 stripGeneration = 0;
         Buffer fontUploadData;
         Buffer updateEpochs;
@@ -275,7 +279,15 @@ namespace {
         Vector<ScreenRowSpan> spanScratch;
         TerminalCursor previousCursor;
         Rect previousSelection;
-        Color clearBackground = composer.opts->vt.bg;
+        Color clearBackground = composer.vtConfig.config->bg;
+        SeamBands seams;
+        // A2: the rectangle the retained cells belong to. The whole
+        // surface as long as one terminal fills the window, which is
+        // what update() accepts; recordCommands() places the grid inside
+        // it and repaintFrame() reuses the last one. Zero until the
+        // first present, which is also the only state in which no frame
+        // is recorded from it.
+        PixelRect paneArea;
         u32 previousHoveredHyperlink = 0;
         u32 previousHoveredLinkBegin = 0;
         u32 previousHoveredLinkEnd = 0;
@@ -338,7 +350,7 @@ namespace {
         u32 assignStrips(const TerminalUpdate& update, bool allRows);
         void resetArenaStaging();
         void recordArenaUploads(FrameResources& frame);
-        void recordCommands(FrameResources& frame, u32 imageIndex, const PresentationState& state, u32 updateCount, bool clearOutput);
+        void recordCommands(FrameResources& frame, u32 imageIndex, const PresentationState& state, u32 updateCount, bool clearOutput, bool fullRepaint);
         void recordRepaintCommands(FrameResources& frame, u32 imageIndex);
         void recordBlit(FrameResources& frame, u32 imageIndex, VkAccessFlags outputSrcAccess, VkPipelineStageFlags outputSrcStage);
         void recordFrame(FrameResources& frame, u32 imageIndex);
@@ -355,6 +367,8 @@ namespace {
         void capturePresentationState(const TerminalUpdate& update);
 
         static u32 packColor(const Color& color);
+        // T10: how opaque this backend's background may be, 0..100.
+        u16 backgroundOpacity() const;
         static bool sameSelection(const Rect& lhs, const Rect& rhs);
     };
 
@@ -452,10 +466,30 @@ namespace {
         return formatSupports(physicalDevice, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) && formatSupports(physicalDevice, VK_FORMAT_R8_UNORM, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
     }
 
+    // F-vk-alpha. Premultiplied first, whatever -backgroundOpacity
+    // happens to say: every colour this backend writes is premultiplied
+    // already - the clear through premultiply(), the cells through
+    // render.comp's storeAtAlpha - so PRE_MULTIPLIED is the mode that
+    // hands the compositor exactly those bytes. At opacity 100 every
+    // alpha written is 255 and the mode changes no pixel, which is why
+    // the choice is not made from the option: a reload that lowers the
+    // opacity then finds a chain that can already show it, where a chain
+    // picked for the option it started with could not.
+    //
+    // POST_MULTIPLIED is deliberately not preferred over OPAQUE. It asks
+    // the compositor to multiply by alpha a second time, so a frame drawn
+    // for it would have to be written straight - a second colour
+    // convention, disagreeing with the reference renderer, in the one
+    // place the parity tests do not look. A surface offering only that
+    // gets the opaque path and the warning below, which is a picture that
+    // is merely not translucent rather than one that is wrong.
+    //
+    // INHERIT is last and counts as opaque for the option's purpose: what
+    // it inherits is not this layer's to know.
     static VkCompositeAlphaFlagBitsKHR selectCompositeAlpha(VkCompositeAlphaFlagsKHR supported) {
         const VkCompositeAlphaFlagBitsKHR choices[] = {
-            VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
             VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+            VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
             VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
             VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
         };
@@ -1081,6 +1115,7 @@ void RendererImpl::destroySwapchainResources(SwapchainResources& resources) {
     resources.outputInitialized = false;
     resources.outputGeneration = 0;
     resources.direct = false;
+    resources.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 }
 
 void RendererImpl::retireSwapchain(SwapchainResources* resources) {
@@ -1274,7 +1309,17 @@ void RendererImpl::createSwapchain(u32 width, u32 height) {
     }
     createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     createInfo.preTransform = capabilities.currentTransform;
-    createInfo.compositeAlpha = selectCompositeAlpha(capabilities.supportedCompositeAlpha);
+    const VkCompositeAlphaFlagBitsKHR compositeAlpha = selectCompositeAlpha(capabilities.supportedCompositeAlpha);
+    createInfo.compositeAlpha = compositeAlpha;
+    if (compositeAlpha != VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR && composer.opts->backgroundOpacity != 100 && !opaqueSurfaceWarned) {
+        // Said out loud once, the way options.cpp warns that
+        // -backgroundBlur has nothing to show at opacity 100. The silent
+        // version of this is what -backgroundOpacity did on Linux for as
+        // long as it existed: the option parsed, the option was ignored,
+        // and nothing anywhere said so.
+        opaqueSurfaceWarned = true;
+        sysE << composer.brand->identifier() << StringView(u8": -backgroundOpacity has no effect here; this Vulkan surface offers no premultiplied composite alpha, so the window stays opaque") << endL;
+    }
     createInfo.presentMode = presentMode;
     createInfo.clipped = VK_TRUE;
     createInfo.oldSwapchain = chain->swapchain;
@@ -1299,6 +1344,7 @@ void RendererImpl::createSwapchain(u32 width, u32 height) {
     replacement->storageViewFormat = renderShader->storageViewFormat;
     replacement->extent = extent;
     replacement->direct = direct;
+    replacement->compositeAlpha = compositeAlpha;
     try {
         if (!direct) {
             // The shader stores already-sRGB-encoded bytes through a raw
@@ -1603,6 +1649,27 @@ void RendererImpl::recordArenaUploads(FrameResources& frame) {
     record(fontResources->color, colorArenaCopies);
 }
 
+u16 RendererImpl::backgroundOpacity() const {
+    // F-vk-alpha. Asked of the live swapchain and not of the option
+    // alone, the way the Metal backend asks its layer rather than
+    // re-deriving what the window was made with (render_metal.mm). Alpha
+    // written into a chain created VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR is
+    // discarded by the presentation engine, so a premultiplied colour
+    // there would not make the background see-through - it would make it
+    // *darker*, by exactly the factor it was multiplied by. Honouring the
+    // option halfway is worse than not honouring it: the first is a wrong
+    // picture, the second is the picture Linux already had, and the
+    // warning in createSwapchain() says which one is on screen.
+    //
+    // Before there is a chain there is no picture to be transparent, and
+    // 100 is the answer that costs nothing: the first present creates the
+    // chain, and every frame after it is asked again.
+    if (chain == nullptr || chain->compositeAlpha != VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) {
+        return 100;
+    }
+    return composer.opts->backgroundOpacity;
+}
+
 u32 RendererImpl::packColor(const Color& color) {
     return (u32)(color.red) | ((u32)(color.green) << 8) | ((u32)(color.blue) << 16);
 }
@@ -1728,7 +1795,7 @@ u32 RendererImpl::materializeUpdates(FrameResources& frame, u64 appliedGeneratio
     return gpuUpdateCount;
 }
 
-void RendererImpl::recordCommands(FrameResources& frame, u32 imageIndex, const PresentationState& state, u32 updateCount, bool clearOutput) {
+void RendererImpl::recordCommands(FrameResources& frame, u32 imageIndex, const PresentationState& state, u32 updateCount, bool clearOutput, bool fullRepaint) {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1747,11 +1814,19 @@ void RendererImpl::recordCommands(FrameResources& frame, u32 imageIndex, const P
     if (clearOutput) {
         imageBarrier(frame.commandBuffer, output, 1, initialized ? restingAccess : 0, VK_ACCESS_TRANSFER_WRITE_BIT, initialized ? restingLayout : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, initialized ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
+        // T10: the same shape the Metal backend's clear takes, through
+        // the same two helpers, and at the same opacity this backend
+        // reports. F-vk-alpha made that opacity the option's, on a chain
+        // created with premultiplied composite alpha; at 100 the alpha is
+        // 255, premultiply() is the identity, and this clear is byte for
+        // byte the one that was here before.
+        const u8 clearAlpha = backgroundAlphaFromPercent(backgroundOpacity());
+        const Color clearInk = premultiply(clearBackground, clearAlpha);
         VkClearColorValue clearColor{{
-            clearBackground.red / 255.0f,
-            clearBackground.green / 255.0f,
-            clearBackground.blue / 255.0f,
-            1.0f,
+            clearInk.red / 255.0f,
+            clearInk.green / 255.0f,
+            clearInk.blue / 255.0f,
+            clearAlpha / 255.0f,
         }};
         const VkImageSubresourceRange outputRange = imageRange(1);
         vkCmdClearColorImage(frame.commandBuffer, output, VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &outputRange);
@@ -1764,16 +1839,22 @@ void RendererImpl::recordCommands(FrameResources& frame, u32 imageIndex, const P
     if (updateCount != 0) {
         bufferBarrier(frame.commandBuffer, frame.cellBuffer, (size_t)(updateCount) * sizeof(GpuCellUpdate), VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
+        // A10: the pane rectangle plus the border. The chrome reserves
+        // came off the window before the rectangle was cut, so adding
+        // them here would charge the pane for a sidebar it is not next
+        // to. A9: and the grid is the pane's - cellColumns/cellRows are
+        // what present() took off the update, not off the window.
+        const Insets insets = composer.paneInsets();
         const PushConstants pushConstants{
             composer.geometry.cellPixelWidth,
             composer.geometry.cellPixelHeight,
             composer.boxDrawingStroke(),
-            composer.geometry.columns,
-            composer.geometry.rows,
-            chain->direct ? chain->extent.width : composer.layout.pixelWidth,
-            chain->direct ? chain->extent.height : composer.layout.pixelHeight,
-            composer.layout.originX,
-            composer.layout.originY,
+            cellColumns,
+            cellRows,
+            min<u32>(chain->direct ? chain->extent.width : composer.geometry.pixelWidth, (u32)(paneArea.x) + paneArea.width),
+            min<u32>(chain->direct ? chain->extent.height : composer.geometry.pixelHeight, (u32)(paneArea.y) + paneArea.height),
+            (u32)(paneArea.x) + insets.left,
+            (u32)(paneArea.y) + insets.top,
             packColor(state.cursor.color),
             state.cursor.posX,
             state.cursor.posY,
@@ -1783,7 +1864,7 @@ void RendererImpl::recordCommands(FrameResources& frame, u32 imageIndex, const P
             state.selection.tl.y,
             state.selection.br.x,
             state.selection.br.y,
-            state.selection.rectangular ? 1u : 0u,
+            (state.selection.rectangular ? rectangularSelectionBit : 0u) | (composer.opts->cursorKeepSelectionFg ? cursorKeepSelectionFgBit : 0u),
             composer.opts->showWraps ? 1u : 0u,
             packColor(state.selectionForeground),
             packColor(state.selectionBackground),
@@ -1794,12 +1875,116 @@ void RendererImpl::recordCommands(FrameResources& frame, u32 imageIndex, const P
             state.hoveredLinkBegin,
             state.hoveredLinkEnd,
             updateCount,
-            composer.opts->cursorKeepSelectionFg ? 1u : 0u,
+            (u32)(paneArea.x),
+            (u32)(paneArea.y),
+            packPaneBackground(packColor(clearBackground), backgroundOpacity()),
         };
         vkCmdBindPipeline(frame.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(frame.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &frame.descriptorSet, 0, nullptr);
+        // F9: render.h's contract - "the backend clears that rectangle" -
+        // in two passes, the same shape the Metal backend takes. The fill
+        // paints the pane's rectangle with its own background, the cells
+        // draw over it, and the seam between panes keeps the colour the
+        // image was cleared with.
+        //
+        // This backend draws one pane per frame (R6-arch, A6-6: it
+        // refuses a wider frame), so today the fill covers the whole
+        // surface and the seam never appears. It is written anyway and
+        // written the same way, because the alternative is two backends
+        // that have to be read differently to be compared - and this one
+        // has no compiler on this machine to catch the difference.
+        //
+        // The barrier is explicit here where Metal's serial encoder gives
+        // it for free: two dispatches writing the same image are a
+        // write-after-write, and without it the cells could land before
+        // the fill that is meant to sit under them.
+        //
+        // G8: and only on a frame that redraws the whole pane. This
+        // backend keeps its cells and its output image between frames
+        // and redraws just the rows the damage journal names, so a fill
+        // on every frame paints the pane's background over every row
+        // the journal did not name - the retained picture, wiped by the
+        // pass that is meant to sit under it. That is the regression
+        // the two -vulkanBlit smoke tests caught: on the blit path one
+        // output image carries the picture forward, so the second
+        // present of a session is already incremental, while the direct
+        // path rotates through swapchain images that are still stale
+        // and get every row back anyway.
+        //
+        // requiresFull() is the question materializeUpdates() asks to
+        // decide the same thing, so the fill runs exactly when the cells
+        // that cover it are all coming. A cleared output implies it -
+        // clearDamageGeneration is only ever set beside a fullDamage() -
+        // so the padding and the pane background a clear repaints are
+        // still repainted here. The Metal backend clears its drawable
+        // and rebuilds every cell of every pane each frame (draw() and
+        // buildPaneUpdates()), which is why the same two passes are
+        // unconditional there and cannot be here.
+        PushConstants fillConstants = pushConstants;
+        fillConstants.paneBackgroundAndFill |= fillPassBit;
+        const u32 paneWidth = pushConstants.outputWidth > fillConstants.paneLeft ? pushConstants.outputWidth - fillConstants.paneLeft : 0;
+        const u32 paneHeight = pushConstants.outputHeight > fillConstants.paneTop ? pushConstants.outputHeight - fillConstants.paneTop : 0;
+        if (fullRepaint && paneWidth != 0 && paneHeight != 0) {
+            vkCmdPushConstants(frame.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fillConstants), &fillConstants);
+            vkCmdDispatch(frame.commandBuffer, ((u32)(paneWidth * paneHeight) + 63) / 64, 1, 1);
+            imageBarrier(frame.commandBuffer, output, 1, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        }
         vkCmdPushConstants(frame.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
         vkCmdDispatch(frame.commandBuffer, (updateCount + 63) / 64, 1, 1);
+
+        // F9: the seams last, over both neighbours, painted with the same
+        // fill pass the pane used - the band as its rectangle, the seam's
+        // colour as its background. The barrier before each is the same
+        // write-after-write the pane fill needed: two dispatches writing
+        // one image have no order of their own here.
+        //
+        // This backend draws one pane per frame (R6-arch, A6-6), so the
+        // list is empty in practice today. Written the same way as Metal
+        // anyway, because a backend that reads differently cannot be
+        // compared against the one that compiles.
+        for (const PixelRect& seam : seams.bands) {
+            PushConstants band = pushConstants;
+            band.outputWidth = min<u32>(chain->direct ? chain->extent.width : composer.geometry.pixelWidth, (u32)(seam.x) + seam.width);
+            band.outputHeight = min<u32>(chain->direct ? chain->extent.height : composer.geometry.pixelHeight, (u32)(seam.y) + seam.height);
+            band.paneLeft = seam.x;
+            band.paneTop = seam.y;
+            band.paneBackgroundAndFill = packPaneBackground(packColor(seams.ink), 100) | fillPassBit;
+            const u32 bandWidth = band.outputWidth > band.paneLeft ? band.outputWidth - band.paneLeft : 0;
+            const u32 bandHeight = band.outputHeight > band.paneTop ? band.outputHeight - band.paneTop : 0;
+            if (bandWidth == 0 || bandHeight == 0) {
+                continue;
+            }
+            imageBarrier(frame.commandBuffer, output, 1, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            vkCmdPushConstants(frame.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(band), &band);
+            vkCmdDispatch(frame.commandBuffer, ((u32)(bandWidth * bandHeight) + 63) / 64, 1, 1);
+        }
+
+        // The panel's bottom corners, on a window this program draws itself
+        // (ui_wayland_chrome.cpp): the surface is the panel below its title
+        // bar, whose own corners the chrome draws round, so these two are
+        // this surface's. Every frame, after the cells: a corner the cells
+        // drew into gets its outside taken back, and the mask is the same
+        // pixels each time, so an incremental frame changes nothing it
+        // did not draw.
+        const u32 surfaceWidth = chain->direct ? chain->extent.width : composer.geometry.pixelWidth;
+        const u32 surfaceHeight = chain->direct ? chain->extent.height : composer.geometry.pixelHeight;
+        const u32 radius = composer.window != nullptr && composer.window->chrome() != nullptr ? (u32)(composer.opts->panelRadius * composer.contentScale + 0.5f) : 0;
+        if (radius != 0 && radius * 2 <= surfaceWidth && radius <= surfaceHeight) {
+            for (u32 corner = 0; corner < 2; ++corner) {
+                PushConstants band = pushConstants;
+                band.paneLeft = corner == 0 ? 0 : surfaceWidth - radius;
+                band.paneTop = surfaceHeight - radius;
+                band.outputWidth = band.paneLeft + radius;
+                band.outputHeight = surfaceHeight;
+                band.paneBackgroundAndFill = packPaneBackground(packColor(clearBackground), backgroundOpacity()) | fillPassBit;
+                band.updateCount = cornerPassMarker;
+                band.glyphWidth = radius;
+                band.glyphHeight = corner;
+                imageBarrier(frame.commandBuffer, output, 1, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                vkCmdPushConstants(frame.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(band), &band);
+                vkCmdDispatch(frame.commandBuffer, (radius * radius + 63) / 64, 1, 1);
+            }
+        }
     }
 
     if (chain->direct) {
@@ -1950,9 +2135,16 @@ bool RendererImpl::repaint() {
 void RendererImpl::recordFrame(FrameResources& frame, u32 imageIndex) {
     const bool initialized = chain->direct ? chain->initialized[imageIndex] : chain->outputInitialized;
     const u64 appliedGeneration = chain->direct ? chain->generations[imageIndex] : chain->outputGeneration;
+    // The same question materializeUpdates() answers below to decide
+    // whether it emits every row or only the rows the journal names.
+    // recordCommands() needs it too: the pane fill may only run on a
+    // frame whose cells all come back over it. Asked here rather than
+    // returned from there because it is a property of the damage, not
+    // of the buffer that call fills.
+    const bool fullRepaint = damage.requiresFull(appliedGeneration, initialized);
     const u32 updateCount = materializeUpdates(frame, appliedGeneration, initialized);
     const bool clearOutput = !initialized || appliedGeneration < clearDamageGeneration;
-    recordCommands(frame, imageIndex, presentationState, updateCount, clearOutput);
+    recordCommands(frame, imageIndex, presentationState, updateCount, clearOutput, fullRepaint);
     if (chain->direct) {
         chain->generations.mut(imageIndex) = damage.generation;
     } else {
@@ -1995,10 +2187,14 @@ bool RendererImpl::repaintFrame() {
 }
 
 bool RendererImpl::present(const TerminalUpdate& update) {
-    const u32 width = composer.layout.pixelWidth;
-    const u32 height = composer.layout.pixelHeight;
-    const size_t cellCount = (size_t)(composer.geometry.columns) * composer.geometry.rows;
-    if (cellCount == 0 || width == 0 || height == 0) {
+    const u32 width = composer.geometry.pixelWidth;
+    const u32 height = composer.geometry.pixelHeight;
+    // A9: the grid of the pane this update belongs to - the shape of the
+    // cells it carries - and not the window's. Zero is a refused frame,
+    // not a window-sized default: reading row.cells without the length
+    // that came with them is a read of an unknown length.
+    const size_t cellCount = (size_t)(update.gridColumns) * update.gridRows;
+    if (update.gridColumns == 0 || update.gridRows == 0 || width == 0 || height == 0) {
         return false;
     }
 
@@ -2013,11 +2209,11 @@ bool RendererImpl::present(const TerminalUpdate& update) {
         return false;
     }
 
-    const bool shapeChanged = cellColumns != composer.geometry.columns || cellRows != composer.geometry.rows;
+    const bool shapeChanged = cellColumns != update.gridColumns || cellRows != update.gridRows;
     if (shapeChanged) {
         // A reshaped grid needs every row before the retained cells mean
         // anything.
-        if (update.rowCount != composer.geometry.rows) {
+        if (update.rowCount != update.gridRows) {
             return false;
         }
         for (size_t index = 0; index < update.rowCount; ++index) {
@@ -2031,15 +2227,15 @@ bool RendererImpl::present(const TerminalUpdate& update) {
     if (shapeChanged) {
         damage.begin = 0;
         damage.count = 0;
-        ensureDamageJournal(composer.geometry.rows);
+        ensureDamageJournal(update.gridRows);
         cells.clear();
         cells.grow(cellCount);
         const GpuCell empty;
         for (size_t index = 0; index < cellCount; ++index) {
             cells.pushBack(empty);
         }
-        cellColumns = composer.geometry.columns;
-        cellRows = composer.geometry.rows;
+        cellColumns = update.gridColumns;
+        cellRows = update.gridRows;
     } else {
         ensureDamageJournal(cellRows);
     }
@@ -2157,10 +2353,52 @@ bool RendererImpl::present(const TerminalUpdate& update) {
     return presented;
 }
 
-bool RendererImpl::update(const TerminalUpdate& update) {
+bool RendererImpl::update(const PaneUpdate* frame, size_t count) {
+    if (count != 1) {
+        // A2, and the honest edge of this backend. Placing a pane it
+        // has: the rectangle below carries the origin and the bounds the
+        // shader clips against, exactly as the Metal backend does.
+        // Presenting two of them it does not, and refusing is the only
+        // answer that is not a lie: this renderer draws incrementally,
+        // from one damage journal over one grid of retained cells, and
+        // two panes need one journal each, one cell range each (the flat
+        // vector with per-pane offsets the Metal backend grew), and a
+        // way to aim one dispatch at one pane's slice of the cell buffer
+        // - a dynamic descriptor offset or an index base in the push
+        // constants, because the descriptor here binds the buffer whole.
+        // The arenas need nothing on top of that, and they are the one
+        // item this list lost: one shaper per window means one arena
+        // per plane and one generation over all the panes there are
+        // (see stripGeneration), so a second pane's strips already
+        // point into what this backend mirrors. A presentation state
+        // each it does need, though: the one
+        // `presentationState` recordCommands() is handed is per frame,
+        // and it is what the push constants are built from. Until that
+        // work lands, splits stay off on Wayland, which is where A3
+        // already said they stay off until the ranges exist.
+        //
+        // Refusing quietly is the one answer that *is* a lie. The caller
+        // answers a false with requestFrame() (application.cpp:517) and
+        // does not consume the terminal output, so the same frame comes
+        // back: an unlit window asking for another one for as long as
+        // the split lives, with nothing in the log to say why. The
+        // condition is not transient either - no retry grows a per-pane
+        // journal - so a layout that offers a split on this backend is a
+        // programming error, and this backend says so instead of going
+        // dark. raiseError unwinds to runMain (main.cpp:156), which
+        // prints the message.
+        if (count > 1) {
+            raiseError(StringView(u8"vulkan: this backend presents one pane per frame, not "), count, StringView(u8" - splits are not supported here yet"));
+        }
+        // An empty frame is not a split, it is nothing to present: the
+        // same false the base contract in render.h and the reference
+        // renderer answer with.
+        return false;
+    }
+    paneArea = frame[0].area;
     for (;;) {
         try {
-            return present(update);
+            return present(frame[0].update);
         } catch (const SurfaceLost&) {
             // See repaint(): mark dead, frame() rebuilds pool and renderer.
             composer.renderer = nullptr;
@@ -2171,6 +2409,19 @@ bool RendererImpl::update(const TerminalUpdate& update) {
             composer.fonts->adoptFaceFor(miss);
         }
     }
+}
+
+void RendererImpl::setSeams(const PixelRect* bands, size_t count, Color ink) {
+    seams.bands.clear();
+    for (size_t at = 0; at < count; ++at) {
+        seams.bands.pushBack(bands[at]);
+    }
+    seams.ink = ink;
+}
+
+bool RendererImpl::update(const TerminalUpdate& update) {
+    const PaneUpdate pane = surfacePane(composer, update);
+    return this->update(&pane, 1);
 }
 
 bool RendererImpl::captureOutput(Buffer& rgb, u32& width, u32& height) {
