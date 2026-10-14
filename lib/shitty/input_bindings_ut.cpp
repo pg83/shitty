@@ -87,8 +87,135 @@ STD_TEST_SUITE(InputBindings) {
         composer.copyListeners.pushBack(&listener);
 
         STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, inactiveCopyModifiers, 0, 'c'}));
-        STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, copyModifiers, 0, 'b'}));
+        // Any letter the table does not claim will do; this one stood as
+        // 'b' until ToggleSidebar took cmd+b, which is exactly the
+        // regression the assertion is here to catch, one chord over.
+        STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, copyModifiers, 0, 'q'}));
         STD_INSIST(listener.calls == 0);
+    }
+
+    // cmd+b. Bound on macOS only, and deliberately: ui_sidebar_tabs.mm
+    // is in the darwin sources, so everywhere else the chord would be
+    // taken away in exchange for nothing. The list is still claimed on
+    // every platform (Composer's constructor), which is what lets this
+    // test name it at all.
+    //
+    // And bound only while -sidebarTabs is on, for a reason with teeth:
+    // cmd+b is reported to the program running inside the terminal
+    // under the kitty keyboard protocol, and test_keyboard.py chose
+    // that exact chord as its Super-only case because cmd+c was already
+    // the platform Copy binding. A chord claimed to do nothing is a
+    // chord taken away from whatever wanted it.
+    // The command palette: cmd+k on the Mac whatever the tab bar; on
+    // Linux ctrl+shift+k, both forms of the letter, and only with the
+    // list pt draws - without it the chord is the program's.
+    STD_TEST(OpensThePaletteOnItsChord) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        Options options;
+        composer.setOptions(&options);
+        CountBinding listener;
+        composer.commandPaletteListeners.pushBack(&listener);
+#if defined(__APPLE__)
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper, 0, 'k'}));
+        STD_INSIST(listener.calls == 1);
+#else
+        STD_INSIST(!options.sidebarTabs);
+        STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputControl | InputShift, 0, 'k'}));
+        STD_INSIST(listener.calls == 0);
+        options.sidebarTabs = true;
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputControl | InputShift, 0, 'k'}));
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Release, InputControl | InputShift, 0, 'k'}));
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputControl | InputShift, 0, 'K'}));
+        STD_INSIST(listener.calls == 2);
+        // Without Shift it is the shell's kill-line, untouched.
+        STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputControl, 0, 'k'}));
+        STD_INSIST(listener.calls == 2);
+#endif
+    }
+
+    STD_TEST(TogglesTheSidebarOnTheMacOsChordAndOnlyWithTheOption) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        Options options;
+        composer.setOptions(&options);
+        CountBinding listener;
+        composer.toggleSidebarListeners.pushBack(&listener);
+
+        STD_INSIST(!options.sidebarTabs);
+        STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper, 0, 'b'}));
+        STD_INSIST(listener.calls == 0);
+
+        // The option is read on every key, so a reload turns the chord
+        // on and off with the panel it drives.
+        options.sidebarTabs = true;
+        const bool consumed = composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper, 0, 'b'});
+
+#if defined(__APPLE__)
+        STD_INSIST(consumed);
+        STD_INSIST(listener.calls == 1);
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Release, InputSuper, 0, 'b'}));
+        // Pressed again, it fires again - a toggle that only ever fired
+        // once would show the panel and never put it away.
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper, 0, 'b'}));
+
+        STD_INSIST(listener.calls == 2);
+#else
+        STD_INSIST(!consumed);
+        STD_INSIST(listener.calls == 0);
+#endif
+    }
+
+    // A4: cmd+d and cmd+shift+d, and only while -panes is on. The
+    // gate is the outer of the two locks on splitting - splitFocused()
+    // refuses on the same option - and it is the one that decides
+    // whether the chord is *consumed*: cmd+d is reported to the program
+    // running inside under the kitty keyboard protocol, exactly as cmd+b
+    // is, so with panes off it has to reach that program untouched.
+    //
+    // cmd+h is deliberately not the horizontal chord: the system Hide
+    // item takes it before the application is asked, so a row for it
+    // would be a row that never fires.
+    STD_TEST(SplitsTheFocusedPaneOnTheTwoChordsAndOnlyWithTheOption) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        Options options;
+        composer.setOptions(&options);
+        CountBinding vertical;
+        CountBinding horizontal;
+        composer.splitVerticalListeners.pushBack(&vertical);
+        composer.splitHorizontalListeners.pushBack(&horizontal);
+
+        STD_INSIST(!options.panes);
+        STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper, 0, 'd'}));
+        STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper | InputShift, 0, 'd'}));
+        STD_INSIST(vertical.calls == 0);
+        STD_INSIST(horizontal.calls == 0);
+
+        // The option is read on every key, so a reload arms the chords
+        // with the feature they drive.
+        options.panes = true;
+        const bool consumedVertical = composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper, 0, 'd'});
+
+#if defined(__APPLE__)
+        STD_INSIST(consumedVertical);
+        STD_INSIST(vertical.calls == 1);
+        STD_INSIST(horizontal.calls == 0);
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Release, InputSuper, 0, 'd'}));
+
+        // Shift picks the other axis and nothing else: the two rows
+        // differ by that modifier alone, so a table that compared only
+        // the codepoint would fire the first row twice.
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper | InputShift, 0, 'd'}));
+        STD_INSIST(horizontal.calls == 1);
+        STD_INSIST(vertical.calls == 1);
+
+        // And cmd+h stays the system's - no row claims it.
+        STD_INSIST(!composer.inputBindings->key({InputKey::Printable, InputAction::Press, InputSuper, 0, 'h'}));
+#else
+        STD_INSIST(!consumedVertical);
+        STD_INSIST(vertical.calls == 0);
+#endif
     }
 
     STD_TEST(TracksRepeatedPlatformBinding) {
@@ -156,6 +283,41 @@ STD_TEST_SUITE(InputBindings) {
         STD_INSIST(newTab.calls == 1);
         STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Press, tabSwitchModifiers, 0, ']'}));
         STD_INSIST(nextTab.calls == 1);
+    }
+
+    // A window without tabs (-tabs off: st on Linux) leaves every chord
+    // that opens or moves between tabs to the program inside, and keeps
+    // the one that closes, which then closes the window.
+    STD_TEST(WithoutTabsTheTabChordsAreThePrograms) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        CountBinding newTab;
+        CountBinding nextTab;
+        CountBinding closeTab;
+        composer.newTabListeners.pushBack(&newTab);
+        composer.nextTabListeners.pushBack(&nextTab);
+        composer.closeTabListeners.pushBack(&closeTab);
+
+        // Premise: with tabs, as every composer starts, the chords bind.
+        STD_INSIST(composer.opts->tabs);
+        STD_INSIST(composer.inputBindings->key({InputKey::Printable, InputAction::Press, tabModifiers, 0, 't'}));
+        STD_INSIST(newTab.calls == 1);
+
+        Options bare;
+        bare.tabs = false;
+        const Options* const previous = composer.opts;
+        composer.setOptions(&bare);
+        const bool newConsumed = composer.inputBindings->key({InputKey::Printable, InputAction::Press, tabModifiers, 0, 't'});
+        const bool nextConsumed = composer.inputBindings->key({InputKey::Printable, InputAction::Press, tabSwitchModifiers, 0, ']'});
+        const bool closeConsumed = composer.inputBindings->key({InputKey::Printable, InputAction::Press, tabModifiers, 0, 'w'});
+        composer.setOptions(previous);
+
+        STD_INSIST(!newConsumed);
+        STD_INSIST(newTab.calls == 1);
+        STD_INSIST(!nextConsumed);
+        STD_INSIST(nextTab.calls == 0);
+        STD_INSIST(closeConsumed);
+        STD_INSIST(closeTab.calls == 1);
     }
 
     // Shift is part of the switch chord, and the frontends disagree about

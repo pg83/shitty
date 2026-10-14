@@ -19,6 +19,7 @@
 #include "drop_target.h"
 #include "span_shaper.h"
 #include "configuration.h"
+#include "grid_geometry.h"
 #include "render_reference.h"
 
 #include <lib/vterm/hex.h>
@@ -36,6 +37,9 @@
 
 #if defined(HAVE_VULKAN_WAYLAND)
     #include "render_vk.h"
+#endif
+#if defined(HAVE_METAL_RENDERER)
+    #include "render_metal.h"
 #endif
 #include <lib/vterm/vterm.h>
 #include <lib/vterm/vt_test.h>
@@ -199,6 +203,25 @@ namespace {
             // cycle this shadow exists to exercise.
             shadow->update(update);
             return primary->update(update);
+        }
+
+        // R3-qa. Without this the multi-pane form fell through to the
+        // Renderer default, which refuses any frame wider than one pane
+        // by construction (render.h) - so with the shadow armed no test
+        // ever built a split frame on the second backend, and the two
+        // could not be compared on the only kind of frame this plan is
+        // about. Same order as above, and for the same reason.
+        bool update(const PaneUpdate* panes, size_t count) override {
+            shadow->update(panes, count);
+            return primary->update(panes, count);
+        }
+
+        // Seams belong to the frame, so both backends have to be told
+        // about them before the update they apply to; a shadow drawing
+        // a split window without dividers is not the same frame.
+        void setSeams(const PixelRect* seams, size_t count, Color ink) override {
+            shadow->setSeams(seams, count, ink);
+            primary->setSeams(seams, count, ink);
         }
 
         bool repaint() override {
@@ -398,7 +421,7 @@ namespace {
     struct TestPtyFactory final: public Pty {
         TestPtyFactory(Composer& composer, int firstFd);
 
-        PtyHandle* spawn(ObjPool& owner, const LaunchCommand& command) override;
+        PtyHandle* spawn(ObjPool& owner, const LaunchCommand& command, const PtySize& size, StringView directory) override;
 
         Composer& composer;
         int firstFd;
@@ -626,6 +649,14 @@ void TestPty::resize(const PtySize& requested) {
     size.ws_xpixel = (unsigned short)(requested.pixelWidth);
     size.ws_ypixel = (unsigned short)(requested.pixelHeight);
     if (ioctl(fd_, TIOCSWINSZ, &size) < 0) {
+        // Deliberately harder than production, which only sysWarns here
+        // (pty.cpp, resizePty). A user's terminal is worth more running
+        // mis-sized than dead; a harness whose whole job is to answer
+        // WINSIZE_PANE is not, and a size that silently stopped tracking
+        // the grid would surface as a wrong number in some later test
+        // rather than as this. Since F1a this also runs on the session
+        // open path, so the failure is a refused start, which is the
+        // shape it should have.
         raiseError(StringView(u8"test PTY resize failed"));
     }
 }
@@ -677,19 +708,42 @@ TestPtyFactory::TestPtyFactory(Composer& composer_, int firstFd_)
 {
 }
 
-PtyHandle* TestPtyFactory::spawn(ObjPool& owner, const LaunchCommand&) {
+PtyHandle* TestPtyFactory::spawn(ObjPool& owner, const LaunchCommand&, const PtySize& size, StringView) {
     int fd = firstFd;
+    // The first fd arrives from runTestMode() already open, so it never
+    // passes through the openpty() below and has to be sized on its own.
+    // Sizing it is not optional: openSession() no longer resizes a handle
+    // after spawning it (K3), so this is the only place the first pane's
+    // pty learns its grid at all.
+    const bool fromOutside = first;
     if (first) {
         first = false;
     } else {
+        // Every session after the first gets its geometry the same way the
+        // real factory does it - on the slave, before anyone can read
+        // TIOCGWINSZ. A pane born from a split would survive without it,
+        // because applyLayout() sizes the whole new layout straight after;
+        // a session opened as a new tab gets no such second chance and was
+        // born 0x0 (R1a-test, finding 3).
+        struct winsize born{};
+        born.ws_col = (unsigned short)(size.columns);
+        born.ws_row = (unsigned short)(size.rows);
+        born.ws_xpixel = (unsigned short)(size.pixelWidth);
+        born.ws_ypixel = (unsigned short)(size.pixelHeight);
         int pair[2] = {-1, -1};
-        if (openpty(&pair[0], &pair[1], nullptr, nullptr, nullptr) != 0) {
+        if (openpty(&pair[0], &pair[1], nullptr, nullptr, &born) != 0) {
             raiseError(StringView(u8"openpty for a new session"));
         }
         fd = pair[0];
         peers.pushBack(pair[1]);
     }
     TestPty* const handle = owner.make<TestPty>(composer, owner, fd);
+    if (fromOutside) {
+        // After the handle rather than before the fork, and no race in
+        // it unlike production: nothing reads this end of the pair until
+        // the CHILD command, which forks a child much later.
+        handle->resize(size);
+    }
     handle->start();
     handles.pushBack(handle);
     return handle;
@@ -1790,8 +1844,7 @@ size_t TestTerminal::getHyperlinkCount() {
 }
 
 void TestTerminal::getHyperlink(int x, int y, Buffer& out) {
-    const auto point = composer.layout.pointerPosition(x, y);
-    const StringView result = testApi.hyperlinkAt(point.pixelX, point.pixelY);
+    const StringView result = testApi.hyperlinkAt(x, y);
     out.reset();
     out.append(result.data(), result.length());
 }
@@ -1833,20 +1886,17 @@ void TestTerminal::pageDown() {
 }
 
 void TestTerminal::selectStart(int x, int y, bool cycle) {
-    const auto point = composer.layout.pointerPosition(x, y);
-    testApi.selectionStart(point.pixelX, point.pixelY, cycle);
+    testApi.selectionStart(x, y, cycle);
     update();
 }
 
 void TestTerminal::selectExtend(int x, int y, bool cycle) {
-    const auto point = composer.layout.pointerPosition(x, y);
-    testApi.selectionExtend(point.pixelX, point.pixelY, cycle);
+    testApi.selectionExtend(x, y, cycle);
     update();
 }
 
 void TestTerminal::selectUpdate(int x, int y) {
-    const auto point = composer.layout.pointerPosition(x, y);
-    testApi.selectionUpdate(point.pixelX, point.pixelY);
+    testApi.selectionUpdate(x, y);
     update();
 }
 
@@ -2101,8 +2151,9 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
     auto* const testFonts = composer.pool->make<TestFontpack>(composer);
     composer.fonts = testFonts;
     composer.configChangedListeners.pushBack(testFonts);
-    const u16 width = 2 * composer.layout.borderPixels + composer.opts->nCols * composer.geometry.cellPixelWidth;
-    const u16 height = 2 * composer.layout.borderPixels + composer.opts->nRows * composer.geometry.cellPixelHeight;
+    const Insets insets = composer.contentInsets();
+    const u16 width = (u16)(gridPixelWidth(composer.opts->nCols, insets, composer.geometry.cellPixelWidth));
+    const u16 height = (u16)(gridPixelHeight(composer.opts->nRows, insets, composer.geometry.cellPixelHeight));
     composer.platform = plt::createHeadlessPlatform(*composer.pool);
     composer.config->start();
     STD_DEFER {
@@ -2111,7 +2162,7 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
     composer.window = composer.platform->createWindow(
         *composer.pool,
         {
-            .title = StringView(composer.opts->vt.title),
+            .title = StringView(composer.vtConfig.config->title),
             .width = width,
             .height = height,
             .decorations = !composer.opts->noDecorations,
@@ -2120,13 +2171,13 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
             .frame = &frame,
         }
     );
-    auto& window = static_cast<plt::WindowHeadless&>(*composer.window);
     composer.installVtHost();
+    auto& window = static_cast<plt::WindowHeadless&>(*composer.window);
     openDebugTrace(composer);
     // The same startup request the interactive run makes; the first
     // dispatched frame then carries the grown window into the grid.
     applyStartupWindowState(composer);
-    composer.resizeWindow(width, height);
+    composer.resize(width, height);
     LaunchCommand testLaunch;
     composer.launch = &testLaunch;
     TestPtyFactory ptyFactory(composer, io[0]);
@@ -2137,18 +2188,28 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
     composer.rendererPool = ObjPool::fromMemory();
     composer.renderer = Renderer::create(composer, *composer.rendererPool, window.renderContext());
     auto& renderer = static_cast<ReferenceRenderer&>(*composer.renderer);
-    Renderer* vulkanShadow = nullptr;
-#if defined(HAVE_VULKAN_WAYLAND)
+    // The GPU renderer this platform builds, drawing the harness's own
+    // frames beside the reference renderer so their pixels can be
+    // compared. Which backend it is follows the build, not the test:
+    // Vulkan over a headless surface on Linux, Metal into a texture on
+    // macOS. The control commands keep their VULKAN_ names because
+    // tst/harness.py speaks them and that file belongs to no task here.
+    Renderer* gpuShadow = nullptr;
+#if defined(HAVE_VULKAN_WAYLAND) || defined(HAVE_METAL_RENDERER)
     if (getenv("SHITTY_TEST_VULKAN") != nullptr) {
+        const plt::RenderContext headlessGpu{plt::RenderBackend::Headless, nullptr, nullptr};
         try {
-            const plt::RenderContext headlessVulkan{plt::RenderBackend::Headless, nullptr, nullptr};
-            vulkanShadow = createVulkanRenderer(composer, *composer.rendererPool, headlessVulkan);
+    #if defined(HAVE_VULKAN_WAYLAND)
+            gpuShadow = createVulkanRenderer(composer, *composer.rendererPool, headlessGpu);
+    #else
+            gpuShadow = createMetalRenderer(composer, *composer.rendererPool, headlessGpu);
+    #endif
         } catch (Exception& error) {
             const StringView description = error.description();
-            sysE << StringView(u8"shitty: vulkan shadow unavailable: ") << description << endL;
+            sysE << StringView(u8"shitty: gpu shadow unavailable: ") << description << endL;
         }
-        if (vulkanShadow != nullptr) {
-            composer.renderer = composer.rendererPool->make<MirrorRenderer>(&renderer, vulkanShadow);
+        if (gpuShadow != nullptr) {
+            composer.renderer = composer.rendererPool->make<MirrorRenderer>(&renderer, gpuShadow);
             testFonts->armMissThrows(*composer.pool);
         }
     }
@@ -2178,6 +2239,20 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
         }
         raiseError(StringView(u8"no harness kit for this session"));
     };
+    // A pane index is a position in SessionSetImpl::visiblePanes(), from
+    // zero: that call walks the active tab's layout, so index 0 is the
+    // first pane in visual order and a vertical split puts the new pane
+    // at index 1. Every pane test leans on that order, so it is read
+    // from the layout on each command rather than kept as a list of our
+    // own that a split or a close could leave stale.
+    const auto visiblePane = [&](u32 index) -> SessionPane {
+        Vector<SessionPane> panes;
+        sessions->visiblePanes(panes);
+        if (index >= panes.length()) {
+            raiseError(StringView(u8"no such pane"));
+        }
+        return panes[index];
+    };
     const auto activeKitIndex = [&]() -> size_t {
         Vterm* const activeTerminal = sessions->activeTerminal();
         for (size_t at = 0; at < sessionKits.length(); ++at) {
@@ -2187,40 +2262,131 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
         }
         raiseError(StringView(u8"active session has no harness kit"));
     };
-    Vterm* trackedActiveTerminal = sessions->activeTerminal();
-    TestSessionAction trackNewSession([&]() {
+    // R8-sec 2.2: which kit the window is showing, kept as an index and
+    // never as a Vterm*. This listener chain runs *after* SessionSet's own
+    // close listener - closeTabAction is registered in SessionSet::create()
+    // and publish() walks from the head - so by the time trackClosedSession
+    // looks, the terminal it wants has been retired and the reaper that
+    // wakeReaper() ran inside that close may already have freed it.
+    // Comparing a freed pointer is undefined behaviour even where it does
+    // not fault; an index is not a pointer and has nothing to compare.
+    //
+    // Unlike activeKitIndex() above, this does not raise when nothing
+    // matches: closing the last tab leaves the window naming a terminal
+    // whose kit has just gone, and that is the window on its way out
+    // rather than an error.
+    const auto trackedKitOfActive = [&]() -> size_t {
+        Vterm* const active = sessions->activeTerminal();
+        for (size_t at = 0; at < sessionKits.length(); ++at) {
+            if (&sessionKits[at].terminal->terminal == active) {
+                return at;
+            }
+        }
+        return sessionKits.length();
+    };
+    size_t trackedActiveKit = trackedKitOfActive();
+    // A session is born in two ways and only one of them publishes
+    // newTabListeners: SessionSet::splitFocused() opens a session too,
+    // and announces it through composer.sessionsChangedListeners at the
+    // end. So adoption listens there as well, and because that list also
+    // fires for a focus move, a title and a close, it adopts by absence
+    // rather than by count: the session the window now shows either has
+    // a kit already or gets one built from the pty and the trace the
+    // factories have just appended.
+    //
+    // trackedActiveKit moves only when a kit is actually built. A close
+    // publishes here too, and trackClosedSession below needs that index
+    // to still name the kit that was in front when the close began.
+    const auto adoptActiveSession = [&]() {
+        Vterm* const active = sessions->activeTerminal();
+        for (size_t at = 0; at < sessionKits.length(); ++at) {
+            if (&sessionKits[at].terminal->terminal == active) {
+                return;
+            }
+        }
         TestPty* const extraPty = ptyFactory.handles.back();
         VtermTraceImpl* const extraTrace = traceFactory.traces.back();
         {
             Buffer discardedActions;
             extraTrace->drainActions(discardedActions);
         }
-        sessionKits.pushBack({composer.pool->make<TestTerminal>(composer, *sessions->activeTerminal(), *extraTrace->testApi, *extraPty, renderer, window), extraPty, extraTrace});
-        trackedActiveTerminal = sessions->activeTerminal();
-    });
+        sessionKits.pushBack({composer.pool->make<TestTerminal>(composer, *active, *extraTrace->testApi, *extraPty, renderer, window), extraPty, extraTrace});
+        trackedActiveKit = sessionKits.length() - 1;
+    };
+    // Still registered for the tab action it was written for: a new tab
+    // owes its kit to opening the tab, not to whatever activate()
+    // happens to publish on the way. Idempotent, so both routes may run.
+    TestSessionAction trackNewSession(adoptActiveSession);
+    TestSessionAction trackSplitSession(adoptActiveSession);
     TestSessionAction trackClosedSession([&]() {
-        size_t closed = sessionKits.length();
-        for (size_t at = 0; at < sessionKits.length(); ++at) {
-            if (&sessionKits[at].terminal->terminal == trackedActiveTerminal) {
-                closed = at;
-                break;
-            }
-        }
-        if (closed == sessionKits.length()) {
+        // The kit that was in front when the close began, named by where
+        // it sits rather than by what it points at.
+        const size_t closed = trackedActiveKit;
+        if (closed >= sessionKits.length()) {
             raiseError(StringView(u8"closed session has no harness kit"));
         }
         for (size_t at = closed; at + 1 < sessionKits.length(); ++at) {
             sessionKits.mut(at) = sessionKits[at + 1];
         }
         sessionKits.popBack();
-        trackedActiveTerminal = sessions->activeTerminal();
+        trackedActiveKit = trackedKitOfActive();
     });
+    const auto paneKit = [&](u32 index) -> SessionKit& {
+        return kitFor(visiblePane(index).terminal);
+    };
+    // A pane's grid, read off its own pty: Vterm keeps TIOCSWINSZ in step
+    // with the grid it reflows to, so the pane's child and the harness
+    // get their columns and rows from one number. WINSIZE_PANE reports
+    // it; SCREEN_TEXT_PANE walks the screen by it.
+    const auto paneWinsize = [&](const SessionKit& kit) -> winsize {
+        winsize size{};
+        if (ioctl(kit.pty->fd_, TIOCGWINSZ, &size) < 0) {
+            raiseError(StringView(u8"test TIOCGWINSZ failed"));
+        }
+        return size;
+    };
+    // SCREEN_TEXT answers from the renderer's retained cells, which
+    // belong to whichever pane it drew last (render_reference.cpp) - one
+    // window, one answer. A per-pane answer cannot come from there, so
+    // this reads the pane's own screen through its TestApi in the same
+    // shape: printable ASCII, blanks kept, one newline per row.
+    const auto paneScreenText = [&](const SessionKit& kit, Buffer& out) {
+        const winsize size = paneWinsize(kit);
+        out.reset();
+        for (u16 row = 0; row < size.ws_row; ++row) {
+            for (u16 column = 0; column < size.ws_col; ++column) {
+                const u32 codepoint = kit.terminal->testApi.cell(row, column).cell.uc_pt;
+                const char printable = codepoint >= 0x20 && codepoint <= 0x7e ? (char)(codepoint) : ' ';
+                out.append(&printable, 1);
+            }
+            out.append("\n", 1);
+        }
+    };
     const auto trackSwitch = [&]() {
-        trackedActiveTerminal = sessions->activeTerminal();
+        trackedActiveKit = trackedKitOfActive();
+    };
+    // Put the window's focus on the kit at this index, if that kit is a
+    // pane of the tab in front. The tab walk CLOSE_SESSION otherwise
+    // uses cannot move inside a tab at all - activateNext() refuses
+    // outright while there is only one - so without this there is no way
+    // to name an unfocused pane for closing, and asking for one spun
+    // forever (R1a-qa, B1).
+    const auto focusKitInActiveTab = [&](size_t index) -> bool {
+        Vector<SessionPane> panes;
+        sessions->visiblePanes(panes);
+        for (const SessionPane& pane : panes) {
+            if (&sessionKits[index].terminal->terminal == pane.terminal) {
+                sessions->focusPane(pane.id);
+                trackSwitch();
+                return true;
+            }
+        }
+        return false;
     };
     TestSessionAction trackPreviousSession(trackSwitch);
     TestSessionAction trackNextSession(trackSwitch);
     composer.newTabListeners.pushBack(&trackNewSession);
+    composer.sessionsChangedListeners.pushBack(&trackSplitSession);
     composer.closeTabListeners.pushBack(&trackClosedSession);
     composer.prevTabListeners.pushBack(&trackPreviousSession);
     composer.nextTabListeners.pushBack(&trackNextSession);
@@ -2318,15 +2484,21 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
         try {
             while (readLine(controlScheduler, controlFd, buffered, lineBytes)) {
                 const StringView line(lineBytes);
-                // Shadow the outer first-session locals: every
-                // terminal-bound command addresses the session the window
-                // shows, so tests switch first and poke second. The child
-                // and script helpers above stay bound to the first
-                // session, whose pty owns the spawned shell.
-                SessionKit& activeKit = kitFor(sessions->activeTerminal());
-                TestTerminal& terminal = *activeKit.terminal;
-                TestPty& terminalPty = *activeKit.pty;
                 try {
+                    // Shadow the outer first-session locals: every
+                    // terminal-bound command addresses the session the
+                    // window shows, so tests switch first and poke
+                    // second. The child and script helpers above stay
+                    // bound to the first session, whose pty owns the
+                    // spawned shell.
+                    //
+                    // Inside the try on purpose: a session the harness
+                    // has no kit for is a failed command, answered with
+                    // ERR, and not a reason to stop the whole terminal
+                    // and leave the test reading a closed socket.
+                    SessionKit& activeKit = kitFor(sessions->activeTerminal());
+                    TestTerminal& terminal = *activeKit.terminal;
+                    TestPty& terminalPty = *activeKit.pty;
                     if (startsWith(line, StringView(u8"WRITE "))) {
                         Buffer input;
                         decodeHex(tail(line, 6), input);
@@ -2415,7 +2587,19 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                         const auto packedColor = [](Color color) {
                             return ((u32)(color.red) << 16) | ((u32)(color.green) << 8) | color.blue;
                         };
-                        writeParts(controlFd, StringView(u8"OK fontsize="), (i64)(composer.opts->fontsize), StringView(u8" border="), (i64)(composer.opts->border), StringView(u8" columns="), (i64)(composer.opts->nCols), StringView(u8" rows="), (i64)(composer.opts->nRows), StringView(u8" save_lines="), (i64)(composer.opts->vt.saveLines), StringView(u8" fg="), (i64)(packedColor(composer.opts->vt.fg)), StringView(u8" bg="), (i64)(packedColor(composer.opts->vt.bg)), StringView(u8" cr="), (i64)(packedColor(composer.opts->vt.cr)), StringView(u8" alt_scroll="), (i64)(composer.opts->vt.altScrollMode), StringView(u8" bold_colors="), (i64)(composer.opts->vt.boldColors), StringView(u8" auto_copy="), (i64)(composer.opts->vt.autoCopyMode), StringView(u8" allow_osc52_read="), (i64)(composer.opts->vt.allowOsc52Read), StringView(u8" allow_window_ops="), (i64)(composer.opts->vt.allowWindowOps), StringView(u8" maximized="), (i64)(composer.opts->maximized), StringView(u8" fullscreen="), (i64)(composer.opts->fullscreen), StringView(u8" no_decorations="), (i64)(composer.opts->noDecorations), StringView(u8"\n"));
+                        // T8. uriScheme is the one option here whose value
+                        // is a list. Joined with commas and never spaces:
+                        // the harness splits this line on whitespace, so a
+                        // space inside a value would be read as the start
+                        // of the next field.
+                        StringBuilder uriSchemeList;
+                        for (const StringView scheme : composer.opts->uriSchemes) {
+                            if (!StringView(uriSchemeList).empty()) {
+                                uriSchemeList << StringView(u8",");
+                            }
+                            uriSchemeList << scheme;
+                        }
+                        writeParts(controlFd, StringView(u8"OK fontsize="), (i64)(composer.opts->fontsize), StringView(u8" border="), (i64)(composer.opts->border), StringView(u8" columns="), (i64)(composer.opts->nCols), StringView(u8" rows="), (i64)(composer.opts->nRows), StringView(u8" save_lines="), (i64)(composer.vtConfig.config->saveLines), StringView(u8" fg="), (i64)(packedColor(composer.vtConfig.config->fg)), StringView(u8" bg="), (i64)(packedColor(composer.vtConfig.config->bg)), StringView(u8" cr="), (i64)(packedColor(composer.vtConfig.config->cr)), StringView(u8" alt_scroll="), (i64)(composer.vtConfig.config->altScrollMode), StringView(u8" bold_colors="), (i64)(composer.vtConfig.config->boldColors), StringView(u8" auto_copy="), (i64)(composer.vtConfig.config->autoCopyMode), StringView(u8" allow_osc52_read="), (i64)(composer.vtConfig.config->allowOsc52Read), StringView(u8" allow_window_ops="), (i64)(composer.vtConfig.config->allowWindowOps), StringView(u8" maximized="), (i64)(composer.opts->maximized), StringView(u8" fullscreen="), (i64)(composer.opts->fullscreen), StringView(u8" no_decorations="), (i64)(composer.opts->noDecorations), StringView(u8" transparent_titlebar="), (i64)(composer.opts->transparentTitlebar), StringView(u8" background_opacity="), (i64)(composer.opts->backgroundOpacity), StringView(u8" background_blur="), backdropModeName(composer.opts->backgroundBlur), StringView(u8" quick="), (i64)(composer.opts->quick), StringView(u8" quick_geometry_w_percent="), (i64)(composer.opts->quickGeometry.width.percent), StringView(u8" quick_geometry_w="), (i64)(composer.opts->quickGeometry.width.value), StringView(u8" quick_geometry_h_percent="), (i64)(composer.opts->quickGeometry.height.percent), StringView(u8" quick_geometry_h="), (i64)(composer.opts->quickGeometry.height.value), StringView(u8" quick_geometry_x_percent="), (i64)(composer.opts->quickGeometry.x.percent), StringView(u8" quick_geometry_x="), (i64)(composer.opts->quickGeometry.x.value), StringView(u8" quick_geometry_y_percent="), (i64)(composer.opts->quickGeometry.y.percent), StringView(u8" quick_geometry_y="), (i64)(composer.opts->quickGeometry.y.value), StringView(u8" quick_corner_radius="), (i64)(composer.opts->quickCornerRadius), StringView(u8" quick_remember_frame="), (i64)(composer.opts->quickRememberFrame), StringView(u8" sidebar_tabs="), (i64)(composer.opts->sidebarTabs), StringView(u8" sidebar_width="), (i64)(composer.opts->sidebarWidth), StringView(u8" sidebar_tab_tint="), (i64)(composer.opts->sidebarTabTint), StringView(u8" auto_hide_chrome="), (i64)(composer.opts->autoHideChrome), StringView(u8" panes="), (i64)(composer.opts->panes), StringView(u8" natural_editing="), (i64)(composer.opts->naturalEditing), StringView(u8" pane_divider_color="), (i64)(packedColor(composer.opts->paneDividerColor)), StringView(u8" uri_schemes="), StringView(uriSchemeList), StringView(u8"\n"));
                     } else if (line == StringView(u8"ARGV")) {
                         Buffer arguments;
                         for (int index = 0; index < argc; ++index) {
@@ -2459,9 +2643,10 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                         renderComposer.fonts = fonts;
                         renderComposer.extras.replace(composer.extras.store);
                         renderComposer.geometry.setCellPixelSize(fonts->getPx(), fonts->getPy());
-                        const u16 imageWidth = 2 * composer.layout.borderPixels + renderer.columns() * fonts->getPx();
-                        const u16 imageHeight = 2 * composer.layout.borderPixels + renderer.rows() * fonts->getPy();
-                        renderComposer.resizeWindow(imageWidth, imageHeight);
+                        const Insets imageInsets = composer.contentInsets();
+                        const u16 imageWidth = (u16)(gridPixelWidth(renderer.columns(), imageInsets, fonts->getPx()));
+                        const u16 imageHeight = (u16)(gridPixelHeight(renderer.rows(), imageInsets, fonts->getPy()));
+                        renderComposer.resize(imageWidth, imageHeight);
                         renderComposer.platform = plt::createHeadlessPlatform(*renderPool);
                         renderComposer.shaper = SpanShaper::create(renderComposer, *renderPool);
                         TerminalUpdate imageUpdate = renderer.renderUpdate();
@@ -2488,6 +2673,7 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                                 .frame = &imageFrame,
                             }
                         );
+                        renderComposer.installVtHost();
                         auto& imageWindow = static_cast<plt::WindowHeadless&>(*renderComposer.window);
                         imageFrame.renderer = Renderer::create(renderComposer, *renderPool, imageWindow.renderContext());
                         imageFrame.update = &imageUpdate;
@@ -2594,7 +2780,7 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                             if (childTty > STDERR_FILENO) {
                                 close(childTty);
                             }
-                            configureTerminalChildEnvironment(*composer.brand, composer.opts->vt.widths);
+                            configureTerminalChildEnvironment(*composer.brand, composer.vtConfig.config->widths);
                             argumentPointers.pushBack(nullptr);
                             execvp(argumentPointers[0], argumentPointers.mutData());
                             _exit(127);
@@ -2698,13 +2884,134 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                         // Cmd+T in production.
                         publishSessionAction(composer.newTabListeners);
                         writeAll(controlFd, "OK\n");
+                    } else if (startsWith(line, StringView(u8"SPLIT "))) {
+                        // The same action and the same split path as
+                        // Cmd+D / Cmd+Shift+D in production; needs
+                        // -panes, without which SessionSet declines and
+                        // the pane count stays where it was.
+                        ArgReader args(tail(line, 6));
+                        char direction[8];
+                        if (!args.token(direction, sizeof(direction))) {
+                            raiseError(StringView(u8"SPLIT needs a direction"));
+                        }
+                        const StringView chosen(direction);
+                        // splitFocused() answers with a bool, but the
+                        // listener chain it is published through has no
+                        // return value, so a refusal is only visible as a
+                        // pane count that did not move. Counting is what
+                        // keeps "panes are off" from reading as "splitting
+                        // is broken" in the test that forgot the flag.
+                        Vector<SessionPane> before;
+                        sessions->visiblePanes(before);
+                        if (chosen == StringView(u8"V")) {
+                            publishSessionAction(composer.splitVerticalListeners);
+                        } else if (chosen == StringView(u8"H")) {
+                            publishSessionAction(composer.splitHorizontalListeners);
+                        } else {
+                            raiseError(StringView(u8"SPLIT direction is V or H"));
+                        }
+                        Vector<SessionPane> after;
+                        sessions->visiblePanes(after);
+                        if (after.length() == before.length()) {
+                            raiseError(StringView(u8"split declined (needs -panes)"));
+                        }
+                        writeAll(controlFd, "OK\n");
+                    } else if (line == StringView(u8"PANE_COUNT")) {
+                        Vector<SessionPane> panes;
+                        sessions->visiblePanes(panes);
+                        writeParts(controlFd, StringView(u8"OK "), (i64)(panes.length()), StringView(u8"\n"));
+                    } else if (startsWith(line, StringView(u8"FOCUS_PANE "))) {
+                        ArgReader args(tail(line, 11));
+                        u32 index = 0;
+                        if (!args.read(index)) {
+                            raiseError(StringView(u8"FOCUS_PANE needs an index"));
+                        }
+                        sessions->focusPane(visiblePane(index).id);
+                        // Same bookkeeping the tab moves do. focusPane()
+                        // publishes sessionsChangedListeners, but adoption
+                        // there deliberately leaves trackedActiveKit alone,
+                        // so without this the close path would go on naming
+                        // the pane that was in front before (R1a-qa, B2).
+                        //
+                        // Keep it even though no test can currently see it
+                        // go: CLOSE_SESSION now always starts by focusing
+                        // its target, and focusKitInActiveTab() repairs the
+                        // same record on the way, so the only reader of
+                        // trackedActiveKit is already correct by the time it
+                        // reads (R1a-test round 2, finding 2). This is the
+                        // bookkeeping invariant for whoever comes to read
+                        // trackedActiveKit next, not dead code.
+                        trackSwitch();
+                        writeAll(controlFd, "OK\n");
+                    } else if (startsWith(line, StringView(u8"WINSIZE_PANE "))) {
+                        ArgReader args(tail(line, 13));
+                        u32 index = 0;
+                        if (!args.read(index)) {
+                            raiseError(StringView(u8"WINSIZE_PANE needs an index"));
+                        }
+                        const winsize size = paneWinsize(paneKit(index));
+                        writeParts(controlFd, StringView(u8"OK "), (i64)(size.ws_col), StringView(u8" "), (i64)(size.ws_row), StringView(u8"\n"));
+                    } else if (startsWith(line, StringView(u8"SCREEN_TEXT_PANE "))) {
+                        ArgReader args(tail(line, 17));
+                        u32 index = 0;
+                        if (!args.read(index)) {
+                            raiseError(StringView(u8"SCREEN_TEXT_PANE needs an index"));
+                        }
+                        Buffer text;
+                        paneScreenText(paneKit(index), text);
+                        writeParts(controlFd, StringView(u8"OK "), HexOut{hexview(StringView(text))}, StringView(u8"\n"));
+                    } else if (startsWith(line, StringView(u8"PTY_WRITE_PANE "))) {
+                        // Pane <index>'s shell produced bytes, the way
+                        // WRITE_SESSION does it for a session index: they
+                        // parse into that pane's terminal alone, which is
+                        // how one pane goes to the alternate screen while
+                        // its neighbour stays quiet.
+                        ArgReader args(tail(line, 15));
+                        u32 index = 0;
+                        char encoded[64 * 1024];
+                        if (!args.read(index) || !args.token(encoded, sizeof(encoded))) {
+                            raiseError(StringView(u8"invalid pane write"));
+                        }
+                        SessionKit& target = paneKit(index);
+                        Buffer input;
+                        decodeHex(StringView(encoded), input);
+                        target.terminal->feedPtyOutput((const u8*)(input.data()), input.used());
+                        writeAll(controlFd, "OK\n");
                     } else if (startsWith(line, StringView(u8"CLOSE_SESSION "))) {
                         ArgReader args(tail(line, 14));
                         u32 index = 0;
                         if (!args.read(index) || index >= sessionKits.length()) {
                             raiseError(StringView(u8"CLOSE_SESSION needs an index"));
                         }
-                        while (activeKitIndex() != index) {
+                        // Reaching the session about to close takes both
+                        // moves, because a session is a pane of a tab and
+                        // not a tab of its own: the walk crosses tabs and
+                        // focusing crosses panes. So the search does both
+                        // at every stop - focus it here, else step to the
+                        // next tab and look again - rather than looking
+                        // once and then only walking, which left a pane
+                        // that is neither in front nor focused in its own
+                        // tab unreachable however far the walk went
+                        // (R1a-qa, V5). Bounded by the number of kits:
+                        // there is a tab for each at most, so a lap that
+                        // has looked in every tab will not find it on the
+                        // next one either.
+                        //
+                        // The walk moves the window for real, so a search
+                        // that comes up empty puts the tab it started on
+                        // back in front before refusing: a command that
+                        // answers ERR must leave the window where it
+                        // found it, or the test that caught the error and
+                        // carried on is addressing a tab it never chose
+                        // (R1a-qa, V4).
+                        const size_t startedOn = activeKitIndex();
+                        for (size_t steps = 0; !focusKitInActiveTab(index); ++steps) {
+                            if (steps == sessionKits.length()) {
+                                for (size_t back = 0; activeKitIndex() != startedOn && back < sessionKits.length(); ++back) {
+                                    publishSessionAction(composer.nextTabListeners);
+                                }
+                                raiseError(StringView(u8"CLOSE_SESSION cannot reach that session"));
+                            }
                             publishSessionAction(composer.nextTabListeners);
                         }
                         publishSessionAction(composer.closeTabListeners);
@@ -2744,12 +3051,12 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                         Buffer rgb;
                         u32 imageWidth = 0;
                         u32 imageHeight = 0;
-                        if (vulkanShadow == nullptr || !vulkanShadow->captureOutput(rgb, imageWidth, imageHeight)) {
-                            raiseError(StringView(u8"vulkan output capture unavailable"));
+                        if (gpuShadow == nullptr || !gpuShadow->captureOutput(rgb, imageWidth, imageHeight)) {
+                            raiseError(StringView(u8"gpu output capture unavailable"));
                         }
                         writeParts(controlFd, StringView(u8"OK "), (i64)(imageWidth), StringView(u8" "), (i64)(imageHeight), StringView(u8" "), HexOut{StringView(rgb)}, StringView(u8"\n"));
                     } else if (line == StringView(u8"VULKAN_SHADOW")) {
-                        writeParts(controlFd, StringView(u8"OK "), (i64)(vulkanShadow != nullptr), StringView(u8"\n"));
+                        writeParts(controlFd, StringView(u8"OK "), (i64)(gpuShadow != nullptr), StringView(u8"\n"));
                     } else if (line == StringView(u8"SHAPE_GENERATION")) {
                         writeParts(controlFd, StringView(u8"OK "), (i64)(composer.shaper->spanGeneration()), StringView(u8"\n"));
                     } else if (line == StringView(u8"FAIL_NEXT_FONT_CHANGE")) {
@@ -2855,13 +3162,15 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                         if (!(args.read(columns) && args.read(rows)) || !columns || !rows) {
                             raiseError(StringView(u8"invalid resize"));
                         }
-                        terminal.resize(2 * composer.layout.borderPixels + columns * composer.geometry.cellPixelWidth, 2 * composer.layout.borderPixels + rows * composer.geometry.cellPixelHeight);
+                        const Insets resizeInsets = composer.contentInsets();
+                        terminal.resize(gridPixelWidth(columns, resizeInsets, composer.geometry.cellPixelWidth), gridPixelHeight(rows, resizeInsets, composer.geometry.cellPixelHeight));
                         writeAll(controlFd, "OK\n");
                     } else if (startsWith(line, StringView(u8"RESIZE_PIXELS "))) {
                         ArgReader args(tail(line, 14));
                         unsigned pixelWidth;
                         unsigned pixelHeight;
-                        if (!(args.read(pixelWidth) && args.read(pixelHeight)) || pixelWidth <= 2 * composer.layout.borderPixels || pixelHeight <= 2 * composer.layout.borderPixels) {
+                        const Insets pixelInsets = composer.contentInsets();
+                        if (!(args.read(pixelWidth) && args.read(pixelHeight)) || pixelWidth <= gridPixelWidth(0, pixelInsets, composer.geometry.cellPixelWidth) || pixelHeight <= gridPixelHeight(0, pixelInsets, composer.geometry.cellPixelHeight)) {
                             raiseError(StringView(u8"invalid pixel resize"));
                         }
                         terminal.resize(pixelWidth, pixelHeight);
@@ -2915,7 +3224,7 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                         writeParts(controlFd, StringView(u8"OK "), (i64)(size.ws_col), StringView(u8" "), (i64)(size.ws_row), StringView(u8" "), (i64)(size.ws_xpixel), StringView(u8" "), (i64)(size.ws_ypixel), StringView(u8"\n"));
                     } else if (line == StringView(u8"FONT_STATE")) {
                         StringBuilder output;
-                        output << StringView(u8"OK ") << composer.fontSize << StringView(u8" ") << composer.geometry.cellPixelWidth << StringView(u8" ") << composer.geometry.cellPixelHeight << StringView(u8" ") << composer.layout.pixelWidth << StringView(u8" ") << composer.layout.pixelHeight << StringView(u8" ") << composer.geometry.columns << StringView(u8" ") << composer.geometry.rows << StringView(u8" ") << (unsigned)(composer.contentScale * 1000.0f + 0.5f) << StringView(u8" ") << composer.layout.borderPixels << StringView(u8"\n");
+                        output << StringView(u8"OK ") << composer.fontSize << StringView(u8" ") << composer.geometry.cellPixelWidth << StringView(u8" ") << composer.geometry.cellPixelHeight << StringView(u8" ") << composer.geometry.pixelWidth << StringView(u8" ") << composer.geometry.pixelHeight << StringView(u8" ") << composer.geometry.columns << StringView(u8" ") << composer.geometry.rows << StringView(u8" ") << (unsigned)(composer.contentScale * 1000.0f + 0.5f) << StringView(u8" ") << composer.borderPixels() << StringView(u8"\n");
                         writeAll(controlFd, StringView(output));
                     } else if (line == StringView(u8"LAST_UPDATE")) {
                         Buffer response;
@@ -3116,12 +3425,15 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                         if ((start || extend) && args.read(cycle) && cycle > 1) {
                             raiseError(StringView(u8"invalid selection cycle"));
                         }
+                        const Insets selectInsets = composer.contentInsets();
+                        const int pointX = selectInsets.left + column * composer.geometry.cellPixelWidth;
+                        const int pointY = selectInsets.top + row * composer.geometry.cellPixelHeight;
                         if (start) {
-                            terminal.selectStart(composer.layout.originX + column * composer.geometry.cellPixelWidth, composer.layout.originY + row * composer.geometry.cellPixelHeight, cycle != 0);
+                            terminal.selectStart(pointX, pointY, cycle != 0);
                         } else if (extend) {
-                            terminal.selectExtend(composer.layout.originX + column * composer.geometry.cellPixelWidth, composer.layout.originY + row * composer.geometry.cellPixelHeight, cycle != 0);
+                            terminal.selectExtend(pointX, pointY, cycle != 0);
                         } else {
-                            terminal.selectUpdate(composer.layout.originX + column * composer.geometry.cellPixelWidth, composer.layout.originY + row * composer.geometry.cellPixelHeight);
+                            terminal.selectUpdate(pointX, pointY);
                         }
                         writeAll(controlFd, "OK\n");
                     } else if (line == StringView(u8"SELECT_RECTANGULAR")) {
@@ -3144,7 +3456,8 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                             raiseError(StringView(u8"invalid hyperlink point"));
                         }
                         Buffer link;
-                        terminal.getHyperlink(composer.layout.originX + column, composer.layout.originY + row, link);
+                        const Insets linkInsets = composer.contentInsets();
+                        terminal.getHyperlink(linkInsets.left + column, linkInsets.top + row, link);
                         writeParts(controlFd, StringView(u8"OK "), HexOut{StringView(link)}, StringView(u8"\n"));
                     } else if (line == StringView(u8"HYPERLINK_COUNT")) {
                         writeParts(controlFd, StringView(u8"OK "), (i64)(terminal.getHyperlinkCount()), StringView(u8"\n"));
@@ -3272,7 +3585,7 @@ int runTestMode(Composer& composer, TestInput& input, plt::WindowEvents& events,
                             if (!parseU64(StringView(token), codepoint, 16) || codepoint > 0x10ffff) {
                                 raiseError(StringView(u8"invalid codepoint"));
                             }
-                            output << StringView(u8" ") << composer.opts->vt.widths.codepointWidth((u32)(codepoint));
+                            output << StringView(u8" ") << composer.vtConfig.config->widths.codepointWidth((u32)(codepoint));
                             ++count;
                         }
                         if (!count) {

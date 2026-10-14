@@ -368,7 +368,13 @@ class DynamicColorTest(unittest.TestCase):
     def test_border_follows_dynamic_background(self):
         # Every mainstream terminal paints its padding with the current
         # (OSC 11) default background, not the startup color.
-        with Shitty(columns=4, rows=2) as terminal:
+        #
+        # T8: opacity pinned back to 100. The shipped default is 60 over
+        # a glass backdrop, and a background pixel then arrives as
+        # 0.6 * the color asked for - (153, 0, 0) here. That is the
+        # translucency working, not the border failing to follow, and
+        # this test is about the following.
+        with Shitty(columns=4, rows=2, extra_arguments=("-backgroundOpacity", "100", "-backgroundBlur", "off")) as terminal:
             terminal.write(b"\x1b]11;#ff0000\x07X")
             self.assertEqual(terminal.presented_pixel(0, 0), (255, 0, 0))
 

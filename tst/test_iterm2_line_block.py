@@ -6,7 +6,7 @@
 
 import unittest
 
-from harness import Shitty
+from harness import ShittyWithTabs as Shitty
 
 
 PORTED_CASES = (

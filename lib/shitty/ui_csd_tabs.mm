@@ -6,6 +6,8 @@
 
 #include "ui_csd_tabs.h"
 
+#include "render_blend.h"
+
 #include "brand.h"
 #include "options.h"
 #include "session.h"
@@ -28,59 +30,109 @@
 #undef Rect
 #undef Point
 
+// After AppKit, and it has to be: see the header.
+#include "ui_window_tint.h"
+
 #include <stdio.h>
+
+// @available guards the runtime; building against an older SDK also needs the
+// declarations to exist at all. Same pair, same spelling, as the one
+// ext/plt/platform_cocoa.mm keeps around NSGlassEffectView itself.
+#if defined(MAC_OS_VERSION_26_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_26_0
+    #define UI_SDK_MACOS_26 1
+#else
+    #define UI_SDK_MACOS_26 0
+#endif
+
+#if defined(MAC_OS_VERSION_27_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_27_0
+    #define UI_SDK_MACOS_27 1
+#else
+    #define UI_SDK_MACOS_27 0
+#endif
 
 using namespace stl;
 
-namespace {
-    struct CsdTabsUi;
+#if UI_SDK_MACOS_27
+// The title bar strip's sheet of glass from macOS 27 on. Same reason for the
+// subclass as TerminalGlassPillView in ui_sidebar_tabs.mm - the shape lives
+// behind a readonly property and is stated by overriding its getter - and the
+// same reason for the neutral name.
+//
+// Concentric along the top only, and square along the bottom, which is the
+// shape the flat zero it replaces was standing in for.
+//
+// The top corners are the window's own: this strip runs the full width into
+// the frame's rounded corners, and concentric is how a view says "whatever
+// the window's corner is". Measured live on this machine - the verbose line
+// below prints it - the fill view this sheet lives in does hand the window's
+// shape down, and a plain concentric configuration resolves to 16 points on
+// ALL FOUR corners. Two of those are the strip's bottom edge, which is a
+// straight seam across the middle of the window: rounding them would be a
+// visible defect, and it is the only reason this class does not simply ask
+// for containerConcentric and stop.
+//
+// A floor of zero rather than of the window's radius, because a window that
+// declares no shape (a borderless one, where NSNextStepFrame reports nil)
+// must leave the strip exactly as square as cornerRadius left it before.
+API_AVAILABLE(macos(27.0))
+@interface TerminalGlassStripView: NSGlassEffectView
+@end
 
-    // Where the tabs sit in the title bar and how the active one is cut
-    // into it: the notch lifts off the seam by inset, rounds its top
-    // corners by radius and flares into the seam by fillet.
-    struct TabLayout {
-        CGFloat left;
-        CGFloat cellWidth;
-        CGFloat tabsWidth;
-        CGFloat inset;
-        CGFloat radius;
-        CGFloat fillet;
-    };
+@implementation TerminalGlassStripView
 
-    // The colors of the well. The fill is the terminal's own background;
-    // the shade is the dark cut on the material right at the edge, the
-    // glow the lit rim one point further out, the lip the faint line on
-    // the well's inner wall, mixed from the terminal's foreground so it
-    // shows on any background. The native title bar supplies the
-    // material underneath; only the active well and the seam's lip
-    // cover it with the terminal's colors.
-    struct WellStyle {
-        NSColor* fill;
-        NSColor* shade;
-        NSColor* glow;
-        NSColor* lip;
-    };
+- (NSViewCornerConfiguration*)cornerConfiguration {
+    NSViewCornerRadius* const square = [NSViewCornerRadius fixedRadius:0];
+    return [NSViewCornerConfiguration configurationWithUniformTopRadius:
+                [NSViewCornerRadius containerConcentricRadiusWithMinimum:0]
+                                                      bottomLeftRadius:square
+                                                     bottomRightRadius:square];
 }
 
-// The iTerm2 look, recessed: the title bar itself, split into tabs by
-// hairline separators, with the active tab and the terminal below it
-// forming one well sunk into the window's material. The view covers the
-// tabs only and owns no model - it reads labels and the active index
-// through its owner, which outlives it.
-@interface CsdTabBarView: NSView {
+@end
+#endif
+
+namespace {
+    struct CsdTabsUi;
+}
+
+// A7: one hover transition of the auto-hiding title bar, and the whole
+// of what one is allowed to touch. It takes the Composer rather than a
+// CsdTabsUi because it needs nothing else: the strip's reserve is set
+// once when the mode turns on and is never revisited here, so there is
+// no per-hover state to keep and nothing that could re-count the grid.
+// Not static, and declared again in ui_csd_tabs_ut.cpp: a unit test can
+// build a Composer but not an NSTrackingArea, and this is the one path
+// A7 forbids from touching geometry, so it has to be callable from one.
+void csdTabsChromeHovered(Composer& composer, bool inside);
+
+// The iTerm2 look: the title bar itself, split into tabs by hairline
+// separators. The view sits inside the titlebar container next to the
+// traffic lights; the native title is hidden while it shows. The view
+// owns no model - it reads labels and the active index through its
+// owner, which outlives it.
+@interface TerminalTabBarView: NSView {
 @public
     CsdTabsUi* owner;
 }
 @end
 
-// The gap between the traffic lights and the first tab: paints its
-// share of the seam over the native material. It is a view of
-// its own because AppKit decides where the title bar drags the window
-// by view frames, not by hit testing - a single strip across the bar
-// that refuses to move the window over its tabs refuses everywhere.
-@interface CsdSeamView: NSView {
-@public
-    CsdTabsUi* owner;
+// The title bar's own tint, and nothing else: a plain fill behind the
+// standard window buttons, in the strip AppKit stops painting once
+// titlebarAppearsTransparent is on. It answers no clicks at all, so the
+// bare title bar keeps dragging the window and zooming on a double
+// click exactly as it does without it.
+@interface TerminalTitlebarFillView: NSView
+@end
+
+// A7: the mouse tracker that reveals the auto-hidden title bar. It sits
+// in the titlebar container and covers exactly it, so the strip that
+// reveals the chrome is the strip the chrome occupies, with no
+// coordinate arithmetic to get wrong and nothing to re-derive when the
+// window is resized. It draws nothing and answers no clicks; all it
+// does is tell the Composer the pointer arrived or left.
+@interface TerminalChromeHoverView: NSView {
+    @public
+    Composer* composer;
 }
 @end
 
@@ -93,6 +145,12 @@ namespace {
         CsdTabsUi* parent;
     };
 
+    // Fires on every config reload (SIGUSR1), not just ones that touch
+    // colors - the listener list carries no diff, so this repaints the
+    // titlebar fill and the tab strip unconditionally. Reacting to an
+    // OSC-driven background change from inside the running shell is a
+    // separate, larger feature (the window would need to hear about it
+    // at all) and stays out of scope here.
     struct CallConfigChanged final: public Listener {
         explicit CallConfigChanged(CsdTabsUi* parent);
 
@@ -112,68 +170,39 @@ namespace {
 
         void project();
         void apply();
+        void applyTitlebarColor();
+        bool applyTitlebarGlass(NSWindow* window);
+        void dropTitlebarGlass();
+        void applyAutoHideChrome();
         void tabSelected(size_t index);
         void tabClosed(size_t index);
         void tabOpened();
-        NSWindow* nativeWindow() const;
-        TabLayout layout(CGFloat width) const;
-        WellStyle style(NSAppearance* appearance) const;
-        void observeWindow(NSWindow* window);
-        void stopObservingWindow();
-        void redraw();
-        void logGeometry(NSWindow* window) const;
 
         Composer& composer;
         CallSessionsChanged sessionsChanged{this};
         CallConfigChanged configChanged{this};
-        CsdTabBarView* bar = nil;
-        CsdSeamView* seam = nil;
+        TerminalTabBarView* bar = nil;
+        // The title bar's tint, installed on demand by
+        // applyTitlebarColor() and removed again when a reload turns
+        // transparentTitlebar off; nil whenever the option is off.
+        TerminalTitlebarFillView* titlebarFill = nil;
+        // The strip's own sheet of glass, or nil when the window has no
+        // glass backdrop to continue. It lives *inside* titlebarFill
+        // rather than beside it, which is what keeps the title bar
+        // draggable: that view answers nil to hitTest: and a nil answer
+        // takes its whole subtree out of hit testing with it. Typed
+        // NSView* so the field needs no availability annotation of its
+        // own, the way WindowImpl::glassBackdrop is.
+        NSView* titlebarGlass = nil;
+        // The hover tracker, installed while autoHideChrome is on and
+        // removed again when a reload turns it off; nil otherwise.
+        TerminalChromeHoverView* chromeHover = nil;
         // The projected model snapshot the view draws from; nil hides
         // the strip (a lone session keeps the clean native title).
         NSArray<NSString*>* labels = nil;
         size_t active = 0;
         bool applyPending = false;
-        CGFloat tabsLeft = 0;
-        id windowObservers[3] = {};
     };
-
-    static bool csdDarkAppearance(NSAppearance* appearance);
-    static NSColor* csdColor(Color color, CGFloat alpha);
-    static NSColor* csdMix(CGFloat red, CGFloat green, CGFloat blue, CGFloat overRed, CGFloat overGreen, CGFloat overBlue, CGFloat alpha);
-}
-
-// The trailing new-tab cell is square-ish; everything left of it is
-// split evenly between the tabs. The close glyph answers clicks in a
-// fixed leading zone of each tab.
-static const CGFloat csdTabPlusWidth = 34;
-static const CGFloat csdTabCloseZone = 24;
-// The notch of the active tab: how far its top sits below the window
-// edge, its top corner radius, and the radius of the flare into the seam.
-static const CGFloat csdTabInset = 5;
-// The top corners and the flare into the seam share one radius, so the
-// notch reads as one curve going in and coming back out.
-static const CGFloat csdTabRadius = 5;
-static const CGFloat csdTabFillet = 5;
-
-namespace {
-    static bool csdDarkAppearance(NSAppearance* appearance) {
-        if (@available(macOS 10.14, *)) {
-            NSAppearanceName const name = [appearance bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
-            return [name isEqualToString:NSAppearanceNameDarkAqua];
-        }
-        return false;
-    }
-
-    // sRGB, the space the terminal itself renders in: a calibrated color
-    // would land beside the grid it is supposed to continue.
-    static NSColor* csdColor(Color color, CGFloat alpha) {
-        return [NSColor colorWithSRGBRed:color.red / 255.0 green:color.green / 255.0 blue:color.blue / 255.0 alpha:alpha];
-    }
-
-    // An opaque color: the second one laid over the first at alpha.
-    static NSColor* csdMix(CGFloat red, CGFloat green, CGFloat blue, CGFloat overRed, CGFloat overGreen, CGFloat overBlue, CGFloat alpha) {
-        return [NSColor colorWithSRGBRed:red + (overRed - red) * alpha green:green + (overGreen - green) * alpha blue:blue + (overBlue - blue) * alpha alpha:1.0];
-    }
 }
 
 CallSessionsChanged::CallSessionsChanged(CsdTabsUi* parent_)
@@ -191,54 +220,230 @@ CallConfigChanged::CallConfigChanged(CsdTabsUi* parent_)
 }
 
 void CallConfigChanged::onListen(void*) {
+    parent->applyTitlebarColor();
+    // A reload can turn autoHideChrome on or off, same as every other
+    // option this module projects; the reserve and the full-size content
+    // view follow it either way, so the grid never keeps paying for a
+    // strip nobody hides anymore.
+    parent->applyAutoHideChrome();
+    // And a reload can turn -sidebarTabs on or off, which decides
+    // whether this module's own strip is redundant (V2). The answer is
+    // read on the main queue inside apply(), by which time the sidebar's
+    // own listener has run whichever order the two were registered in.
     parent->project();
+}
+
+namespace {
+    // sRGB, the space the terminal itself renders in: a calibrated color
+    // would land beside the grid it is supposed to continue or blend into.
+    static NSColor* nsColorFromTerminalColor(Color color, CGFloat alpha = 1.0) {
+        return [NSColor colorWithSRGBRed:color.red / 255.0 green:color.green / 255.0 blue:color.blue / 255.0 alpha:alpha];
+    }
+
+    // Whether the window is backed by the system's glass, asked of the
+    // live view hierarchy and deliberately not re-derived from the
+    // options - the same question ui_sidebar_tabs.mm asks, spelled the
+    // same way and for the same reason. Three things decide it and only
+    // one is an option: -backgroundBlur glass, a system that has
+    // NSGlassEffectView at all, and -backgroundOpacity below 100. All
+    // three are weighed in ext/plt/platform_cocoa.mm, which then either
+    // installs the glass or silently falls back to the frosted pane;
+    // reading the option here would answer "glass" on a machine that can
+    // never show any, and the strip would stand its own tint down for a
+    // backdrop that is not there.
+    static bool windowBackdropIsGlass(NSWindow* window) {
+#if UI_SDK_MACOS_26
+        if (@available(macOS 26.0, *)) {
+            NSView* const content = window == nil ? nil : window.contentView;
+            NSView* const frame = content == nil ? nil : content.superview;
+            for (NSView* const sibling in frame.subviews) {
+                if ([sibling isKindOfClass:[NSGlassEffectView class]]) {
+                    return true;
+                }
+            }
+        }
+#else
+        (void)window;
+#endif
+        return false;
+    }
+
+    // Every backend hands back a non-null .window - the headless one
+    // points it at its own render target, not at an NSWindow - so the
+    // backend tag has to be checked before the bridge cast runs, not
+    // just nullness: the pointer bridges fine and sending it any
+    // Objective-C message does not (this crashed a headless probe test,
+    // R2-qa round 2, B5). The single cast in this file lives here, so
+    // every caller inherits the guard by asking for nil.
+    static NSWindow* nativeWindow(const Composer& composer) {
+        if (composer.window == nullptr) {
+            return nil;
+        }
+        const plt::RenderContext context = composer.window->renderContext();
+        if (context.backend != plt::RenderBackend::Cocoa) {
+            return nil;
+        }
+        return (__bridge NSWindow*)(context.window);
+    }
+
+    // The view AppKit keeps the standard window buttons in - the title
+    // bar's own strip, and the surface everything this module puts in
+    // the title bar goes into. Reached through the zoom button because
+    // the container itself is private API; nil when the window has no
+    // decorations to hold one.
+    static NSView* titlebarContainer(NSWindow* window) {
+        NSButton* const zoom = [window standardWindowButton:NSWindowZoomButton];
+        return zoom != nil ? zoom.superview : nil;
+    }
+
+    // Whether the mode is live at all: an undecorated window has no
+    // title bar to hide and none to reserve room for, so the option
+    // means nothing there - the same scoping applyTitlebarColor() gives
+    // transparentTitlebar one screen up.
+    static bool autoHidingChrome(const Composer& composer) {
+        return composer.opts->autoHideChrome && !composer.opts->noDecorations;
+    }
+}
+
+// The whole of A7's hover decision, and deliberately not a line inside
+// csdTabsChromeHovered(): there it sat below the nativeWindow() == nil
+// exit, where no headless test can reach it, and inverting it - the
+// pointer revealing the chrome it should hide and hiding the chrome it
+// should reveal - was green across the entire suite (R4-test, N13).
+// Above the cast it is an ordinary function of the options and the
+// pointer, and the assignment left behind has no branch in it at all.
+double csdTabsChromeAlpha(const Composer& composer, bool inside) {
+    // Off means fully visible: a window whose title bar nobody hides
+    // must not be dimmed by a pointer wandering over it.
+    return !autoHidingChrome(composer) || inside ? 1.0 : 0.0;
+}
+
+// Where the tab bar lives is the option's answer and nothing else's
+// (V3). The strip shows in the title bar when that is the placement the
+// user picked; the sidebar shows in the other case, and cmd+b hides the
+// sidebar without the tabs reappearing up here - which is exactly what
+// this used to get wrong.
+//
+// It used to read the sidebar's left-edge chrome reserve, so that cmd+b
+// hiding the panel brought the strip back. That was the "toggle" the
+// user complained about: the chord moved the tabs from one edge to the
+// other instead of putting them away. Reading the option instead is not
+// only the right answer, it is one fewer cross-module channel and one
+// fewer question about which module's listener ran first.
+//
+// Not static, and declared again in ui_csd_tabs_ut.cpp, for the same
+// reason csdTabsChromeAlpha() is: below the nativeWindow() == nil exit
+// no headless test could reach the decision at all, and that is exactly
+// how an inverted one stayed green through a whole suite before (N13).
+bool csdTabsStripShown(const Composer& composer, bool haveTabs) {
+    return haveTabs && !composer.opts->sidebarTabs;
+}
+
+void csdTabsChromeHovered(Composer& composer, bool inside) {
+    // A7, and the reason this function is three lines long: a hover
+    // changes what is drawn in the strip and nothing else. The reserve
+    // stays, the content view keeps its size, the grid keeps its rows,
+    // and the shell is never told anything happened. Dropping the
+    // reserve here instead - the obvious way to make the terminal use
+    // the strip while the chrome is away - is what would send a
+    // SIGWINCH on every crossing of the boundary and make Vterm rebuild
+    // Screen with a scrollback reflow, twice per pass of the pointer.
+    if (composer.vtConfig.config->verbose && autoHidingChrome(composer)) {
+        // The row count travels with the line on purpose: this is the
+        // trace that shows a pass of the pointer moving nothing. A
+        // window: line from application.cpp between two of these would
+        // be a re-counted grid, which is the failure A7 names.
+        fprintf(stderr, "%s: chrome: pointer %s the strip, grid %ux%u\n", composer.brand->identifierCString(), inside ? "entered" : "left", (unsigned)(composer.geometry.columns), (unsigned)(composer.geometry.rows));
+    }
+    NSWindow* const window = nativeWindow(composer);
+    NSView* const titlebar = window != nil ? titlebarContainer(window) : nil;
+    if (titlebar == nil) {
+        return;
+    }
+    // Alpha, not -setHidden: - a hidden title bar container is a piece
+    // of window state AppKit re-derives on its own (a fullscreen
+    // transition, a style mask change), and it takes the standard
+    // buttons' own hidden flags with it. Alpha is ours alone and
+    // survives all of that. It leaves the chrome hit-testable while
+    // invisible, which costs nothing: a click in the strip is preceded
+    // by the pointer entering it, and that is what makes it visible.
+    //
+    // Except in the layered window, where the standard buttons sit on the
+    // sidebar's surface for good, the way the mock drew them: there is no
+    // strip over the terminal to hide any more (applyTitlebarColor() stands
+    // it down), so hiding the container would only take the buttons away.
+    titlebar.alphaValue = layeredWindowShown(composer, window) ? 1.0 : csdTabsChromeAlpha(composer, inside);
 }
 
 CsdTabsUi::CsdTabsUi(Composer& composer_)
     : composer(composer_)
 {
     composer.sessionsChangedListeners.pushBack(&sessionsChanged);
-    // A reload may change the terminal colors or the seam's lip.
     composer.configChangedListeners.pushBack(&configChanged);
+    // The window already exists by the time application.cpp constructs
+    // this object (createCsdTabsUi runs right after createWindow), so the
+    // initial color applies here instead of waiting for the first reload.
+    applyTitlebarColor();
+    // Before showWindow() counts the grid for the first time, so the
+    // strip is reserved out of the very first row count rather than
+    // taken away from it one frame later.
+    applyAutoHideChrome();
 }
 
-NSWindow* CsdTabsUi::nativeWindow() const {
-    if (composer.window == nullptr) {
-        return nil;
+void CsdTabsUi::applyAutoHideChrome() {
+    const bool on = autoHidingChrome(composer);
+    // C11: nothing is reserved, in either direction. A7 charged the grid
+    // a title bar's height so no text could sit under the chrome, and
+    // the band of empty window that left above the first row - the
+    // terminal's and the sidebar list's alike, since that list insets
+    // itself by this same reserve - is what the user reported as looking
+    // wrong. The point of hiding the title bar is a window with nothing
+    // above the text; on the frames the pointer brings it back it is
+    // drawn over the top rows, which is the trade the user asked for.
+    // Still set rather than skipped: a reload that turns the mode off
+    // has to clear whatever an older build left behind.
+    composer.setChromeReserve(ChromeSide::Top, 0);
+    NSWindow* const window = nativeWindow(composer);
+    if (window == nil) {
+        return;
     }
-    return (__bridge NSWindow*)(composer.window->renderContext().window);
-}
-
-TabLayout CsdTabsUi::layout(CGFloat width) const {
-    TabLayout result;
-    result.left = tabsLeft;
-    result.tabsWidth = width - tabsLeft - csdTabPlusWidth;
-    if (result.tabsWidth < 0) {
-        result.tabsWidth = 0;
+    if (on) {
+        // The content view takes the whole window, title bar included,
+        // and the title bar stops painting its own material over it.
+        // This is what makes hiding the chrome show the terminal's
+        // background there instead of a bare grey strip - and it is the
+        // one geometry change in the whole feature, made once when the
+        // mode turns on, never on a hover.
+        window.styleMask |= NSWindowStyleMaskFullSizeContentView;
+        window.titlebarAppearsTransparent = YES;
+    } else {
+        window.styleMask &= ~NSWindowStyleMaskFullSizeContentView;
+        // transparentTitlebar is the other owner of this bit and may
+        // still want it; clearing it unconditionally would turn one
+        // option off by turning another one off.
+        window.titlebarAppearsTransparent = composer.opts->transparentTitlebar;
     }
-    const NSUInteger count = labels.count;
-    result.cellWidth = count == 0 ? 0 : result.tabsWidth / (CGFloat)(count);
-    // A narrow cell keeps its notch a notch: the curves shrink before
-    // they could cross each other.
-    const CGFloat quarter = result.cellWidth / 4;
-    result.inset = csdTabInset;
-    result.radius = csdTabRadius < quarter ? csdTabRadius : quarter;
-    result.fillet = csdTabFillet < quarter ? csdTabFillet : quarter;
-    return result;
-}
-
-WellStyle CsdTabsUi::style(NSAppearance* appearance) const {
-    const bool dark = csdDarkAppearance(appearance);
-    const Color bg = composer.opts->vt.bg;
-    const Color fg = composer.opts->vt.fg;
-    const CGFloat shadeAlpha = dark ? 0.6 : 0.2;
-    const CGFloat glowAlpha = dark ? 0.1 : 0.6;
-    WellStyle result;
-    result.fill = csdColor(bg, 1.0);
-    result.shade = [NSColor colorWithSRGBRed:0 green:0 blue:0 alpha:shadeAlpha];
-    result.glow = [NSColor colorWithSRGBRed:1 green:1 blue:1 alpha:glowAlpha];
-    result.lip = csdMix(bg.red / 255.0, bg.green / 255.0, bg.blue / 255.0, fg.red / 255.0, fg.green / 255.0, fg.blue / 255.0, 0.07);
-    return result;
+    NSView* const titlebar = titlebarContainer(window);
+    if (titlebar == nil) {
+        return;
+    }
+    if (on && chromeHover == nil) {
+        chromeHover = [[TerminalChromeHoverView alloc] initWithFrame:titlebar.bounds];
+        chromeHover.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        chromeHover->composer = &composer;
+        [titlebar addSubview:chromeHover];
+        if (composer.vtConfig.config->verbose) {
+            fprintf(stderr, "%s: chrome: auto-hiding title bar, %u pt reserved for good\n", composer.brand->identifierCString(), (unsigned)(composer.chromeReserve(ChromeSide::Top)));
+        }
+    } else if (!on && chromeHover != nil) {
+        [chromeHover removeFromSuperview];
+        [chromeHover release];
+        chromeHover = nil;
+    }
+    // Hidden until the pointer says otherwise, and fully visible again
+    // the moment the mode goes off - a reload that drops the option
+    // must not leave the title bar it stops managing at alpha zero.
+    csdTabsChromeHovered(composer, false);
 }
 
 void CsdTabsUi::project() {
@@ -277,167 +482,255 @@ void CsdTabsUi::project() {
 
 void CsdTabsUi::apply() {
     applyPending = false;
-    NSWindow* const window = nativeWindow();
+    NSWindow* const window = nativeWindow(composer);
     if (window == nil) {
-        if (composer.opts->vt.verbose) {
+        if (composer.vtConfig.config->verbose) {
             fprintf(stderr, "%s: tabs: no native window in the render context\n", composer.brand->identifierCString());
         }
         return;
     }
-    if (labels == nil) {
+    if (!csdTabsStripShown(composer, labels != nil)) {
         if (bar != nil) {
-            stopObservingWindow();
             [bar removeFromSuperview];
             [bar release];
             bar = nil;
-            [seam removeFromSuperview];
-            [seam release];
-            seam = nil;
-            window.titleVisibility = NSWindowTitleVisible;
-            if (@available(macOS 11.0, *)) {
-                window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleAutomatic;
-            }
+        }
+        // The layered window's panel says the title itself, centred over
+        // the terminal; the system's copy would sit across the top of the
+        // whole window, over the sidebar and the panel's edge at once.
+        const bool layered = layeredWindowShown(composer, window);
+        window.titleVisibility = layered ? NSWindowTitleHidden : NSWindowTitleVisible;
+        if (@available(macOS 11.0, *)) {
+            window.titlebarSeparatorStyle = layered ? NSTitlebarSeparatorStyleNone : NSTitlebarSeparatorStyleAutomatic;
         }
         return;
     }
     NSButton* const zoom = [window standardWindowButton:NSWindowZoomButton];
-    NSView* titlebar = zoom != nil ? zoom.superview : nil;
-    // The strip wants a view spanning the whole title bar. The zoom
-    // button's parent is that view on the releases seen so far; should
-    // a release keep the buttons in a narrower box of their own, climb
-    // until the view is as wide as the window, stopping short of the
-    // frame itself.
-    NSView* const frameView = window.contentView.superview;
-    while (titlebar != nil && titlebar.superview != frameView && titlebar.bounds.size.width < window.contentView.bounds.size.width) {
-        titlebar = titlebar.superview;
-    }
-    if (titlebar == nil || titlebar == frameView) {
-        if (composer.opts->vt.verbose) {
+    NSView* const titlebar = zoom != nil ? zoom.superview : nil;
+    if (titlebar == nil) {
+        if (composer.vtConfig.config->verbose) {
             fprintf(stderr, "%s: tabs: no titlebar container to draw into\n", composer.brand->identifierCString());
         }
         return;
     }
-    // Only a direct child of the title bar can order the strip below the
-    // buttons; from a wider ancestor the strip goes in at the bottom.
-    NSView* const buttons = zoom.superview == titlebar ? zoom : nil;
-    // The gap before the first tab keeps dragging the window natively,
-    // double-click zoom included: it belongs to the seam view, which
-    // lets the window move; the tab strip does not.
-    tabsLeft = NSMaxX([zoom.superview convertRect:zoom.frame toView:titlebar]) + 56;
-    // Both views reach one point below the title bar, over the
-    // content's top point: whatever the content view's own layers put
-    // there, its top device row does not show translucent or vibrant
-    // material, only opaque paint. The title bar views draw over the
-    // content, so they paint that row themselves, opaquely.
-    const NSRect bounds = titlebar.bounds;
-    const NSRect frame = NSMakeRect(tabsLeft, -1, bounds.size.width - tabsLeft, bounds.size.height + 1);
-    const NSRect seamFrame = NSMakeRect(0, -1, tabsLeft, bounds.size.height + 1);
+    // Up to the very window edge: the trailing new-tab cell is never
+    // filled, so nothing opaque reaches the rounded corner. The gap
+    // before the first tab is bare title bar outside this view, so it
+    // drags the window natively, double-click zoom included.
+    const CGFloat left = NSMaxX(zoom.frame) + 56;
+    const NSRect frame = NSMakeRect(left, 0, titlebar.bounds.size.width - left, titlebar.bounds.size.height);
     if (bar == nil) {
-        seam = [[CsdSeamView alloc] initWithFrame:seamFrame];
-        seam.autoresizingMask = NSViewMaxXMargin | NSViewHeightSizable;
-        seam->owner = this;
-        bar = [[CsdTabBarView alloc] initWithFrame:frame];
+        bar = [[TerminalTabBarView alloc] initWithFrame:frame];
         bar.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         bar->owner = this;
-        // Below the traffic lights: the seam runs under them, the
-        // buttons stay on top.
-        [titlebar addSubview:seam positioned:NSWindowBelow relativeTo:buttons];
-        [titlebar addSubview:bar positioned:NSWindowBelow relativeTo:buttons];
+        [titlebar addSubview:bar];
         window.titleVisibility = NSWindowTitleHidden;
-        // AppKit keeps drawing the native title bar. Our views overlay
-        // only the tabs and their seam; hiding the window title does
-        // not replace the material or change the frame's transparency.
+        // The automatic style draws a hard rule under the title bar on
+        // some releases - straight through the seam where the active tab
+        // continues into its terminal.
         if (@available(macOS 11.0, *)) {
             window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
         }
-        if (composer.opts->vt.verbose) {
+        if (composer.vtConfig.config->verbose) {
             fprintf(stderr, "%s: tabs: strip installed over the title bar\n", composer.brand->identifierCString());
         }
     } else {
         bar.frame = frame;
-        seam.frame = seamFrame;
     }
-    if (windowObservers[0] == nil) {
-        observeWindow(window);
-    }
-    redraw();
-    if (composer.opts->vt.verbose) {
-        logGeometry(window);
-    }
+    bar.needsDisplay = YES;
 }
 
-namespace {
-    static void csdLogSubtree(const char* prefix, NSView* view, int depth) {
-        const NSRect frame = view.frame;
-        const NSRect bounds = view.bounds;
-        fprintf(stderr, "%s: tabs: %*s%s frame=(%g,%g %gx%g) bounds=(%g,%g %gx%g)%s\n", prefix, depth * 2, "", view.className.UTF8String, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height, view.hidden ? " hidden" : "");
-        if (depth >= 3) {
-            return;
-        }
-        for (NSView* child in view.subviews) {
-            csdLogSubtree(prefix, child, depth + 1);
-        }
-    }
-}
-
-// Everything the seam depends on, for a bug report from a machine this
-// code cannot be run on: where the title bar, its container and the
-// content view actually sit, and what AppKit put between them.
-void CsdTabsUi::logGeometry(NSWindow* window) const {
-    const char* const prefix = composer.brand->identifierCString();
-    const NSRect frame = window.frame;
-    const NSRect content = window.contentView.frame;
-    const NSRect layout = window.contentLayoutRect;
-    fprintf(stderr, "%s: tabs: window frame=(%g,%g %gx%g) scale=%g content frame=(%g,%g %gx%g) contentLayoutRect=(%g,%g %gx%g) border=%u (frame layer corner radius %g) macOS %ld.%ld\n", prefix, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, window.backingScaleFactor, content.origin.x, content.origin.y, content.size.width, content.size.height, layout.origin.x, layout.origin.y, layout.size.width, layout.size.height, (unsigned)(composer.opts->border), window.contentView.superview.layer.cornerRadius, (long)(NSProcessInfo.processInfo.operatingSystemVersion.majorVersion), (long)(NSProcessInfo.processInfo.operatingSystemVersion.minorVersion));
-    NSView* titlebar = bar.superview;
-    NSView* root = titlebar;
-    while (root.superview != nil && root.superview != window.contentView.superview) {
-        root = root.superview;
-    }
-    if (root != nil) {
-        csdLogSubtree(prefix, root, 0);
-    }
-    if (titlebar != nil) {
-        const NSRect inWindow = [titlebar convertRect:titlebar.bounds toView:nil];
-        fprintf(stderr, "%s: tabs: titlebar in window coordinates=(%g,%g %gx%g)\n", prefix, inWindow.origin.x, inWindow.origin.y, inWindow.size.width, inWindow.size.height);
-    }
-}
-
-void CsdTabsUi::observeWindow(NSWindow* window) {
-    NSView* const content = window.contentView;
-    if (content == nil) {
+void CsdTabsUi::applyTitlebarColor() {
+    NSWindow* const window = nativeWindow(composer);
+    if (window == nil) {
         return;
     }
-    // The active tab's position depends on the whole window width, so
-    // both title bar views repaint in the content resize transaction.
-    content.postsFrameChangedNotifications = YES;
-    const auto observe = [&](NSString* name, id object) {
-        return [[NSNotificationCenter.defaultCenter addObserverForName:name
-                                                                object:object
-                                                                 queue:nil
-                                                            usingBlock:^(NSNotification* note) {
-                                                              (void)note;
-                                                              redraw();
-                                                            }] retain];
-    };
-    windowObservers[0] = observe(NSViewFrameDidChangeNotification, content);
-    windowObservers[1] = observe(NSWindowDidEnterFullScreenNotification, window);
-    windowObservers[2] = observe(NSWindowDidExitFullScreenNotification, window);
-}
-
-void CsdTabsUi::stopObservingWindow() {
-    for (id& observer : windowObservers) {
-        if (observer != nil) {
-            [NSNotificationCenter.defaultCenter removeObserver:observer];
-            [observer release];
-            observer = nil;
+    // no-decorations makes the option meaningless (there is no title bar
+    // to blend): leave the window's default background alone rather than
+    // paint a borderless window's whole frame.
+    if (!composer.opts->transparentTitlebar || composer.opts->noDecorations) {
+        // A reload can turn the option off. The tint has to go with it,
+        // or the strip keeps wearing opts->bg with nothing left to
+        // justify it - the same stale-state trap the arbitration below
+        // is built to avoid (R2-qa round 2, Z3).
+        if (titlebarFill != nil) {
+            dropTitlebarGlass();
+            [titlebarFill removeFromSuperview];
+            [titlebarFill release];
+            titlebarFill = nil;
+        }
+        return;
+    }
+    // T10: at the terminal's own opacity, or the strip stays a solid
+    // step above a body the desktop shows through - the two are one
+    // surface to look at and have to fade together. At the default this
+    // is 1.0 and the colour is the one that was here before.
+    NSColor* const tint = nsColorFromTerminalColor(composer.vtConfig.config->bg, windowTintAlpha(composer, window));
+    // The tint belongs to the title bar *strip*, not to the window.
+    // window.backgroundColor is the whole frame, which is why it could
+    // never have two owners: a quick window that rounds its corners
+    // needs that background transparent, or the corners
+    // WindowImpl::requestCornerRadius() (platform_cocoa.mm) rounds show
+    // a solid opts->bg rectangle instead of the desktop behind them -
+    // the "square ears" the option exists to avoid (F2's report, I7).
+    // A fill view sitting behind the standard buttons in the titlebar
+    // container - exactly the surface AppKit stops painting once
+    // titlebarAppearsTransparent is on, and nothing beyond it - carries
+    // the tint instead, so the two options finally combine: rounded
+    // corners with the desktop showing through them, and a title bar in
+    // the terminal's own background color.
+    NSView* const titlebar = titlebarContainer(window);
+    if (titlebar != nil) {
+        if (titlebarFill == nil) {
+            titlebarFill = [[TerminalTitlebarFillView alloc] initWithFrame:titlebar.bounds];
+            titlebarFill.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+            titlebarFill.wantsLayer = YES;
+            // Behind everything the title bar already holds: the
+            // standard buttons, and the tab strip apply() adds.
+            [titlebar addSubview:titlebarFill positioned:NSWindowBelow relativeTo:nil];
+        }
+        // T4. The strip's colour, and the one line of this method a colour
+        // change can reach.
+        //
+        // With the system's glass behind the window the flat tint is what
+        // has to go: it is opts->bg at the terminal's own alpha, and at the
+        // opacities this option is worn with it covers most of what the
+        // glass would have shown - a solid band across the top of a window
+        // whose body refracts the desktop. A sheet of glass in its place
+        // continues the body instead of interrupting it.
+        //
+        // Inside the fill view rather than beside it: TerminalTitlebarFillView
+        // answers nil to hitTest:, which takes its whole subtree out of hit
+        // testing, and that is what keeps the bare title bar dragging the
+        // window and zooming on a double click.
+        //
+        // The layered window paints no strip at all: the surface and the
+        // terminal panel are both below the title bar, the panel carries a
+        // title bar of its own, and a band across the whole width would cut
+        // through both.
+        if (layeredWindowShown(composer, window)) {
+            dropTitlebarGlass();
+            titlebarFill.layer.backgroundColor = NSColor.clearColor.CGColor;
+        } else if (applyTitlebarGlass(window)) {
+            titlebarFill.layer.backgroundColor = NSColor.clearColor.CGColor;
+        } else {
+            titlebarFill.layer.backgroundColor = tint.CGColor;
         }
     }
+    // Behind the content view the same tint still beats the default
+    // window gray wherever the renderer has not painted yet (a live
+    // resize outruns it) - but only while nobody has made this window
+    // transparent for its rounded corners. That is asked of the live
+    // AppKit state rather than re-derived from opts, deliberately:
+    // requestCornerRadius() sets window.opaque = NO in the same call
+    // that rounds the layer, so both halves of the decision are read
+    // off one moment in time. Deriving it from quickCornerRadius
+    // instead read a fresh config against a layer radius that no
+    // reload re-applies, and a SIGUSR1 that dropped the radius to zero
+    // brought the square ears back on a still-rounded window (R2-qa
+    // round 2, Z3). Order between the two writers does not matter:
+    // whichever runs first, this one stops writing the moment the
+    // window goes transparent, and never writes over clearColor.
+    if (window.opaque) {
+        window.backgroundColor = tint;
+    }
+    // Every color drawRect: mixes in this mode - the accent bar and the
+    // idle text/hairline blends alike - reads opts->bg or opts->fg
+    // straight from composer.opts, so a reload that only changes colors
+    // still needs a repaint even though the tab model itself (project())
+    // never fired. Only reachable here, under transparentTitlebar: the
+    // plain title bar's active fill and system label colors already
+    // track window state AppKit repaints on its own.
+    bar.needsDisplay = YES;
 }
 
-void CsdTabsUi::redraw() {
-    bar.needsDisplay = YES;
-    seam.needsDisplay = YES;
+// True when the strip now carries glass and its own tint must stand down.
+bool CsdTabsUi::applyTitlebarGlass(NSWindow* window) {
+#if UI_SDK_MACOS_26
+    if (@available(macOS 26.0, *)) {
+        if (titlebarFill != nil && windowBackdropIsGlass(window)) {
+            if (titlebarGlass == nil) {
+                NSGlassEffectView* sheet = nil;
+#if UI_SDK_MACOS_27
+                if (@available(macOS 27.0, *)) {
+                    sheet = [[TerminalGlassStripView alloc] initWithFrame:titlebarFill.bounds];
+                }
+#endif
+                if (sheet == nil) {
+                    sheet = [[NSGlassEffectView alloc] initWithFrame:titlebarFill.bounds];
+                }
+                // Clear, where the window's own backdrop is Regular, and
+                // the difference is the whole reason a second sheet is worth
+                // having. Regular frosts what is behind it; the backdrop has
+                // already done that, and frosting a frosted pane again only
+                // takes the colour out of it - measured on a probe, the
+                // strip came out 21 units darker than the body it belongs to
+                // against 7 for Clear, and looked it. Clear is the style
+                // meant for glass laid over something already composed,
+                // which after the backdrop is exactly what this is.
+                sheet.style = NSGlassEffectViewStyleClear;
+                // Square: the strip runs the full width of the window and
+                // meets the frame's own rounded corners, which are already
+                // rounded by the window. On macOS 27 the concentric
+                // configuration on TerminalGlassStripView outranks this and
+                // resolves to the same zero, measured; the line stays because
+                // it is the whole statement on 26.
+                sheet.cornerRadius = 0;
+#if UI_SDK_MACOS_27
+                // The strip is the background of the tab buttons, which is
+                // the case the header names for this flag. Measured on a
+                // probe: no difference at all at rest or under the pointer,
+                // a visible lift under a press, and the lift only where hit
+                // testing gives the glass the event. It does not here -
+                // TerminalTitlebarFillView answers nil to hitTest: and takes
+                // its whole subtree, this sheet included, out of hit testing
+                // so the title bar stays draggable. Set for the same reason
+                // as on the pill: it is what this view is, and the cost at
+                // rest is measured at zero.
+                if (@available(macOS 27.0, *)) {
+                    sheet.effectIsInteractive = YES;
+                }
+#endif
+                // A glass view ships this set NO, and a view in that state
+                // takes its frame from constraints nobody here writes - the
+                // same thing T3 measured on the backdrop.
+                sheet.translatesAutoresizingMaskIntoConstraints = YES;
+                sheet.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+                titlebarGlass = sheet;
+                [titlebarFill addSubview:sheet];
+                if (composer.vtConfig.config->verbose) {
+                    // Both ends printed, not one: the strip's corners differ
+                    // from each other by design from macOS 27 on, and a single
+                    // number would hide exactly the half that has to stay
+                    // square. Zero and zero on macOS 26, where nothing
+                    // resolves anything and cornerRadius is the whole story.
+                    double top = 0;
+                    double bottom = 0;
+#if UI_SDK_MACOS_27
+                    if (@available(macOS 27.0, *)) {
+                        NSViewCornerRadii* const radii = sheet.effectiveCornerRadii;
+                        top = radii == nil ? 0 : (double)(radii.topLeft);
+                        bottom = radii == nil ? 0 : (double)(radii.bottomLeft);
+                    }
+#endif
+                    fprintf(stderr, "%s: tabs: glass under the title bar strip, corner radius %.1f top, %.1f bottom\n", composer.brand->identifierCString(), top, bottom);
+                }
+            }
+            return true;
+        }
+    }
+#endif
+    (void)window;
+    dropTitlebarGlass();
+    return false;
+}
+
+void CsdTabsUi::dropTitlebarGlass() {
+    if (titlebarGlass != nil) {
+        [titlebarGlass removeFromSuperview];
+        [titlebarGlass release];
+        titlebarGlass = nil;
+    }
 }
 
 void CsdTabsUi::tabSelected(size_t index) {
@@ -475,135 +768,132 @@ void CsdTabsUi::tabOpened() {
     }
 }
 
-namespace {
-    // The well over the native title bar: the seam with its glow and
-    // shade, the notch of the active tab filled with
-    // the terminal's background, and the lip inside. Both views over
-    // the title bar draw it whole and clip to their own frames, so the
-    // strokes meet at their shared edge without a seam of their own.
-    static void csdDrawWell(CsdTabsUi* owner, NSRect titlebar, NSAppearance* appearance) {
-        const NSUInteger active = (NSUInteger)(owner->active);
-        const NSRect bounds = titlebar;
-        const TabLayout tabs = owner->layout(bounds.size.width);
-        const WellStyle colors = owner->style(appearance);
-        const CGFloat cellWidth = tabs.cellWidth;
-        const CGFloat height = bounds.size.height;
-        // The notch of the active tab, drawn from the seam up and back down
-        // to it, y up: a flare out of the seam, two rounded top corners, a
-        // flare back in.
-        const CGFloat left = tabs.left + cellWidth * (CGFloat)(active);
-        const CGFloat right = left + cellWidth;
-        const CGFloat fillet = tabs.fillet;
-        const CGFloat radius = tabs.radius;
-        const CGFloat top = height - tabs.inset;
-        NSBezierPath* const notch = [NSBezierPath bezierPath];
-        [notch moveToPoint:NSMakePoint(left - fillet, 0)];
-        [notch appendBezierPathWithArcWithCenter:NSMakePoint(left - fillet, fillet) radius:fillet startAngle:270 endAngle:360 clockwise:NO];
-        [notch lineToPoint:NSMakePoint(left, top - radius)];
-        [notch appendBezierPathWithArcWithCenter:NSMakePoint(left + radius, top - radius) radius:radius startAngle:180 endAngle:90 clockwise:YES];
-        [notch lineToPoint:NSMakePoint(right - radius, top)];
-        [notch appendBezierPathWithArcWithCenter:NSMakePoint(right - radius, top - radius) radius:radius startAngle:90 endAngle:0 clockwise:YES];
-        [notch lineToPoint:NSMakePoint(right, fillet)];
-        [notch appendBezierPathWithArcWithCenter:NSMakePoint(right + fillet, fillet) radius:fillet startAngle:180 endAngle:270 clockwise:NO];
-        // The well outline: the seam along the whole bar, lifted into the
-        // notch. Strokes centered on it leave their outer half on the
-        // material; the fill covers the inner half.
-        // The seam reaches both window edges in every window mode.
-        const CGFloat width = bounds.size.width;
-        NSBezierPath* const outline = [NSBezierPath bezierPath];
-        [outline moveToPoint:NSMakePoint(0, 0)];
-        [outline lineToPoint:NSMakePoint(left - fillet, 0)];
-        [outline appendBezierPath:notch];
-        [outline lineToPoint:NSMakePoint(width, 0)];
-        outline.lineJoinStyle = NSLineJoinStyleRound;
-        // The fill closes below the seam, through the content's top
-        // point, so the notch continues straight into the terminal.
-        NSBezierPath* const well = [[notch copy] autorelease];
-        [well lineToPoint:NSMakePoint(right + fillet, -2)];
-        [well lineToPoint:NSMakePoint(left - fillet, -2)];
-        [well closePath];
-        outline.lineWidth = 4;
-        [colors.glow setStroke];
-        [outline stroke];
-        outline.lineWidth = 2;
-        [colors.shade setStroke];
-        [outline stroke];
-        // The active tab is a piece of the terminal it fronts: its cell
-        // wears the terminal's background and foreground. Idle tabs let
-        // the native title bar show through.
-        [colors.fill setFill];
-        [well fill];
-        [NSGraphicsContext saveGraphicsState];
-        [well addClip];
-        [colors.lip setStroke];
-        [outline stroke];
-        [NSGraphicsContext restoreGraphicsState];
-        // The seam under the idle tabs, in the content's top point:
-        // terminal background with the lip on it, from the window
-        // edges to the active tab's flares.
-        const CGFloat from = 0;
-        const CGFloat to = width;
-        const NSRect bands[2] = {
-            NSMakeRect(from, -1, left - fillet > from ? left - fillet - from : 0, 1),
-            NSMakeRect(right + fillet, -1, to > right + fillet ? to - right - fillet : 0, 1),
-        };
-        for (size_t at = 0; at < 2; ++at) {
-            if (bands[at].size.width <= 0) {
-                continue;
-            }
-            [colors.lip setFill];
-            NSRectFill(bands[at]);
-        }
-    }
+// The trailing new-tab cell is square-ish; everything left of it is
+// split evenly between the tabs. The close glyph answers clicks in a
+// fixed leading zone of each tab.
+static const CGFloat tabPlusWidth = 34;
+static const CGFloat tabCloseZone = 24;
+
+@implementation TerminalTitlebarFillView
+
+// Invisible to the event system, not merely click-through: returning nil
+// keeps every title bar gesture the bare strip offers - drag, double
+// click to zoom, the standard buttons' own tracking - reaching whatever
+// sits above and around this fill, exactly as if it were not there.
+- (NSView*)hitTest:(NSPoint)point {
+    (void)point;
+    return nil;
 }
 
-@implementation CsdTabBarView
+@end
+
+@implementation TerminalChromeHoverView
+
+// Same nil as TerminalTitlebarFillView's, for a stronger reason: this
+// one covers the standard window buttons and the tab strip, and taking
+// their clicks would make the revealed chrome useless. A tracking area
+// is geometric - AppKit delivers entered/exited from the pointer's
+// position, not from hit testing - so being invisible to the event
+// system costs this view nothing it needs.
+- (NSView*)hitTest:(NSPoint)point {
+    (void)point;
+    return nil;
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (self.trackingAreas.count != 0) {
+        return;
+    }
+    // NSTrackingActiveAlways, unlike the content view's own area
+    // (NSTrackingActiveInKeyWindow, platform_cocoa.mm): that one feeds
+    // the terminal's pointer reporting, which has no business firing
+    // for a window the user is not in, while this one has to work
+    // precisely there. Reaching an inactive window's close button means
+    // hovering it before clicking it, and with InKeyWindow the button
+    // would still be invisible at that moment - the chrome would only
+    // appear after a click that landed on nothing. AppKit's own
+    // traffic lights light up on hover in inactive windows for the same
+    // reason.
+    //
+    // NSTrackingInVisibleRect keeps the area in step with the strip as
+    // the window is resized (the rect argument is then ignored), so
+    // there is no geometry to recompute here and none to get wrong.
+    NSTrackingArea* const area = [[NSTrackingArea alloc] initWithRect:NSZeroRect options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect owner:self userInfo:nil];
+    [self addTrackingArea:area];
+    [area release];
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+    (void)event;
+    csdTabsChromeHovered(*composer, true);
+}
+
+- (void)mouseExited:(NSEvent*)event {
+    (void)event;
+    csdTabsChromeHovered(*composer, false);
+}
+
+@end
+
+@implementation TerminalTabBarView
 
 - (BOOL)mouseDownCanMoveWindow {
     return NO;
 }
 
-- (void)viewDidChangeEffectiveAppearance {
-    [super viewDidChangeEffectiveAppearance];
-    owner->redraw();
-}
-
 - (void)drawRect:(NSRect)dirty {
     (void)dirty;
-    // The seam strokes are centered on the view's bottom edge and the
-    // well fill reaches below it. Since macOS 14 a view no longer clips
-    // to its bounds by default, and the outer halves would land on the
-    // terminal's top points as stray lines.
-    NSRectClip(self.bounds);
     NSArray<NSString*>* const labels = owner->labels;
     const NSUInteger count = labels.count;
     if (count == 0) {
         return;
     }
-    // Title bar coordinates, the seam at y = 0: this view starts at the
-    // first tab and one point below the seam; the seam view covers the
-    // gap before it.
-    const CGFloat offset = self.frame.origin.x;
-    const NSRect bounds = NSMakeRect(0, 0, self.frame.size.width + offset, self.bounds.size.height - 1);
-    NSAffineTransform* const shift = [NSAffineTransform transform];
-    [shift translateXBy:-offset yBy:1];
-    [shift concat];
-    csdDrawWell(owner, bounds, self.effectiveAppearance);
     const NSUInteger active = (NSUInteger)(owner->active);
-    const TabLayout tabs = owner->layout(bounds.size.width);
-    const CGFloat cellWidth = tabs.cellWidth;
-    const CGFloat height = bounds.size.height;
-    const Color terminalForeground = owner->composer.opts->vt.fg;
-    NSColor* const activeText = csdColor(terminalForeground, 1.0);
+    const NSRect bounds = self.bounds;
+    const CGFloat tabsWidth = bounds.size.width - tabPlusWidth;
+    const CGFloat cellWidth = tabsWidth / (CGFloat)(count);
+    // With an opaque title bar, the active tab is a piece of the terminal
+    // it fronts: its cell wears the terminal's background and foreground,
+    // and idle tabs stay bare so the title bar's own material shows
+    // through. transparentTitlebar paints that same background onto the
+    // title bar itself (WindowImpl's titlebarAppearsTransparent plus
+    // CsdTabsUi::applyTitlebarColor), so the fill that used to set the
+    // active tab apart would now match its surroundings and vanish; the
+    // accent bar below stands in for it instead.
+    const bool transparentTitlebar = owner->composer.opts->transparentTitlebar;
+    NSColor* const activeFill = nsColorFromTerminalColor(owner->composer.vtConfig.config->bg);
+    NSColor* const activeText = nsColorFromTerminalColor(owner->composer.vtConfig.config->fg);
     NSColor* const activeGlyphs = [activeText colorWithAlphaComponent:0.75];
+    // Only the transparentTitlebar branch below ever fills with this.
+    NSColor* const activeAccent = transparentTitlebar ? nsColorFromTerminalColor(owner->composer.vtConfig.config->cr) : nil;
     // The strip is our own surface, and the system label tiers are tuned
     // for controls on the standard material: tertiary label over a dark
     // title bar measures 1.16:1 against it (issue 84), which is nothing.
     // Every idle tier moves one step up, and the hairlines are mixed from
     // the label color so they keep following the appearance.
-    NSColor* const idleText = NSColor.labelColor;
-    NSColor* const idleGlyphs = NSColor.secondaryLabelColor;
-    NSColor* const hairline = [NSColor.labelColor colorWithAlphaComponent:0.4];
+    //
+    // That fix assumed the title bar's own material stays in step with
+    // NSAppearance, which transparentTitlebar breaks: the title bar now
+    // wears opts->bg, a color the window's appearance (and so the system
+    // label tiers) knows nothing about. A user on a light system theme
+    // with the project's own default dark bg measured out at 1.60:1 -
+    // effectively invisible, and the hairlines marking tab boundaries
+    // disappeared with it, since they are mixed from the same tier.
+    // Flipping window.appearance by opts->bg's brightness would drag the
+    // tiers back in step, but they would still be blind to opts->bg's
+    // actual color, same as the pre-fix issue 84 case; every idle color
+    // here is mixed straight from opts->fg and opts->bg instead, so idle
+    // tabs are legible by construction against the exact bg painted
+    // above, independent of the system theme entirely - not just brought
+    // back in step with it. The active tab keeps the full fg strength;
+    // idle tabs sit further toward bg so the active one reads as the
+    // brighter of the two without a fill to say so anymore, and the
+    // hairline sits furthest toward bg of the three, same low-emphasis
+    // role the alpha-faded label color played before.
+    NSColor* const idleText = transparentTitlebar ? [activeText blendedColorWithFraction:0.4 ofColor:activeFill] : NSColor.labelColor;
+    NSColor* const idleGlyphs = transparentTitlebar ? [activeText blendedColorWithFraction:0.55 ofColor:activeFill] : NSColor.secondaryLabelColor;
+    NSColor* const hairline = transparentTitlebar ? [activeText blendedColorWithFraction:0.68 ofColor:activeFill] : [NSColor.labelColor colorWithAlphaComponent:0.4];
     NSMutableParagraphStyle* const centered = [[[NSMutableParagraphStyle alloc] init] autorelease];
     centered.alignment = NSTextAlignmentCenter;
     // Long shell titles differ at the tail; keep it, iTerm style.
@@ -630,22 +920,49 @@ namespace {
     };
     const auto drawGlyph = [&](NSString* glyph, CGFloat x, NSDictionary* attributes) {
         const NSSize size = [glyph sizeWithAttributes:attributes];
-        [glyph drawAtPoint:NSMakePoint(x, bounds.origin.y + (height - size.height) / 2) withAttributes:attributes];
+        [glyph drawAtPoint:NSMakePoint(x, bounds.origin.y + (bounds.size.height - size.height) / 2) withAttributes:attributes];
     };
     for (NSUInteger at = 0; at < count; ++at) {
-        const NSRect cell = NSMakeRect(tabs.left + cellWidth * (CGFloat)(at), bounds.origin.y, cellWidth, height);
-        // Hairlines separate bare cells only; the well draws its own
-        // edges. The leftmost tab has the drag gap to its left, and that
-        // seam wants the same line unless the tab itself is the well.
+        const NSRect cell = NSMakeRect(bounds.origin.x + cellWidth * (CGFloat)(at), bounds.origin.y, cellWidth, bounds.size.height);
+        if (at == active) {
+            if (transparentTitlebar) {
+                // A solid opts->bg fill would be invisible against the
+                // now-matching title bar behind it, so the active tab is
+                // marked with a cursor-colored bar along its bottom edge
+                // instead. cr is guaranteed distinct from bg - the cursor
+                // itself would be invisible in the grid otherwise - but
+                // not from fg: options.cpp defaults cr to fg when unset,
+                // in which case the bar simply matches the active text,
+                // which is harmless here. Either way it reads the same
+                // way the terminal's own cursor does: "the active thing
+                // is here".
+                [activeAccent setFill];
+                NSRectFill(NSMakeRect(cell.origin.x, cell.origin.y, cell.size.width, 2));
+            } else {
+                // Everything but the top point: that row is where the
+                // window's own frame edge lives, and an opaque fill over
+                // it darkens the border itself rather than the title bar.
+                [activeFill setFill];
+                NSRectFill(NSMakeRect(cell.origin.x, cell.origin.y, cell.size.width, cell.size.height - 1));
+            }
+        }
+        // Hairlines separate bare cells only; the active tab draws its
+        // own edge - a solid fill in the plain title bar, the accent
+        // bar's own left/right extent under transparentTitlebar (see
+        // above). A hairline touching either would double up on that
+        // edge and read as a wall boxing the active tab in, which is
+        // exactly what the accent bar alone is meant to avoid. The
+        // leftmost tab has the drag gap to its left, and that seam wants
+        // the same line unless the tab itself is the marked one.
         if (at != active && (at == 0 || at - 1 != active)) {
             [hairline setFill];
-            NSRectFillUsingOperation(NSMakeRect(cell.origin.x, cell.origin.y + 7, 1, height - 14), NSCompositingOperationSourceOver);
+            NSRectFillUsingOperation(NSMakeRect(cell.origin.x, cell.origin.y + 4, 1, cell.size.height - 8), NSCompositingOperationSourceOver);
         }
         NSDictionary* const glyphAttributes = at == active ? activeGlyphAttributes : idleGlyphAttributes;
-        drawGlyph(@"×", cell.origin.x + 9, glyphAttributes);
+        drawGlyph(@"\u00d7", cell.origin.x + 9, glyphAttributes);
         CGFloat trailing = 8;
         if (at < 9) {
-            NSString* const hint = [NSString stringWithFormat:@"⌘%u", (unsigned)(at + 1)];
+            NSString* const hint = [NSString stringWithFormat:@"\u2318%u", (unsigned)(at + 1)];
             const NSSize hintSize = [hint sizeWithAttributes:glyphAttributes];
             trailing += hintSize.width + 8;
             drawGlyph(hint, NSMaxX(cell) - 8 - hintSize.width, glyphAttributes);
@@ -653,24 +970,24 @@ namespace {
         NSDictionary* const attributes = at == active ? activeAttributes : idleAttributes;
         NSString* const label = labels[at];
         const NSSize size = [label sizeWithAttributes:attributes];
-        const CGFloat leading = csdTabCloseZone;
+        const CGFloat leading = tabCloseZone;
         const CGFloat available = cell.size.width - leading - trailing;
         if (available <= 0) {
             continue;
         }
-        const NSRect text = NSMakeRect(cell.origin.x + leading, cell.origin.y + (height - size.height) / 2, available, size.height);
+        const NSRect text = NSMakeRect(cell.origin.x + leading, cell.origin.y + (cell.size.height - size.height) / 2, available, size.height);
         [label drawWithRect:text options:NSStringDrawingUsesLineFragmentOrigin attributes:attributes context:nil];
     }
     // The trailing new-tab cell: bare material, a plus, and a hairline
-    // against the last tab unless the well already draws that edge.
-    const CGFloat plusLeft = tabs.left + tabs.tabsWidth;
+    // against the last tab unless the active tab already draws that edge
+    // itself - same reasoning as the loop above.
     if (count - 1 != active) {
         [hairline setFill];
-        NSRectFillUsingOperation(NSMakeRect(plusLeft, bounds.origin.y + 7, 1, height - 14), NSCompositingOperationSourceOver);
+        NSRectFillUsingOperation(NSMakeRect(bounds.origin.x + tabsWidth, bounds.origin.y + 4, 1, bounds.size.height - 8), NSCompositingOperationSourceOver);
     }
     NSString* const plus = @"+";
     const NSSize plusSize = [plus sizeWithAttributes:idleGlyphAttributes];
-    drawGlyph(plus, plusLeft + (csdTabPlusWidth - plusSize.width) / 2, idleGlyphAttributes);
+    drawGlyph(plus, bounds.origin.x + tabsWidth + (tabPlusWidth - plusSize.width) / 2, idleGlyphAttributes);
 }
 
 - (void)mouseDown:(NSEvent*)event {
@@ -679,51 +996,22 @@ namespace {
         return;
     }
     const NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
-    const TabLayout tabs = owner->layout(self.frame.size.width + self.frame.origin.x);
-    // Local x runs from the first tab.
-    const CGFloat x = point.x;
-    if (x < 0) {
-        return;
-    }
-    if (x >= tabs.tabsWidth) {
+    const NSRect bounds = self.bounds;
+    const CGFloat tabsWidth = bounds.size.width - tabPlusWidth;
+    if (point.x >= bounds.origin.x + tabsWidth) {
         owner->tabOpened();
         return;
     }
-    NSUInteger index = (NSUInteger)(x / tabs.cellWidth);
+    const CGFloat cellWidth = tabsWidth / (CGFloat)(count);
+    NSUInteger index = (NSUInteger)((point.x - bounds.origin.x) / cellWidth);
     if (index >= count) {
         index = count - 1;
     }
-    if (x - tabs.cellWidth * (CGFloat)(index) < csdTabCloseZone) {
+    if (point.x - bounds.origin.x - cellWidth * (CGFloat)(index) < tabCloseZone) {
         owner->tabClosed((size_t)(index));
         return;
     }
     owner->tabSelected((size_t)(index));
-}
-
-@end
-
-@implementation CsdSeamView
-
-- (BOOL)mouseDownCanMoveWindow {
-    return YES;
-}
-
-- (NSView*)hitTest:(NSPoint)point {
-    (void)point;
-    return nil;
-}
-
-- (void)drawRect:(NSRect)dirty {
-    (void)dirty;
-    NSRectClip(self.bounds);
-    if (owner->labels.count == 0) {
-        return;
-    }
-    const NSRect titlebar = NSMakeRect(0, 0, self.superview.bounds.size.width, self.bounds.size.height - 1);
-    NSAffineTransform* const shift = [NSAffineTransform transform];
-    [shift translateXBy:0 yBy:1];
-    [shift concat];
-    csdDrawWell(owner, titlebar, self.effectiveAppearance);
 }
 
 @end

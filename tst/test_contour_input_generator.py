@@ -116,6 +116,14 @@ class ContourInputGeneratorTest(unittest.TestCase):
                             # (the issue 82 reservation); the chord is
                             # the frontend's and never reaches the pty.
                             continue
+                        if (
+                            TEST_PLATFORM == "cocoa"
+                            and modifiers == SUPER | ALT
+                        ):
+                            # Cmd+Opt+arrows move between the panes of a
+                            # split on macOS; like the chord above they
+                            # are the frontend's and never reach the pty.
+                            continue
                         terminal.frontend_key_event(
                             key, PRESS, modifiers=modifiers
                         )

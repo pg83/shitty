@@ -43,12 +43,12 @@ class ResizeSameGridPixelsTest(unittest.TestCase):
             self.assertEqual(terminal.winsize(), (5, 3))
             self.assertGreater(after, before)
 
-    def test_layout_change_does_not_report_a_terminal_resize(self):
+    def test_in_band_resize_reports_same_grid_for_pixel_only_change(self):
         with Shitty(columns=5, rows=3, glyph_px=4, glyph_py=8) as terminal:
             terminal.write(b"\x1b[?2048h")
             self.assertEqual(terminal.read_input(), b"\x1b[48;3;5;24;20t")
             terminal.resize_pixels(25, 35)
-            self.assertEqual(terminal.read_input(), b"")
+            self.assertEqual(terminal.read_input(), b"\x1b[48;3;5;24;20t")
 
 
 if __name__ == "__main__":

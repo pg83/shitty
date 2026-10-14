@@ -2,6 +2,7 @@
 # MIT licensed
 # See the file LICENSE.MIT for the full license.
 
+import select
 import socket
 import subprocess
 import os
@@ -147,13 +148,42 @@ VGA_PIN = (
     "-color15", "#ffffff",
 )
 
+# How long a single command may wait for its reply. A terminal that dies
+# hangs up and every read fails at once, but one that spins - the tab
+# walk CLOSE_SESSION used to do is the worked example - stays connected
+# and silent, and a wait with no bound on it turns that into a CI job
+# hanging until the runner's own timeout rather than a red test. Well
+# past anything a healthy command takes: the whole pane suite answers in
+# under a second.
+#
+# The bound belongs on the read, through select() below, and NOT on the
+# socket: settimeout() puts the fd into non-blocking mode, and a
+# non-blocking send() stops at whatever fits in the socket's send buffer
+# (8 KiB for a macOS socketpair) instead of queueing the whole message.
+# The one send() per command that makefile("rwb", buffering=0) does then
+# truncates every command longer than that, mid-hex, and the terminal
+# answers the mangled line with "invalid hex input" - see
+# test_harness_reply_timeout.py, which pins this down.
+REPLY_TIMEOUT = 10
+
+
+def ShittyWithTabs(*args, extra_arguments=(), **kwargs):
+    """A Shitty whose window holds more than one tab.
+
+    On Linux st is one shell to a window unless -tabs says otherwise
+    (bin/st/main.cpp, defaultFor): the tab chords stay the program's and
+    a second session cannot be opened. Tests about several sessions ask
+    for tabs out loud rather than lean on a platform's default."""
+    return Shitty(*args, extra_arguments=("-tabs", *extra_arguments), **kwargs)
+
 
 class Shitty:
     def __init__(
         self, columns=80, rows=24, save_lines=500,
         glyph_px=1, glyph_py=1,
         font_size_env=None, extra_arguments=(), extra_environment=None,
-        binary=None, pin_vga=True, pin_border=True,
+        binary=None, pin_vga=True, pin_border=True, pin_natural_editing=True,
+        capture_stderr=False,
     ):
         parent, child = socket.socketpair()
         self.socket = parent
@@ -188,13 +218,32 @@ class Shitty:
                 # default scheme cannot shift color assertions. Scheme
                 # tests opt out with pin_vga=False.
                 *(VGA_PIN if pin_vga else ()),
+                # T8. naturalEditing is on by default now, and it is an
+                # input-layer preset: it claims the Option and Command
+                # chords before anything reaches the pty. Every keyboard
+                # conformance suite here asks what bytes a chord
+                # produces, so it is pinned off for the reason the
+                # palette is pinned to VGA - an ambient default must not
+                # be the one answering. Thirteen tests across seven
+                # files reddened on the default alone. Tests about the
+                # preset itself opt out with pin_natural_editing=False.
+                *(("+naturalEditing",) if pin_natural_editing else ()),
                 *map(str, extra_arguments),
             ],
             pass_fds=(child.fileno(),),
             env=child_environment,
+            # F10: off by default so every existing test keeps seeing the
+            # terminal's diagnostics on the runner's own stderr. A test
+            # that asks for the pipe must read it only after close(),
+            # through stderr_text() below: nobody drains it while the
+            # process runs, so a child that filled the pipe would block.
+            # Startup warnings - the only thing this exists for - are
+            # written before READY and fit many times over.
+            stderr=subprocess.PIPE if capture_stderr else None,
         )
         self._glyph_px = glyph_px
         self._glyph_py = glyph_py
+        self._stderr = None
         child.close()
         self._window_info = {
             "x": 10,
@@ -216,9 +265,34 @@ class Shitty:
             try:
                 self.command("QUIT")
             finally:
-                self.process.wait(timeout=5)
+                try:
+                    if self.process.stderr is not None:
+                        # communicate() drains the pipe and reaps the
+                        # child; wait() alone can deadlock against a full
+                        # pipe.
+                        self._stderr = self.process.communicate(timeout=5)[1]
+                    else:
+                        self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # QUIT never landed, which is the failure the test
+                    # above is already reporting. Leaving the terminal
+                    # running would hand it to every test after this one -
+                    # a spinning one keeps a core busy for the rest of the
+                    # suite - so it goes down here either way.
+                    self.process.kill()
+                    self.process.wait()
         self.stream.close()
         self.socket.close()
+
+    def stderr_text(self):
+        """Everything the terminal wrote to stderr, valid after close().
+
+        Requires capture_stderr=True at construction; without it the
+        child's stderr is the runner's and there is nothing to return.
+        """
+        if self._stderr is None:
+            raise RuntimeError("construct with capture_stderr=True to read stderr")
+        return self._stderr
 
     def __enter__(self):
         return self
@@ -233,6 +307,10 @@ class Shitty:
                 line = bytes(self._receive_buffer[:newline])
                 del self._receive_buffer[:newline + 1]
                 return line.decode("ascii")
+            # The bound goes here rather than on the socket, which has to
+            # stay blocking for writes to arrive whole; see REPLY_TIMEOUT.
+            if not select.select([self.socket], (), (), REPLY_TIMEOUT)[0]:
+                raise RuntimeError(f"shitty gave no reply within {REPLY_TIMEOUT}s")
             chunk = self.socket.recv(64 * 1024)
             if not chunk:
                 raise RuntimeError(f"shitty exited with {self.process.poll()}")
@@ -268,7 +346,15 @@ class Shitty:
         result = {}
         for field in response[1:]:
             name, value = field.split("=", 1)
-            result[name] = int(value)
+            # Most fields are numbers, but not all of them: background_blur
+            # prints the mode's name, because the numeric value of the
+            # enum behind it is deliberately not a contract. int() applied
+            # to every field would turn that into a ValueError in every
+            # caller of options(), not only in the ones that read it.
+            try:
+                result[name] = int(value)
+            except ValueError:
+                result[name] = value
         return result
 
     def argv(self):
@@ -559,6 +645,57 @@ class Shitty:
         """Close the session at index; a neighbour becomes active."""
         self.command(f"CLOSE_SESSION {index}")
 
+    def split(self, direction="V"):
+        """Divide the focused pane, as the split chord does.
+
+        Needs the terminal started with extra_arguments=("-panes",): the
+        option is off by default, and without it SessionSet declines the
+        split and the command answers ERR rather than moving the pane
+        count.
+        """
+        self.command(f"SPLIT {direction}")
+
+    def _pane_numbers(self, command, count):
+        """`count` numbers from a pane query, or the terminal's own ERR.
+
+        A pane index nothing answers to is a failed command and not a
+        dead terminal, so the message it comes back with is worth
+        keeping: "no such pane" reads better than a shape complaint.
+        """
+        self.stream.write(command.encode("ascii") + b"\n")
+        response = self._readline().split()
+        if response and response[0] == "ERR":
+            raise RuntimeError(" ".join(response[1:]))
+        if len(response) != count + 1 or response[0] != "OK":
+            raise RuntimeError(f"invalid response to {command}")
+        return tuple(map(int, response[1:]))
+
+    def pane_count(self):
+        """How many panes the active tab shows."""
+        return self._pane_numbers("PANE_COUNT", 1)[0]
+
+    def focus_pane(self, index):
+        """Give pane index the input focus."""
+        self.command(f"FOCUS_PANE {index}")
+
+    def winsize_pane(self, index):
+        """(columns, rows) of pane index, read off that pane's own pty."""
+        return self._pane_numbers(f"WINSIZE_PANE {index}", 2)
+
+    def screen_text_pane(self, index):
+        """Pane index's visible screen, in the shape screen_text() uses.
+
+        Read from that pane's own screen rather than from the renderer,
+        which retains the cells of whichever pane it drew last and so has
+        one answer for the whole window.
+        """
+        return self._read_hex_response(f"SCREEN_TEXT_PANE {index}").decode("ascii")
+
+    def write_to_pane(self, index, output):
+        """Pane index's shell produced bytes: they parse into that pane's
+        terminal alone, focused or not."""
+        self.command(f"PTY_WRITE_PANE {index} " + output.hex())
+
     def write_to(self, index, output):
         """Session index's shell produced bytes: they parse into that
         session's terminal whether or not it is the one shown."""
@@ -587,6 +724,33 @@ class Shitty:
 
     def chord_clear(self):
         self._chord("L", 8 if TEST_PLATFORM == "cocoa" else 2 | 1)
+
+    def _font_chord(self, character, text, modifiers):
+        """One font-size chord, as this platform binds it.
+
+        Cmd+key on macOS against a Ctrl form elsewhere
+        (input_bindings.cpp), and elsewhere the binding also wants the
+        text event the layout produces under that chord - '+' under
+        Ctrl+Shift+=, not '='. A test that spells one platform's pair by
+        hand passes on that platform and silently does nothing on the
+        other: the font never changes, and what the test then measures is
+        a terminal that ignored it.
+        """
+        if TEST_PLATFORM == "cocoa":
+            self._chord(character, 8)
+            return
+        self.frontend_key_event(ord(character), 1, modifiers=modifiers)
+        self.frontend_text_event(text, modifiers=modifiers)
+        self.frontend_key_event(ord(character), 0, modifiers=modifiers)
+
+    def chord_font_increase(self):
+        self._font_chord("=", "+", 2 | 1)
+
+    def chord_font_decrease(self):
+        self._font_chord("-", "-", 2)
+
+    def chord_font_reset(self):
+        self._font_chord("0", "0", 2)
 
     def session_state(self):
         """(session count, active index) for the window's terminals."""
@@ -785,6 +949,10 @@ class Shitty:
     def _read_hex_response(self, command):
         self.stream.write(command.encode("ascii") + b"\n")
         response = self._readline().split(" ", 1)
+        if response[0] == "ERR":
+            # What the terminal refused, said in its own words - the way
+            # command() reports it. A bad pane index arrives here.
+            raise RuntimeError(response[1] if len(response) == 2 else "")
         if response[0] != "OK":
             raise RuntimeError(f"invalid response to {command}")
         return bytes.fromhex(response[1]) if len(response) == 2 else b""

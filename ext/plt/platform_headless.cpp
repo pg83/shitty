@@ -53,6 +53,8 @@ namespace {
         explicit WindowHeadlessImpl(const WindowOptions& options);
 
         void requestShow() override;
+        void requestHide() override;
+        void requestShowAt(ShowPlacement placement) override;
         void requestClose() override;
         void requestFrame() override;
         void requestTitle(StringView title) override;
@@ -63,6 +65,7 @@ namespace {
         void requestFocus() override;
         void requestMaximized(bool maximized) override;
         void requestFullscreen(bool fullscreen) override;
+        void requestCornerRadius(u16 radius) override;
         void requestResize(u32 width, u32 height) override;
         void requestMinimumSize(u32 width, u32 height) override;
         void requestResizeUnit(u32 width, u32 height, u32 baseWidth, u32 baseHeight) override;
@@ -72,6 +75,7 @@ namespace {
         void requestOpenUri(StringView uri) override;
         void requestTextInputRect(i32 x, i32 y, u32 width, u32 height) override;
         WindowInfo info() const override;
+        bool visible() const override;
         bool inLiveResize() const override;
         RenderContext renderContext() const override;
 
@@ -81,6 +85,9 @@ namespace {
         void failNextPresentation() override;
         HeadlessFrame presentedFrame() const override;
         void setClipboards(Clipboard& primary, Clipboard& secondary) override;
+        WindowSizeRequest requestedMinimumSize() const override;
+        WindowResizeUnitRequest requestedResizeUnit() const override;
+        WindowTextInputRect requestedTextInputRect() const override;
         PointerIcon pointerIcon() const override;
         stl::StringView openedUri() const override;
         u64 openUriCount() const override;
@@ -97,6 +104,9 @@ namespace {
         WindowInfo info_;
         WindowInfo restored_;
         PointerIcon icon_ = PointerIcon::Default;
+        WindowSizeRequest minimumSize_;
+        WindowResizeUnitRequest resizeUnit_;
+        WindowTextInputRect textInputRect_;
         std::vector<u8> title_;
         std::vector<u8> uri_;
         u64 openCount_ = 0;
@@ -110,6 +120,7 @@ namespace {
         bool failNext_ = false;
         bool haveRestored_ = false;
         bool closed_ = false;
+        bool shown_ = false;
     };
 
     struct PlatformHeadless final: Platform {
@@ -178,7 +189,20 @@ WindowHeadlessImpl::WindowHeadlessImpl(const WindowOptions& options)
 }
 
 void WindowHeadlessImpl::requestShow() {
+    shown_ = true;
     requestFrame();
+}
+
+void WindowHeadlessImpl::requestHide() {
+    // No visible frame to withhold in the headless harness, but shown_
+    // still flips so visible() gives a real show/hide cycle for tests to
+    // assert against - the one thing this backend can offer here.
+    shown_ = false;
+}
+
+void WindowHeadlessImpl::requestShowAt(ShowPlacement) {
+    // Single fixed virtual screen, so every placement is the same show.
+    requestShow();
 }
 
 void WindowHeadlessImpl::requestClose() {
@@ -270,6 +294,11 @@ void WindowHeadlessImpl::requestFullscreen(bool fullscreen) {
     dispatchFrame();
 }
 
+// No visible surface to round; same scope as
+// WindowOptions::quickCornerRadius already documents (window.h).
+void WindowHeadlessImpl::requestCornerRadius(u16) {
+}
+
 void WindowHeadlessImpl::requestResize(u32 width, u32 height) {
     if (width == 0 || height == 0) {
         return;
@@ -279,10 +308,32 @@ void WindowHeadlessImpl::requestResize(u32 width, u32 height) {
     requestFrame();
 }
 
-void WindowHeadlessImpl::requestMinimumSize(u32, u32) {
+// Recorded rather than ignored: these two are the only geometry a
+// window is told about that it never reports back, so a caller that
+// pairs a width with a height axis has no observable effect anywhere -
+// on a real desktop the window manager quietly obeys the swap. Keeping
+// the pair lets a test read the hand-off itself instead of only the
+// arithmetic that produced it.
+void WindowHeadlessImpl::requestMinimumSize(u32 width, u32 height) {
+    minimumSize_.width = width;
+    minimumSize_.height = height;
+    ++minimumSize_.count;
 }
 
-void WindowHeadlessImpl::requestResizeUnit(u32, u32, u32, u32) {
+void WindowHeadlessImpl::requestResizeUnit(u32 width, u32 height, u32 baseWidth, u32 baseHeight) {
+    resizeUnit_.width = width;
+    resizeUnit_.height = height;
+    resizeUnit_.baseWidth = baseWidth;
+    resizeUnit_.baseHeight = baseHeight;
+    ++resizeUnit_.count;
+}
+
+WindowSizeRequest WindowHeadlessImpl::requestedMinimumSize() const {
+    return minimumSize_;
+}
+
+WindowResizeUnitRequest WindowHeadlessImpl::requestedResizeUnit() const {
+    return resizeUnit_;
 }
 
 Clipboard* WindowHeadlessImpl::primary() {
@@ -360,7 +411,22 @@ StringView WindowHeadlessImpl::title() const {
     return StringView(title_.data(), title_.size());
 }
 
-void WindowHeadlessImpl::requestTextInputRect(i32, i32, u32, u32) {
+// Recorded for the same reason as the sizing pair above: the anchor is
+// where the input method draws its candidate window, and nothing else in
+// the tree reads it back. Its x comes from the horizontal inset and its y
+// from the vertical one - a swap that was equivalent arithmetic until
+// window chrome began reserving a single edge, and a candidate window a
+// title bar's height above the caret afterwards.
+void WindowHeadlessImpl::requestTextInputRect(i32 x, i32 y, u32 width, u32 height) {
+    textInputRect_.x = x;
+    textInputRect_.y = y;
+    textInputRect_.width = width;
+    textInputRect_.height = height;
+    ++textInputRect_.count;
+}
+
+WindowTextInputRect WindowHeadlessImpl::requestedTextInputRect() const {
+    return textInputRect_;
 }
 
 bool WindowHeadlessImpl::inLiveResize() const {
@@ -369,6 +435,10 @@ bool WindowHeadlessImpl::inLiveResize() const {
 
 WindowInfo WindowHeadlessImpl::info() const {
     return info_;
+}
+
+bool WindowHeadlessImpl::visible() const {
+    return shown_;
 }
 
 RenderContext WindowHeadlessImpl::renderContext() const {

@@ -13,6 +13,9 @@
 
 #include <plt/window.h>
 
+#include <stddef.h>
+
+struct Vterm;
 struct VtermTitleChanged;
 
 // Every way the terminal reaches past pure byte-stream semantics: the
@@ -28,8 +31,6 @@ struct VtHost {
     virtual plt::WindowInfo info() = 0;
     virtual void requestFrame() = 0;
     virtual void requestResize(u32 width, u32 height) = 0;
-    virtual void requestResizeCells(u32 columns, u32 rows) = 0;
-    virtual VtGridSize gridSize(u32 pixelWidth, u32 pixelHeight) = 0;
     virtual void requestMaximized(bool maximized) = 0;
     virtual void requestFullscreen(bool fullscreen) = 0;
     virtual void requestIconify() = 0;
@@ -46,7 +47,47 @@ struct VtHost {
     // A terminal published its undecorated title; the embedder decides
     // whether the source is visible and how a window presents it.
     virtual void titleChanged(const VtermTitleChanged& event) = 0;
-    // The presenting client committed new terminal dimensions; every
-    // terminal sharing them must hear the change.
+    // The grid geometry moved under an in-band resize the core applied
+    // itself; every terminal behind the window must hear it.
     virtual void resized() = 0;
+    // A1/A10: what the window reserves on each side before any pane may
+    // draw - the user's border plus whatever chrome (a sidebar, a
+    // titlebar strip) took - in physical pixels. The core divides the
+    // *window's* pixels by these when an application asks how much grid
+    // fits in them (CSI 18t / 19t, CSI 8t); they are never a pane's,
+    // whose own border arrives in VtGeometry::insets and carries no
+    // chrome at all. Substituting one for the other compiles and
+    // answers plausibly, which is why they come from different places.
+    //
+    // Asked rather than held: the reserve moves under cmd+b, a font
+    // change and a display of another scale, and a core that kept a
+    // copy would be a second place that knows how much is taken on the
+    // left. Returned by value for the same reason - the embedder
+    // composes it out of two other numbers and has nowhere to keep it.
+    virtual VtInsets contentInsets() = 0;
+    // The core applied an in-band resize (CSI 4t / CSI 8t / CSI 9t) and
+    // has already asked the window for it through requestResize(). This
+    // commits the same size on the embedder's own surface without
+    // waiting for the platform to call back, which is what makes the
+    // grid and the child's resize a consequence of the escape sequence
+    // rather than of the next frame. Upstream's core writes its own
+    // VtGeometry here; ours cannot, because counting the window's grid
+    // needs contentInsets() and A1 leaves the points-to-pixels
+    // conversion with the embedder.
+    //
+    // Not a duplicate of requestResize(): that one asks the platform,
+    // and in the two embedders with no frame loop - the headless
+    // adapter and the C facade - nothing else would ever reach the pane
+    // or the child. Where a frame does come back it carries the size
+    // the window manager actually granted, which is not the size that
+    // was asked for whenever it refuses.
+    virtual void surfaceResized(u32 width, u32 height) = 0;
+    // A11: how many cells every live pane behind this window holds,
+    // except one. The core sizes the shared cell-extra store by the sum
+    // over the panes, and only the embedder has the list; the exception
+    // is the caller, which adds its own count itself because it may not
+    // be in the list yet at the moment it asks. An embedder with no
+    // list at all - the headless adapter, the C facade - answers zero,
+    // and then the caller is the only pane there is.
+    virtual size_t cellCapacityExcept(const Vterm* except) = 0;
 };

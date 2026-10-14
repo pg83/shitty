@@ -204,10 +204,10 @@ void CoreTextFont::render(const u32* codepoints, size_t count, u16 cells, void* 
         u16 column = 0;
         SpanCluster cluster;
         SpanCluster next;
-        bool haveNext = composer_.opts->vt.widths.nextSpanCluster(codepoints, count, position, next);
+        bool haveNext = composer_.vtConfig.config->widths.nextSpanCluster(codepoints, count, position, next);
         while (haveNext) {
             cluster = next;
-            haveNext = composer_.opts->vt.widths.nextSpanCluster(codepoints, count, position, next);
+            haveNext = composer_.vtConfig.config->widths.nextSpanCluster(codepoints, count, position, next);
             const bool nextBlank = haveNext && next.count == 1 && codepoints[next.begin] == ' ';
             const bool capturedBlank = nextBlank && column + 1 < cells;
             const bool fitted = cluster.cells == 1 && cluster.count == 1 && puaSymbol(codepoints[cluster.begin]) && !capturedBlank;
@@ -833,7 +833,7 @@ Font* CoreTextFontRenderer::render(ObjPool& owner, IntrusivePtr<FontFace> face, 
         CFRelease(font);
         return nullptr;
     }
-    if (composer.opts->vt.verbose) {
+    if (composer.vtConfig.config->verbose) {
         sysO << StringView(u8"coretext face: kind ") << (u64)((u8)(kind)) << StringView(u8" at ") << pixels << StringView(u8"px, cell ") << actual.width << StringView(u8"x") << actual.height << StringView(u8" baseline ") << actual.baseline << StringView(u8"\n");
     }
     if (kind == FontKind::Primary) {

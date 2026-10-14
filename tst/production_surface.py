@@ -3,7 +3,9 @@
 # See the file LICENSE.MIT for the full license.
 
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +44,33 @@ class ProductionSurfaceTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"unknown option: --test-fd", result.stderr)
+
+    def test_st_is_the_bare_window_and_pt_the_chrome_on_linux(self):
+        # bin/st/main.cpp: on Linux st's own defaults turn tabs, panes and
+        # decorations off; pt keeps the table's. Everywhere else the two
+        # binaries agree.
+        def defaults(binary):
+            result = subprocess.run(
+                [str(binary), "-help"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+            found = {}
+            for name in ("tabs", "panes", "no-decorations"):
+                match = re.search(rb"^  -" + name.encode() + rb" .*\(default: (\w+)\)$", result.stdout, re.MULTILINE)
+                self.assertIsNotNone(match, name)
+                found[name] = match.group(1).decode()
+            return found
+
+        pretty = {"tabs": "true", "panes": "true", "no-decorations": "false"}
+        self.assertEqual(defaults(PRETTY_BINARY), pretty)
+        if sys.platform.startswith("linux"):
+            self.assertEqual(defaults(PRODUCTION_BINARY), {"tabs": "false", "panes": "false", "no-decorations": "true"})
+        else:
+            self.assertEqual(defaults(PRODUCTION_BINARY), pretty)
 
     def test_version_probe_exits_before_window_startup(self):
         expected = (

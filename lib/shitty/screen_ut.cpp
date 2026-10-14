@@ -371,6 +371,56 @@ STD_TEST_SUITE(Screen) {
         STD_INSIST(!hasDamage(*screen));
     }
 
+    // R5: row identities come from one process-wide sequence, not one
+    // per screen. The window shapes every pane through a single
+    // SpanShaper (Composer::shaper), and that shaper caches a shaped row
+    // under this value and nothing else - no screen, no pane. Two
+    // screens handing out the same number would therefore have one of
+    // them drawn from the other's glyphs, silently, and only in the
+    // cells where their contents differ.
+    //
+    // Nothing about a per-screen counter fails to compile, and no test
+    // that holds one screen can notice it: the numbers look perfectly
+    // well-behaved from inside either screen. Hence this one - two live
+    // screens, and no identity shared between them or reused within
+    // them. render_arena.h names it as the assumption the Metal arena
+    // mirror rests on.
+    STD_TEST(RowIdentitiesNeverRepeatAcrossScreens) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 16));
+        TerminalColors colors;
+        configureColors(colors);
+
+        Screen* const first = Screen::createPrimary(composer.extras, *pool, 4, 2, &colors, 0);
+        Screen* const second = Screen::createPrimary(composer.extras, *pool, 4, 2, &colors, 0);
+
+        // Different text on the second pass, so that a row rewritten
+        // with the content it already holds cannot be what mints the
+        // fresh identity.
+        const u8 text[2][4] = {{'a', 'b', 'c', 'd'}, {'e', 'f', 'g', 'h'}};
+        u64 ids[8] = {};
+        size_t count = 0;
+        for (u16 pass = 0; pass < 2; ++pass) {
+            for (u16 row = 0; row < 2; ++row) {
+                first->writeAsciiRun(row, 0, text[pass], 4, attributes(), 0, 0, TerminalCell{});
+                ids[count++] = first->viewRow(row).id;
+                second->writeAsciiRun(row, 0, text[pass], 4, attributes(), 0, 0, TerminalCell{});
+                ids[count++] = second->viewRow(row).id;
+            }
+        }
+
+        STD_INSIST(count == 8);
+        for (size_t index = 0; index < count; ++index) {
+            // Zero is what viewRow() answers for a row that is not
+            // there, and an identity is never it.
+            STD_INSIST(ids[index] != 0);
+            for (size_t other = index + 1; other < count; ++other) {
+                STD_INSIST(ids[index] != ids[other]);
+            }
+        }
+    }
+
     STD_TEST(WritesSixelCellsWithSharedPalette) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());

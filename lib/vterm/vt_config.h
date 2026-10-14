@@ -33,6 +33,8 @@ struct VtConfig {
     Color fg{};
     AnsiPalette palette{};
     bool altScrollMode = false;
+    // The command-line editor at a shell prompt (prompt_editor.h).
+    bool promptEditor = false;
     bool altSendsEscape = false;
     bool autoCopyMode = false;
     bool allowOsc52Read = false;

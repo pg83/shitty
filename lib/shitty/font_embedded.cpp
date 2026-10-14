@@ -145,3 +145,8 @@ FontFace* EmbeddedFontResolverImpl::resolveCluster(const u32* codepoints, size_t
 FontResolver* createEmbeddedFontResolver(Composer& composer) {
     return composer.pool->make<EmbeddedFontResolverImpl>();
 }
+
+void embeddedMonoFont(const void*& data, unsigned long& size) {
+    data = embeddedFontMono.data;
+    size = embeddedFontMono.size;
+}

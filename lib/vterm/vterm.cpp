@@ -25,11 +25,13 @@
 #include "mouse_frontend.h"
 #include "mouse_protocol.h"
 #include "cell_extra_store.h"
+#include "prompt_editor.h"
 
 #include <lib/vterm/hex.h>
 #include <lib/vterm/utf8.h>
 #include <lib/vterm/base64.h>
 #include <lib/vterm/unicode.h>
+#include <lib/vterm/vt_grid.h>
 #include <lib/vterm/vt_host.h>
 #include <lib/vterm/grapheme.h>
 #include <lib/vterm/keyboard.h>
@@ -69,7 +71,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -291,6 +292,18 @@ namespace {
 
     struct VtermImpl;
 
+    // R7: what makes this terminal's refs visible to a collection some
+    // other terminal started. The store is the window's, so a pane that
+    // never noticed the budget is exactly the pane whose cells used to be
+    // left pointing into the freed pool.
+    struct CallVtermCollectExtras final: public CellExtraClient {
+        explicit CallVtermCollectExtras(VtermImpl* terminal);
+
+        void collectExtras(Vector<TerminalCell*>& cells, Vector<u32*>& roots) override;
+
+        VtermImpl* terminal;
+    };
+
     // A one-shot fiber body carved out of the small-object allocator;
     // releases itself and recycles its stack when the fiber finishes.
     template <typename F>
@@ -350,9 +363,9 @@ namespace {
 
         bool key(const KeyInput& input);
         bool text(const TextInput& input);
-        bool pointerMotion(const VtPointerMotion& input);
-        bool pointerButton(const VtPointerButton& input);
-        bool scroll(const VtScroll& input);
+        bool pointerMotion(const PointerMotionInput& input);
+        bool pointerButton(const PointerButtonInput& input);
+        bool scroll(const ScrollInput& input);
         void focus(bool focused);
         void pointerPresence(bool present);
         void flush();
@@ -390,6 +403,11 @@ namespace {
         unsigned suppressedTextInputs = 0;
         bool suppressRepeatedTextInput = false;
         bool hyperlinkClick = false;
+        // A single click that may yet place the command line's cursor: where
+        // it was pressed, kept until the release shows it was not a drag.
+        bool promptClick = false;
+        int promptClickX = 0;
+        int promptClickY = 0;
         int pointerX = 0;
         int pointerY = 0;
         u16 pointerModifiers = 0;
@@ -415,7 +433,7 @@ namespace {
     };
 
     struct VtermImpl final: public Vterm, public ParserIface {
-        VtermImpl(ObjPool& owner, VtGeometry& geometry, const VtConfigSlot& configSlot, VtCellExtras& extras, SmallObjAllocator& smallObjects, plt::Scheduler& scheduler, VtHost& host, PtyHandle& pty, VtermTraceFactory* traceFactory, Output* dump);
+        VtermImpl(ObjPool& owner, VtGeometry& windowGeometry, const VtConfigSlot& configSlot, VtCellExtras& extras, SmallObjAllocator& smallObjects, plt::Scheduler& scheduler, VtHost& host, const VtGeometry& geometry, PtyHandle& pty, VtermTraceFactory* traceFactory, Output* dump);
 
         const VtConfig& config() const;
 
@@ -423,17 +441,17 @@ namespace {
 
         void feedPty(StringView bytes) override;
         void feedPty(const StringView* slices, size_t count) override;
-        void activate() override;
-        void deactivate() override;
+        void show() override;
+        void hide() override;
         void expose() override;
+        void exposeAll() override;
         void focus(bool focused) override;
         bool key(const KeyInput& input) override;
         bool text(const TextInput& input) override;
-        bool pointerMotion(const VtPointerMotion& input) override;
-        bool pointerButton(const VtPointerButton& input) override;
-        bool scroll(const VtScroll& input) override;
+        bool pointerMotion(const PointerMotionInput& input) override;
+        bool pointerButton(const PointerButtonInput& input) override;
+        bool scroll(const ScrollInput& input) override;
         void pointerPresence(bool present) override;
-        void pointerRepositioned(const VtPointerPosition& position) override;
         void flush() override;
         void copy() override;
         void paste(bool primary) override;
@@ -441,6 +459,18 @@ namespace {
         void key(InputKey key, VtModifier modifiers);
         void character(u8 byte, VtModifier modifiers);
         void sendBytes(StringView bytes, bool userInput) override;
+        bool selectCommandLine() override;
+        bool commandLineEditable() const override;
+        bool commandLineUndo(bool redo) override;
+        // The editor's own: whether there is a line to edit now, and where
+        // it starts; a click placing its cursor; the selection replaced.
+        bool promptAtInput() const;
+        bool promptOrigin(PromptOrigin& origin) const;
+        // Under -verbose: one line on stderr saying why the editor did not
+        // act, with everything the decision read.
+        void promptTrace(const char* action) const;
+        bool promptPlaceCursor(int pixelX, int pixelY);
+        bool promptReplaceSelection(const u32* insert, size_t count);
         void kittyKey(InputKey key, u16 modifiers, VtermKeyEventType event);
         void kittyKey(u32 key, u32 shiftedKey, u32 baseLayoutKey, u16 modifiers, VtermKeyEventType event);
         bool mouseHighlightRelease(u16 endX, u16 endY, u16 mouseX, u16 mouseY);
@@ -473,6 +503,7 @@ namespace {
         bool bufferDropPayload(Input& source, Buffer& content);
         void buildQuotedEntry(StringView entry, StringBuilder& quoted);
         const TerminalUpdate* output() override;
+        const TerminalUpdate& retainedOutput() override;
         void consume() override;
         VtermState state() const override;
         TestApi* createTestApi();
@@ -501,7 +532,7 @@ namespace {
         size_t parserPlaceAscii(StringView bytes) override;
         size_t parserPlaceUtf8Run(StringView bytes, u8& pendingTrace) override;
 
-        void windowResized() override;
+        void paneResized(const VtGeometry& geometry) override;
         void presentationInvalidated() override;
         void configChanged() override;
         void resizeGrid();
@@ -584,6 +615,8 @@ namespace {
         void publishProgress(u32 state, u32 percent);
         void windowOperation(u32 operation, u32 first, u32 second);
         plt::WindowInfo windowInfo() const;
+        u32 columnsForPixelWidth(u32 width) const;
+        u32 rowsForPixelHeight(u32 height) const;
         u32 windowColumns() const;
         u32 windowRows() const;
         u32 screenColumns() const;
@@ -606,7 +639,9 @@ namespace {
         void fillScreen(u16 ch);
         void collectCellExtrasIfNeeded(bool force = false);
         void collectCellExtras();
+        void collectExtras(Vector<TerminalCell*>& cells, Vector<u32*>& roots);
         void updateExtraCellCount();
+        size_t cellCapacity() const override;
 
         void normalizeCursorPos();
         bool isCursorInsideMargins() const;
@@ -974,12 +1009,42 @@ namespace {
         plt::Fiber* blinkFiber_ = nullptr;
         plt::Fiber* autoscrollFiber_ = nullptr;
         ObjPool& owner_;
-        VtGeometry& geometry;
+        // Upstream's explicit embedding pieces, in upstream's order.
+        // windowGeometry_ is the window's: its surface size and the cell
+        // size the font gives it, one per window and shared by every
+        // pane on it. This pane's own rectangle is pane_ below - the
+        // same type, a different instance, and never the same numbers
+        // once a window holds two panes.
+        VtGeometry& windowGeometry_;
         const VtConfigSlot& configSlot_;
         VtCellExtras& extras_;
         SmallObjAllocator& smallObjects_;
         plt::Scheduler& scheduler_;
         VtHost& host;
+        // A8: this terminal's own geometry, handed to it by whatever lays
+        // panes out, rather than read back off the window - its grid,
+        // its rectangle on the surface, how far its text reaches and the
+        // border it keeps around that text. Every "columns" and "rows"
+        // below is this pane's, not the window's, and while a window
+        // shows one terminal the two are the same numbers, which is what
+        // makes the whole migration invisible.
+        //
+        // T5.5: the grid is read straight out of here. The pair of u16
+        // that used to shadow pane_.columns/pane_.rows is gone; there is
+        // one instance of this pane's size and nothing to keep in step
+        // with it.
+        //
+        // The window's half of the geometry is not copied in here: the
+        // surface and the cell size stay in windowGeometry_ and are read
+        // from there at the call sites that ask about the window. One
+        // pane holding its own copy of a number the whole window shares
+        // is a copy that goes stale between a font change and the resize
+        // that follows it.
+        //
+        // Declared here, above nColsEff, because the constructor's
+        // initializer list reads pane_.columns to seed it and members are
+        // initialized in declaration order.
+        VtGeometry pane_;
         // Captured per terminal: a deferred transaction that resumes after
         // a tab switch must still write to the shell it began talking to.
         PtyBlockOutput ptyStream_;
@@ -998,6 +1063,10 @@ namespace {
         i32 preeditCursorBeginCell = -1;
         i32 preeditCursorEndCell = -1;
         TerminalUpdate terminalUpdate;
+        // Storage of its own rather than terminalUpdate's, so that asking
+        // one terminal for both forms cannot turn a frame already handed
+        // out by output() into a zero-damage one behind the caller's back.
+        TerminalUpdate retainedUpdate;
 
         Buffer inputResult;
         bool outputPending = false;
@@ -1048,6 +1117,11 @@ namespace {
         u32 nextHyperlink = 1;
         u32 currentSemantic = 0;
         bool semanticUntilEndOfLine = false;
+        // The command line zsh last reported (OSC 7701) since the input began
+        // (OSC 133;B), and the column it began at.
+        PromptLine promptLine;
+        bool promptReported = false;
+        u16 promptColumn = 0;
         u32 inactiveSemantic = 0;
         bool inactiveSemanticUntilEndOfLine = false;
         enum class SemanticClick : u8 {
@@ -1602,15 +1676,7 @@ int VtermInput::currentSelectionAutoscrollDirection() const {
     if (!mouse.selectionOngoing() || !(mouse.buttons() & selectionButtons) || terminal->cf->currentSelection().null() || !pointerFocused || !pointerPresent || !pointerPositionKnown) {
         return 0;
     }
-    const int top = 0;
-    const int bottom = max(0, (int)(min<u32>(terminal->geometry.pixelHeight, INT_MAX)) - 1);
-    if (pointerY <= top) {
-        return -1;
-    }
-    if (pointerY >= bottom) {
-        return 1;
-    }
-    return 0;
+    return mouseAutoscrollDirection(pointerY, mouseGeometry(terminal->pane_, terminal->windowGeometry_));
 }
 
 void VtermInput::updateSelectionAutoscroll() {
@@ -1877,6 +1943,9 @@ bool VtermInput::key(const KeyInput& input) {
     if (suppressRepeatedTextInput) {
         return true;
     }
+    if (pressed && (input.key == InputKey::Backspace || input.key == InputKey::Delete) && terminal->hasSelection() && terminal->promptReplaceSelection(nullptr, 0)) {
+        return true;
+    }
 
     const u8 kittyFlags = terminal->getKittyKeyboardFlags();
     const u16 kittyMods = kittyModifiers(input.modifiers);
@@ -1997,6 +2066,14 @@ bool VtermInput::text(const TextInput& input) {
     if (input.codepoint == 0) {
         return false;
     }
+    // Typed over a selection in the command line: it replaces what is
+    // selected, as in a text field.
+    if (input.codepoint >= 0x20 && input.codepoint != 0x7f && terminal->hasSelection()) {
+        const u32 typed = input.codepoint;
+        if (terminal->promptReplaceSelection(&typed, 1)) {
+            return true;
+        }
+    }
     const VtModifier modifiers = legacyModifiers(input.modifiers);
     if (input.codepoint < 0x80) {
         terminal->sendCharacter((u8)(input.codepoint), modifiers);
@@ -2015,8 +2092,7 @@ bool VtermInput::text(const TextInput& input) {
 }
 
 void VtermInput::mouseProtocolCoordinates(MouseTrackingEnc encoding, int pixelX, int pixelY, u16& column, u16& row) const {
-    const MouseGeometry geometry = {terminal->geometry.pixelWidth, terminal->geometry.pixelHeight, terminal->geometry.cellPixelWidth, terminal->geometry.cellPixelHeight};
-    const MouseProtocolPoint point = mouseProtocolPoint(encoding, pixelX, pixelY, geometry);
+    const MouseProtocolPoint point = mouseProtocolPoint(encoding, pixelX, pixelY, mouseGeometry(terminal->pane_, terminal->windowGeometry_));
     column = point.column;
     row = point.row;
 }
@@ -2043,8 +2119,8 @@ void VtermInput::sendMouseButtonProtocol(MouseEventType type, int button, int pi
     sendMouseProtocol(tracking.enc, type, tracking.mode == MouseTrackingMode::X10_Compat ? 0 : modifiers, button, column, row);
 }
 
-bool VtermInput::pointerButton(const VtPointerButton& input) {
-    updatePointer(input.position.pixelX, input.position.pixelY, input.modifiers);
+bool VtermInput::pointerButton(const PointerButtonInput& input) {
+    updatePointer(input.pixelX, input.pixelY, input.modifiers);
     const int button = (int)(input.button);
     mouse.updateButton(button, input.pressed);
     if (!input.pressed && (input.button == PointerButton::Primary || input.button == PointerButton::Secondary)) {
@@ -2054,8 +2130,8 @@ bool VtermInput::pointerButton(const VtPointerButton& input) {
     const int protocolButton = mouseTerminalButton(button);
     u16 locatorColumn = 1;
     u16 locatorRow = 1;
-    mouseProtocolCoordinates(MouseTrackingEnc::Default, input.position.pixelX, input.position.pixelY, locatorColumn, locatorRow);
-    terminal->setLocatorPosition(locatorColumn, locatorRow, (u16)(min<i64>(UINT16_MAX, max<i64>(1, (i64)(input.position.locatorPixelX) + 1))), (u16)(min<i64>(UINT16_MAX, max<i64>(1, (i64)(input.position.locatorPixelY) + 1))), 0);
+    mouseProtocolCoordinates(MouseTrackingEnc::Default, input.pixelX, input.pixelY, locatorColumn, locatorRow);
+    terminal->setLocatorPosition(locatorColumn, locatorRow, max(1, input.pixelX + 1), max(1, input.pixelY + 1), 0);
     if (protocolButton >= 1 && protocolButton <= 4) {
         terminal->reportLocatorButton(protocolButton, input.pressed);
     }
@@ -2066,7 +2142,7 @@ bool VtermInput::pointerButton(const VtPointerButton& input) {
     if (input.pressed && input.button == PointerButton::Primary) {
         hyperlinkClick = false;
         if (input.modifiers & hyperlinkModifiers) {
-            const ScreenHyperlink link = resolveLink(input.position.pixelX, input.position.pixelY);
+            const ScreenHyperlink link = resolveLink(input.pixelX, input.pixelY);
             if (!link.payload.empty()) {
                 hyperlinkClick = true;
                 terminal->host.requestOpenUri(link.payload);
@@ -2075,20 +2151,23 @@ bool VtermInput::pointerButton(const VtPointerButton& input) {
         }
     }
     if (mouse.protocolActive(input.modifiers, tracking.mode)) {
-        sendMouseButtonProtocol(input.pressed ? MouseEventType::Press : MouseEventType::Release, protocolButton, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+        sendMouseButtonProtocol(input.pressed ? MouseEventType::Press : MouseEventType::Release, protocolButton, input.pixelX, input.pixelY, input.modifiers, tracking);
         return true;
     }
     if (input.pressed) {
-        const bool cycleSnapTo = mouse.registerClick(button, input.position.pixelX, input.position.pixelY, input.time) > 1;
+        const bool cycleSnapTo = mouse.registerClick(button, input.pixelX, input.pixelY, input.time) > 1;
+        promptClick = input.button == PointerButton::Primary && !cycleSnapTo && !(input.modifiers & InputShift);
+        promptClickX = input.pixelX;
+        promptClickY = input.pixelY;
         if (input.button == PointerButton::Primary) {
             if ((input.modifiers & InputShift) && terminal->hasSelection()) {
-                terminal->selectionExtend(input.position.pixelX, input.position.pixelY, cycleSnapTo);
+                terminal->selectionExtend(input.pixelX, input.pixelY, cycleSnapTo);
             } else {
-                terminal->selectionStart(input.position.pixelX, input.position.pixelY, cycleSnapTo);
+                terminal->selectionStart(input.pixelX, input.pixelY, cycleSnapTo);
             }
             mouse.beginSelection();
         } else if (input.button == PointerButton::Secondary) {
-            terminal->selectionExtend(input.position.pixelX, input.position.pixelY, cycleSnapTo);
+            terminal->selectionExtend(input.pixelX, input.pixelY, cycleSnapTo);
             mouse.beginSelection();
         }
         return true;
@@ -2096,6 +2175,14 @@ bool VtermInput::pointerButton(const VtPointerButton& input) {
     if (input.button == PointerButton::Primary || input.button == PointerButton::Secondary) {
         mouse.endSelection();
         const VtermTextResult selected = terminal->selectionFinish();
+        // A click that selected nothing, in the command line: its cursor goes
+        // where the click was, as in a text field.
+        if (input.button == PointerButton::Primary && promptClick && !selected.status && !terminal->hasSelection()) {
+            terminal->promptPlaceCursor(promptClickX, promptClickY);
+        } else if (input.button == PointerButton::Primary && terminal->config().verbose) {
+            fprintf(stderr, "%.*s: prompt editor: release not a click: single=%d selected=%d selection=%d\n", (int)(terminal->config().brandName.length()), (const char*)(terminal->config().brandName.data()), (int)(promptClick), (int)(selected.status), (int)(terminal->hasSelection()));
+        }
+        promptClick = false;
         if (selected.status) {
             writeSelection(*terminal->host.primary(), selected.text);
             if (terminal->config().autoCopyMode) {
@@ -2108,12 +2195,12 @@ bool VtermInput::pointerButton(const VtPointerButton& input) {
     return true;
 }
 
-bool VtermInput::pointerMotion(const VtPointerMotion& input) {
-    updatePointer(input.position.pixelX, input.position.pixelY, input.modifiers);
+bool VtermInput::pointerMotion(const PointerMotionInput& input) {
+    updatePointer(input.pixelX, input.pixelY, input.modifiers);
     u16 locatorColumn = 1;
     u16 locatorRow = 1;
-    mouseProtocolCoordinates(MouseTrackingEnc::Default, input.position.pixelX, input.position.pixelY, locatorColumn, locatorRow);
-    terminal->setLocatorPosition(locatorColumn, locatorRow, (u16)(min<i64>(UINT16_MAX, max<i64>(1, (i64)(input.position.locatorPixelX) + 1))), (u16)(min<i64>(UINT16_MAX, max<i64>(1, (i64)(input.position.locatorPixelY) + 1))), 0);
+    mouseProtocolCoordinates(MouseTrackingEnc::Default, input.pixelX, input.pixelY, locatorColumn, locatorRow);
+    terminal->setLocatorPosition(locatorColumn, locatorRow, max(1, input.pixelX + 1), max(1, input.pixelY + 1), 0);
     const MouseTrackingState tracking = terminal->mouseTrk;
     if (mouse.protocolActive(input.modifiers, tracking.mode)) {
         stopSelectionAutoscroll();
@@ -2125,12 +2212,12 @@ bool VtermInput::pointerMotion(const VtPointerMotion& input) {
         }
         u16 column = 0;
         u16 row = 0;
-        mouseProtocolCoordinates(tracking.enc, input.position.pixelX, input.position.pixelY, column, row);
+        mouseProtocolCoordinates(tracking.enc, input.pixelX, input.pixelY, column, row);
         if (mouse.reportMotion(column, row, tracking.mode, tracking.enc, tracking.generation)) {
             sendMouseProtocol(tracking.enc, MouseEventType::Motion, input.modifiers, 0, column, row);
         }
     } else if (mouse.buttons() & ((1u << (unsigned)(PointerButton::Primary)) | (1u << (unsigned)(PointerButton::Secondary)))) {
-        terminal->selectionUpdate(input.position.pixelX, input.position.pixelY);
+        terminal->selectionUpdate(input.pixelX, input.pixelY);
         updateSelectionAutoscroll();
     } else {
         stopSelectionAutoscroll();
@@ -2138,24 +2225,24 @@ bool VtermInput::pointerMotion(const VtPointerMotion& input) {
     return true;
 }
 
-bool VtermInput::scroll(const VtScroll& input) {
-    updatePointer(input.position.pixelX, input.position.pixelY, input.modifiers);
+bool VtermInput::scroll(const ScrollInput& input) {
+    updatePointer(input.pixelX, input.pixelY, input.modifiers);
     const MouseTrackingState tracking = terminal->mouseTrk;
     const bool reporting = mouse.protocolActive(input.modifiers, tracking.mode);
     const bool alternate = terminal->altScrollMode && terminal->altScreenBufferMode;
     const MouseWheelSteps steps = mouse.consumeWheel(input.x, input.y, reporting || alternate);
     if (reporting) {
         for (int k = 0; k < steps.y; ++k) {
-            sendMouseButtonProtocol(MouseEventType::Press, 4, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+            sendMouseButtonProtocol(MouseEventType::Press, 4, input.pixelX, input.pixelY, input.modifiers, tracking);
         }
         for (int k = 0; k < -steps.y; ++k) {
-            sendMouseButtonProtocol(MouseEventType::Press, 5, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+            sendMouseButtonProtocol(MouseEventType::Press, 5, input.pixelX, input.pixelY, input.modifiers, tracking);
         }
         for (int k = 0; k < -steps.x; ++k) {
-            sendMouseButtonProtocol(MouseEventType::Press, 6, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+            sendMouseButtonProtocol(MouseEventType::Press, 6, input.pixelX, input.pixelY, input.modifiers, tracking);
         }
         for (int k = 0; k < steps.x; ++k) {
-            sendMouseButtonProtocol(MouseEventType::Press, 7, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+            sendMouseButtonProtocol(MouseEventType::Press, 7, input.pixelX, input.pixelY, input.modifiers, tracking);
         }
     } else {
         if (steps.y > 0) {
@@ -2208,7 +2295,7 @@ void VtermImpl::createPrimaryScreen() {
     ObjPool* const next = ObjPool::fromMemoryRaw();
     Screen* screen;
     try {
-        screen = Screen::createPrimary(extras_, *next, geometry.columns, geometry.rows, &colors, config().saveLines);
+        screen = Screen::createPrimary(extras_, *next, pane_.columns, pane_.rows, &colors, config().saveLines);
     } catch (...) {
         delete next;
         throw;
@@ -2222,7 +2309,7 @@ void VtermImpl::createAlternateScreen() {
     ObjPool* const next = ObjPool::fromMemoryRaw();
     Screen* screen;
     try {
-        screen = Screen::createAlternate(extras_, *next, geometry.columns, geometry.rows, &colors);
+        screen = Screen::createAlternate(extras_, *next, pane_.columns, pane_.rows, &colors);
     } catch (...) {
         delete next;
         throw;
@@ -2256,7 +2343,7 @@ void VtermImpl::resizeScreen(Screen*& frame, ObjPool*& pool, Screen::Cursor& cur
     ObjPool* const next = ObjPool::fromMemoryRaw();
     Screen* screen;
     try {
-        screen = frame->resizedWithHistory(*next, geometry.columns, geometry.rows, config().saveLines, cursor, trackedStatePtr);
+        screen = frame->resizedWithHistory(*next, pane_.columns, pane_.rows, config().saveLines, cursor, trackedStatePtr);
     } catch (...) {
         delete next;
         throw;
@@ -2303,12 +2390,151 @@ void VtermImpl::expose() {
     redraw();
 }
 
+void VtermImpl::exposeAll() {
+    // R3a-1. A synchronized update (\e[?2026h) makes redraw() a no-op,
+    // so a pane that opened one and then fell silent would take the
+    // damage and still hand over its retained form - the same zero rows
+    // the caller asked to be rid of, refused again, for as long as the
+    // mode holds. resizeGrid() drops the mode on both of its branches
+    // for exactly this reason; this is the same movement for the same
+    // reason. A torn frame in one pane is cheaper than a window that
+    // has stopped presenting, and the pane is handing over everything
+    // it has anyway.
+    if (synchronizedOutputMode) {
+        setSynchronizedOutput(false);
+    }
+    // The damage first, the pending flag second, and both of them: a
+    // pane whose rows are damaged but whose output is not pending is
+    // asked for its retained form instead, and a retained form carries
+    // no damage at all (retainedOutput() zeroes it). Either half alone
+    // leaves the caller with the same zero rows it asked to be rid of.
+    exposeFrames();
+    redraw();
+}
+
 void VtermImpl::copy() {
     input.copy();
 }
 
 void VtermImpl::paste(bool primary) {
     input.paste(primary);
+}
+
+void VtermImpl::promptTrace(const char* action) const {
+    if (!config().verbose) {
+        return;
+    }
+    i64 row = 0;
+    u16 expected = 0;
+    const PromptOrigin probe{0, promptColumn, pane_.columns};
+    promptCursorCell(probe, promptLine.text.data(), promptLine.text.length(), config().widths, promptLine.cursor, row, expected);
+    fprintf(stderr, "%.*s: prompt editor: %s declined: option=%d reported=%d semantic=%u alternate=%d inputColumn=%u cursor=%u,%u expectedColumn=%u lineRow=%lld length=%zu lineCursor=%zu columns=%u\n",
+        (int)(config().brandName.length()), (const char*)(config().brandName.data()), action,
+        (int)(config().promptEditor), (int)(promptReported), (unsigned)(currentSemantic), (int)(altScreenBufferMode),
+        (unsigned)(promptColumn), (unsigned)(posX), (unsigned)(posY), (unsigned)(expected), (long long)(row),
+        (size_t)(promptLine.text.length()), (size_t)(promptLine.cursor), (unsigned)(pane_.columns));
+}
+
+bool VtermImpl::promptAtInput() const {
+    // After the prompt's start as well as after the input's: a theme that
+    // marks its prompt again while redrawing it (reset-prompt) sends a
+    // second 133;A mid-line, and the input's column stays the one its 133;B
+    // gave - the cursor check in promptOriginFromCursor() says whether that
+    // still fits the line.
+    return currentSemantic == 1 || currentSemantic == 2;
+}
+
+bool VtermImpl::promptOrigin(PromptOrigin& origin) const {
+    if (!config().promptEditor || !promptReported || !promptAtInput() || altScreenBufferMode) {
+        return false;
+    }
+    return promptOriginFromCursor(promptColumn, pane_.columns, promptLine, config().widths, (i64)(posY), posX, origin);
+}
+
+bool VtermImpl::promptPlaceCursor(int pixelX, int pixelY) {
+    PromptOrigin origin;
+    if (!promptOrigin(origin)) {
+        promptTrace("click");
+        return false;
+    }
+    const Point cell = selectionPoint(pixelX, pixelY);
+    size_t index = 0;
+    if (!promptIndexAt(origin, promptLine.text.data(), promptLine.text.length(), config().widths, cell.y, (u16)(cell.x < 0 ? 0 : cell.x), index)) {
+        if (config().verbose) {
+            fprintf(stderr, "%.*s: prompt editor: click at %d,%d outside the line starting %lld,%u\n", (int)(config().brandName.length()), (const char*)(config().brandName.data()), cell.x, cell.y, (long long)(origin.row), (unsigned)(origin.column));
+        }
+        return false;
+    }
+    if (index != promptLine.cursor) {
+        StringBuilder sequence;
+        promptSetSequence(promptLine.text.data(), promptLine.text.length(), index, sequence);
+        sendBytes(StringView(sequence), true);
+    }
+    return true;
+}
+
+bool VtermImpl::promptReplaceSelection(const u32* insert, size_t count) {
+    PromptOrigin origin;
+    if (!promptOrigin(origin)) {
+        return false;
+    }
+    const Rect selected = cf->logicalSelection();
+    if (selected.empty() || selected.rectangular) {
+        return false;
+    }
+    // The selection's end is the first cell it leaves out, so both ends are
+    // positions in the line the same way.
+    size_t from = 0;
+    size_t to = 0;
+    const u32* const text = promptLine.text.data();
+    const size_t length = promptLine.text.length();
+    if (!promptIndexAt(origin, text, length, config().widths, selected.tl.y, (u16)(selected.tl.x), from) || !promptIndexAt(origin, text, length, config().widths, selected.br.y, (u16)(selected.br.x), to) || to <= from) {
+        return false;
+    }
+    StringBuilder sequence;
+    promptReplace(promptLine, from, to, insert, count, sequence);
+    selectClear();
+    sendBytes(StringView(sequence), true);
+    return true;
+}
+
+bool VtermImpl::commandLineEditable() const {
+    PromptOrigin origin;
+    if (!promptOrigin(origin)) {
+        promptTrace("key");
+        return false;
+    }
+    return true;
+}
+
+bool VtermImpl::selectCommandLine() {
+    PromptOrigin origin;
+    if (!promptOrigin(origin) || promptLine.text.empty()) {
+        return false;
+    }
+    i64 row = 0;
+    u16 column = 0;
+    promptCursorCell(origin, promptLine.text.data(), promptLine.text.length(), config().widths, promptLine.text.length(), row, column);
+    const Point first((int)(origin.column), (int)(origin.row));
+    const Point past((int)(column), (int)(row));
+    cf->beginSelection(first);
+    cf->updateSelection(Rect(first, past));
+    changePresentation();
+    redraw();
+    return true;
+}
+
+bool VtermImpl::commandLineUndo(bool redo) {
+    PromptOrigin origin;
+    if (!promptOrigin(origin)) {
+        promptTrace(redo ? "redo" : "undo");
+        return false;
+    }
+    sendBytes(redo ? promptRedoSequence() : promptUndoSequence(), true);
+    if (config().verbose) {
+        fprintf(stderr, "%.*s: prompt editor: %s sent\n", (int)(config().brandName.length()), (const char*)(config().brandName.data()), redo ? "redo" : "undo");
+    }
+    return true;
 }
 
 void VtermImpl::clear() {
@@ -2328,42 +2554,20 @@ bool VtermImpl::text(const TextInput& value) {
     return input.text(value);
 }
 
-bool VtermImpl::pointerMotion(const VtPointerMotion& value) {
+bool VtermImpl::pointerMotion(const PointerMotionInput& value) {
     return input.pointerMotion(value);
 }
 
-bool VtermImpl::pointerButton(const VtPointerButton& value) {
+bool VtermImpl::pointerButton(const PointerButtonInput& value) {
     return input.pointerButton(value);
 }
 
-bool VtermImpl::scroll(const VtScroll& value) {
+bool VtermImpl::scroll(const ScrollInput& value) {
     return input.scroll(value);
 }
 
 void VtermImpl::pointerPresence(bool present) {
     input.pointerPresence(present);
-}
-
-void VtermImpl::pointerRepositioned(const VtPointerPosition& position) {
-    if (!input.pointerPositionKnown) {
-        return;
-    }
-    input.pointerX = position.pixelX;
-    input.pointerY = position.pixelY;
-    input.refreshHyperlinkAndRedraw();
-    u16 column = 1;
-    u16 row = 1;
-    input.mouseProtocolCoordinates(MouseTrackingEnc::Default, position.pixelX, position.pixelY, column, row);
-    // A layout change updates query coordinates without synthesizing a
-    // locator event (or testing its filter as if the pointer had moved).
-    locator.column = column;
-    locator.row = row;
-    locator.pixelX = min<i64>(UINT16_MAX, max<i64>(1, (i64)(position.locatorPixelX) + 1));
-    locator.pixelY = min<i64>(UINT16_MAX, max<i64>(1, (i64)(position.locatorPixelY) + 1));
-    if (input.mouse.selectionOngoing()) {
-        selectionUpdate(position.pixelX, position.pixelY);
-        input.updateSelectionAutoscroll();
-    }
 }
 
 void VtermImpl::flush() {
@@ -2446,11 +2650,11 @@ void VtermImpl::paste(StringView text) {
 }
 
 ScreenHyperlink VtermImpl::resolveHyperlink(int pixelX, int pixelY) const {
-    if (pixelX < 0 || pixelY < 0 || (u32)(pixelX) >= geometry.pixelWidth || (u32)(pixelY) >= geometry.pixelHeight) {
+    u16 column = 0;
+    u16 row = 0;
+    if (!mouseCell(pixelX, pixelY, mouseGeometry(pane_, windowGeometry_), column, row)) {
         return {};
     }
-    const u16 column = pixelX / geometry.cellPixelWidth;
-    const u16 row = pixelY / geometry.cellPixelHeight;
     const ScreenInfo info = cf->info();
     if (column >= info.columns || row >= info.rows) {
         return {};
@@ -2484,6 +2688,9 @@ void VtermImpl::fillTerminalUpdate(TerminalUpdate& update, const ScreenFrame& fr
     update = {};
     update.rows = rows;
     update.rowCount = frame.damagedRows;
+    // A9: this pane's grid - the one the rows above were built by.
+    update.gridColumns = pane_.columns;
+    update.gridRows = pane_.rows;
     update.colors = &colors;
     update.viewOffset = frame.viewOffset;
     update.historyRows = frame.historyRows;
@@ -2777,15 +2984,31 @@ const TerminalUpdate* VtermImpl::output() {
     return &terminalUpdate;
 }
 
+const TerminalUpdate& VtermImpl::retainedOutput() {
+    Screen* const frame = cf;
+    // Captured rather than assembled field by field: the view offset,
+    // the history depth and both selection rectangles are what the
+    // renderer draws this pane's retained cells *through*, and this is
+    // the one place that knows how to read them. The damage travels
+    // with it and is then dropped - the screen still holds it, so the
+    // output() that follows reports it in full.
+    ScreenFrame quiet = frame->captureFrame(outputRows.mutData());
+    quiet.damagedRows = 0;
+    fillTerminalUpdate(retainedUpdate, quiet, outputRows.data());
+    retainedUpdate.shapes = frame;
+    overlayPreedit(retainedUpdate);
+    return retainedUpdate;
+}
+
 void VtermImpl::overlayPreedit(TerminalUpdate& update) {
     if (preeditCells.empty()) {
         return;
     }
     const i32 row = (i32)(posY) + (i32)(update.viewOffset);
-    if (row < 0 || row >= (i32)(geometry.rows) || cf->lineAttribute(posY) != 0) {
+    if (row < 0 || row >= (i32)(pane_.rows) || cf->lineAttribute(posY) != 0) {
         return;
     }
-    const i32 columns = geometry.columns;
+    const i32 columns = pane_.columns;
     i32 count = (i32)(preeditCells.length());
     // foot's clipping policy: shift left when the preview does not fit
     // to the end of the line; when it exceeds the whole row keep the
@@ -2885,7 +3108,7 @@ VtermTestState TestApiImpl::inspect() const {
     if (vterm->originMode == VtermImpl::OriginMode::ScrollingRegion) {
         result.rectangleOrigin = {vterm->marginTop, vterm->hMargin, vterm->marginBottom, vterm->nColsEff};
     } else {
-        result.rectangleOrigin = {0, 0, vterm->geometry.rows, vterm->geometry.columns};
+        result.rectangleOrigin = {0, 0, vterm->pane_.rows, vterm->pane_.columns};
     }
     result.hyperlinkCount = vterm->extras_.store->hyperlinkCount();
     for (size_t index = 0; index < 4; ++index) {
@@ -3003,7 +3226,7 @@ void TestApiImpl::hardReset() {
 }
 
 bool TestApiImpl::tabStop(u16 column) const {
-    if (column >= vterm->geometry.columns) {
+    if (column >= vterm->pane_.columns) {
         return false;
     }
     if (!vterm->tabStopsCustomized) {
@@ -3273,11 +3496,38 @@ void VtermImpl::redraw() {
     outputPending = true;
 }
 
-void VtermImpl::updateExtraCellCount() {
+size_t VtermImpl::cellCapacity() const {
     size_t count = frame_pri->info().cellCapacity;
     if (altScreenInitialized) {
         count += frame_alt->info().cellCapacity;
     }
+    return count;
+}
+
+void VtermImpl::updateExtraCellCount() {
+    size_t count = cellCapacity();
+    // A11 (Q2 of R5-qa). One store serves every terminal behind the
+    // window, and it is sized by the sum over the live panes - not by
+    // whoever wrote to it last, and not by an upper bound taken off the
+    // window.
+    //
+    // "The last writer" was harmless before A8, because every terminal
+    // held the window's grid and so "the last one" and "all of them"
+    // were the same number. A pane is smaller than the window, so a
+    // pane-sized budget had the store collecting on behalf of terminals
+    // that are not this one, and the more panes there were the further
+    // under the truth it fell. The window-sized floor that stood here
+    // until now was the other half of the same mistake in the other
+    // direction: an upper bound for one pane, and short by a whole pane
+    // for every pane after the first.
+    //
+    // The caller counts itself rather than being counted: a terminal
+    // sizes the store from inside its own construction, before
+    // SessionSet has a record of it, so asking the set for everybody
+    // else and adding its own is what makes the sum exact at every
+    // moment instead of at most of them. With no set at all - the
+    // headless adapters - a terminal is the only pane there is.
+    count += host.cellCapacityExcept(this);
     extras_.store->setCellCount(count);
 }
 
@@ -3298,38 +3548,40 @@ void VtermImpl::collectCellExtrasIfNeeded(bool force) {
     presentedSinceGcSafePoint = false;
 }
 
-void VtermImpl::collectCellExtras() {
-    extraCells.clear();
-    u32* roots[2];
-    size_t rootCount = 0;
+void VtermImpl::collectExtras(Vector<TerminalCell*>& cells, Vector<u32*>& roots) {
     if (activeHyperlink != 0) {
-        roots[rootCount++] = &activeHyperlink;
+        roots.pushBack(&activeHyperlink);
     }
     if (inputGraphemeScreen != nullptr && inputGraphemeHyperlink != 0) {
-        roots[rootCount++] = &inputGraphemeHyperlink;
+        roots.pushBack(&inputGraphemeHyperlink);
     }
-    frame_pri->collectExtraCells(extraCells);
+    frame_pri->collectExtraCells(cells);
     if (altScreenInitialized) {
-        frame_alt->collectExtraCells(extraCells);
+        frame_alt->collectExtraCells(cells);
     }
     // The composition preview and the slice the overlay points at live
     // outside both frames, and their clusters reference the same store:
     // a collection that skipped them would leave the preview pointing
     // into the freed pool.
-    const auto collectPreeditCells = [&](Vector<TerminalCell>& cells) {
-        for (size_t index = 0; index != cells.length(); ++index) {
-            TerminalCell& cell = cells.mut(index);
+    const auto collectPreeditCells = [&](Vector<TerminalCell>& preedit) {
+        for (size_t index = 0; index != preedit.length(); ++index) {
+            TerminalCell& cell = preedit.mut(index);
             if (cell.hasExtra()) {
-                extraCells.pushBack(&cell);
+                cells.pushBack(&cell);
             }
         }
     };
     collectPreeditCells(preeditCells);
     collectPreeditCells(preeditWindow);
+}
 
-    CellExtraStore& extras = *extras_.store;
-    extras.collect(extraCells, roots, rootCount);
-    extraCells.clear();
+void VtermImpl::collectCellExtras() {
+    // R7: nothing is handed over here. This terminal is a client like any
+    // other, so the store asks it for its cells along with everybody
+    // else's - and a terminal that gathered its own would hand the same
+    // roots over twice.
+    Vector<TerminalCell*> none;
+    extras_.store->collect(none, nullptr, 0);
 }
 
 bool VtermImpl::advanceAnimation(bool force) {
@@ -3460,7 +3712,7 @@ void VtermImpl::pageUp() {
             sendKey(InputKey::Up);
         }
     } else {
-        cf->scrollView(geometry.rows / 2);
+        cf->scrollView(pane_.rows / 2);
         refreshBlinkingText();
         redraw();
     }
@@ -3491,7 +3743,7 @@ void VtermImpl::pageDown() {
             sendKey(InputKey::Down);
         }
     } else {
-        cf->scrollView(-(i32)(geometry.rows / 2));
+        cf->scrollView(-(i32)(pane_.rows / 2));
         refreshBlinkingText();
         redraw();
     }
@@ -3557,7 +3809,7 @@ void VtermImpl::resetTerminal() {
 
     cf->dropHistory();
     marginTop = 0;
-    marginBottom = geometry.rows;
+    marginBottom = pane_.rows;
     clearScreen();
 
     switchScreenBufferMode(false);
@@ -3592,7 +3844,7 @@ void VtermImpl::resetTerminal() {
 
     horizMarginMode = false;
     hMargin = 0;
-    nColsEff = geometry.columns;
+    nColsEff = pane_.columns;
 
     osc_TITLE_0(config().title);
 }
@@ -3699,9 +3951,9 @@ void VtermImpl::switchColMode(ColMode colMode_, bool force) {
         windowOperation(8, windowRows(), columns);
     }
     marginTop = 0;
-    marginBottom = geometry.rows;
+    marginBottom = pane_.rows;
     hMargin = 0;
-    nColsEff = geometry.columns;
+    nColsEff = pane_.columns;
     posX = 0;
     posY = 0;
     lastCol = false;
@@ -3724,9 +3976,9 @@ void VtermImpl::switchScreenBufferMode(bool altScreenBufferMode_, bool clearAlte
                 semanticUntilEndOfLine = false;
                 semanticClick = SemanticClick::None;
                 marginTop = 0;
-                marginBottom = geometry.rows;
+                marginBottom = pane_.rows;
                 hMargin = 0;
-                nColsEff = geometry.columns;
+                nColsEff = pane_.columns;
                 altScreenInitialized = true;
                 cf = frame_alt;
                 cf->expose();
@@ -3751,17 +4003,17 @@ void VtermImpl::switchScreenBufferMode(bool altScreenBufferMode_, bool clearAlte
             inactiveSemanticUntilEndOfLine = false;
             inactiveSemanticClick = SemanticClick::None;
             marginTop = 0;
-            marginBottom = geometry.rows;
+            marginBottom = pane_.rows;
             hMargin = 0;
-            nColsEff = geometry.columns;
+            nColsEff = pane_.columns;
             altScreenInitialized = true;
-        } else if (const ScreenInfo info = frame_alt->info(); info.columns != geometry.columns || info.rows != geometry.rows) {
+        } else if (const ScreenInfo info = frame_alt->info(); info.columns != pane_.columns || info.rows != pane_.rows) {
             Screen::Cursor cursorState;
             resizeScreen(frame_alt, frameAltPool, cursorState, &savedCursorAlt);
             marginTop = 0;
-            marginBottom = geometry.rows;
+            marginBottom = pane_.rows;
             hMargin = 0;
-            nColsEff = geometry.columns;
+            nColsEff = pane_.columns;
         }
         cf = frame_alt;
         cf->expose();
@@ -3769,16 +4021,16 @@ void VtermImpl::switchScreenBufferMode(bool altScreenBufferMode_, bool clearAlte
         savedCursor = &savedCursorAlt;
         altScreenBufferMode = true;
     } else {
-        if (const ScreenInfo info = frame_pri->info(); info.columns != geometry.columns || info.rows != geometry.rows || info.saveLines != config().saveLines) {
+        if (const ScreenInfo info = frame_pri->info(); info.columns != pane_.columns || info.rows != pane_.rows || info.saveLines != config().saveLines) {
             Screen::Cursor cursorState{Point(posX, posY), lastCol};
             resizeScreen(frame_pri, framePriPool, cursorState, &savedCursorPri);
             posX = cursorState.position.x;
             posY = cursorState.position.y;
             lastCol = cursorState.pendingWrap;
             marginTop = 0;
-            marginBottom = geometry.rows;
+            marginBottom = pane_.rows;
             hMargin = 0;
-            nColsEff = geometry.columns;
+            nColsEff = pane_.columns;
         }
         cf = frame_pri;
         cf->expose();
@@ -3807,8 +4059,8 @@ void VtermImpl::normalizeCursorPos() {
         posX = nColsEff - 1;
     }
 
-    if (geometry.rows < posY + 1) {
-        posY = geometry.rows - 1;
+    if (pane_.rows < posY + 1) {
+        posY = pane_.rows - 1;
     }
 
     lastCol = false;
@@ -3824,7 +4076,7 @@ void VtermImpl::activeColumns(u16& begin, u16& end) const {
         end = nColsEff;
     } else {
         begin = 0;
-        end = geometry.columns;
+        end = pane_.columns;
     }
 }
 
@@ -3848,12 +4100,12 @@ u16 VtermImpl::doubleWidthEnd(u16 normalEnd) const {
     // half of the screen; the right margin may only shorten it.  In
     // particular, the left margin must not shift this boundary as the cursor
     // crosses it.
-    return min(normalEnd, max<u16>(1, geometry.columns / 2));
+    return min(normalEnd, max<u16>(1, pane_.columns / 2));
 }
 
 void VtermImpl::eraseRow(u16 pY) {
     eraseRangeInRow(pY, hMargin, nColsEff - hMargin);
-    if (hMargin == 0 && nColsEff == geometry.columns) {
+    if (hMargin == 0 && nColsEff == pane_.columns) {
         cf->setLineAttribute(pY, 0);
     }
 }
@@ -3873,7 +4125,7 @@ void VtermImpl::copyRow(u16 dstY, u16 srcY) {
 }
 
 void VtermImpl::insertRows(u16 startY, u16 count) {
-    if (hMargin == 0 && nColsEff == geometry.columns) {
+    if (hMargin == 0 && nColsEff == pane_.columns) {
         cf->rotateRows(startY, marginBottom, count);
     } else {
         cf->scrollRectangle(startY, hMargin, marginBottom, nColsEff, count, eraseAttrs);
@@ -3886,7 +4138,7 @@ void VtermImpl::insertRows(u16 startY, u16 count) {
 }
 
 void VtermImpl::deleteRows(u16 startY, u16 count) {
-    if (hMargin == 0 && nColsEff == geometry.columns) {
+    if (hMargin == 0 && nColsEff == pane_.columns) {
         cf->rotateRows(startY, marginBottom, -(i32)(count));
     } else {
         cf->scrollRectangle(startY, hMargin, marginBottom, nColsEff, -(i32)(count), eraseAttrs);
@@ -3930,12 +4182,12 @@ void VtermImpl::eraseEcmaRangeInRow(u16 row, u16 start, u16 count) {
 
 void VtermImpl::eraseEcmaRow(u16 row) {
     if (eraseModeAll || !isoProtectionActive) {
-        eraseRangeInRow(row, 0, geometry.columns);
+        eraseRangeInRow(row, 0, pane_.columns);
         cf->setLineAttribute(row, 0);
         return;
     }
     const bool retained = cf->hasProtection(row, TerminalCell::isoProtection);
-    eraseEcmaRangeInRow(row, 0, geometry.columns);
+    eraseEcmaRangeInRow(row, 0, pane_.columns);
     if (!retained) {
         cf->setLineAttribute(row, 0);
     }
@@ -3957,8 +4209,8 @@ void VtermImpl::rectangleOrigin(u16& rowBase, u16& columnBase, u16& rowLimit, u1
     } else {
         rowBase = 0;
         columnBase = 0;
-        rowLimit = geometry.rows;
-        columnLimit = geometry.columns;
+        rowLimit = pane_.rows;
+        columnLimit = pane_.columns;
     }
 }
 
@@ -4236,7 +4488,7 @@ void VtermImpl::placeAsciiRun(const u8* input, size_t size) {
             continue;
         }
         if constexpr (!insert) {
-            if (autoWrapMode && lastCol && horizMarginMode && isCursorInsideMargins() && posY == marginBottom - 1 && (hMargin != 0 || nColsEff != geometry.columns)) {
+            if (autoWrapMode && lastCol && horizMarginMode && isCursorInsideMargins() && posY == marginBottom - 1 && (hMargin != 0 || nColsEff != pane_.columns)) {
                 const u16 lineWidth = nColsEff - hMargin;
                 const u16 fullLines = min<size_t>(size / lineWidth, 0xffff);
                 if (fullLines >= 2) {
@@ -4674,7 +4926,7 @@ void VtermImpl::jumpToNextTabStop() {
     const u16 previous = posX;
     const bool insideMargins = isCursorInsideMargins();
     const u16 left = insideMargins ? hMargin : 0;
-    const u16 right = insideMargins ? nColsEff : geometry.columns;
+    const u16 right = insideMargins ? nColsEff : pane_.columns;
     if (!tabStopsCustomized) {
         do {
             posX = ((posX / 8) + 1) * 8;
@@ -4718,7 +4970,7 @@ bool VtermImpl::performIndex() {
             scrollRegionUp(1);
             scrolled = true;
         }
-    } else if (posY < geometry.rows - 1) {
+    } else if (posY < pane_.rows - 1) {
         ++posY;
         lastCol = false;
     }
@@ -4999,7 +5251,7 @@ void VtermImpl::esc_FI() {
     if (posX >= hMargin && posX == nColsEff - 1) {
         deleteCols(hMargin, 1);
         lastCol = false;
-    } else if (posX < geometry.columns - 1) {
+    } else if (posX < pane_.columns - 1) {
         ++posX;
         lastCol = false;
     }
@@ -5022,7 +5274,7 @@ void VtermImpl::esc_NEL() {
 
 void VtermImpl::esc_HTS() {
     if (!tabStopsCustomized) {
-        for (unsigned column = 8; column < geometry.columns; column += 8) {
+        for (unsigned column = 8; column < pane_.columns; column += 8) {
             tabStops.pushBack((u16)(column));
         }
         tabStopsCustomized = true;
@@ -5096,8 +5348,8 @@ void VtermImpl::esc_DECRC() {
             posX = hMargin + min<u16>(savedCursor->posX, nColsEff - hMargin - 1);
             posY = marginTop + min<u16>(savedCursor->posY, marginBottom - marginTop - 1);
         } else {
-            posX = min<u16>(savedCursor->posX, geometry.columns - 1);
-            posY = min<u16>(savedCursor->posY, geometry.rows - 1);
+            posX = min<u16>(savedCursor->posX, pane_.columns - 1);
+            posY = min<u16>(savedCursor->posY, pane_.rows - 1);
         }
         lastCol = savedCursor->lastCol;
         attrs = savedCursor->attrs;
@@ -5119,7 +5371,7 @@ void VtermImpl::csi_CUU(u32 count) {
 }
 
 void VtermImpl::csi_CUD(u32 count) {
-    const u16 bottom = posY < marginBottom ? marginBottom : geometry.rows;
+    const u16 bottom = posY < marginBottom ? marginBottom : pane_.rows;
     count = min<u32>(count, bottom - posY - 1);
     posY += count;
     lastCol = false;
@@ -5127,7 +5379,7 @@ void VtermImpl::csi_CUD(u32 count) {
 
 void VtermImpl::csi_CUF(u32 count) {
     const bool insideMargins = posX >= hMargin && posX < nColsEff;
-    const u16 right = insideMargins ? nColsEff : geometry.columns;
+    const u16 right = insideMargins ? nColsEff : pane_.columns;
     count = min<u32>(count, right - posX - 1);
     posX += count;
     lastCol = false;
@@ -5140,7 +5392,7 @@ void VtermImpl::csi_CUB(u32 count) {
 void VtermImpl::moveCursorBackward(u32 count) {
     const bool insideMargins = posX >= hMargin && posX < nColsEff;
     const bool canReverseWrap = autoWrapMode && (reverseWrapMode || extendedReverseWrapMode);
-    bool findCycle = extendedReverseWrapMode && (u64)count > (u64)geometry.columns * geometry.rows;
+    bool findCycle = extendedReverseWrapMode && (u64)count > (u64)pane_.columns * pane_.rows;
     bool cycleStarted = false;
     u16 cycleRow = 0;
     u32 cycleRemaining = 0;
@@ -5176,7 +5428,7 @@ void VtermImpl::moveCursorBackward(u32 count) {
                 }
             }
         }
-        const u16 rightEdge = (insideMargins ? nColsEff : geometry.columns) - 1;
+        const u16 rightEdge = (insideMargins ? nColsEff : pane_.columns) - 1;
         if (extendedReverseWrapMode && posY == marginTop) {
             posY = marginBottom - 1;
             posX = rightEdge;
@@ -5223,7 +5475,7 @@ void VtermImpl::csi_CHA(u32 column) {
         column = max<u32>(1, min<u32>(column, nColsEff - hMargin));
         posX = hMargin + column - 1;
     } else {
-        column = max<u32>(1, min<u32>(column, geometry.columns));
+        column = max<u32>(1, min<u32>(column, pane_.columns));
         posX = column - 1;
     }
     lastCol = false;
@@ -5234,7 +5486,7 @@ void VtermImpl::csi_HPA(u32 column) {
 }
 
 void VtermImpl::csi_HPR(u32 count) {
-    const u16 right = originMode == OriginMode::ScrollingRegion ? nColsEff : geometry.columns;
+    const u16 right = originMode == OriginMode::ScrollingRegion ? nColsEff : pane_.columns;
     posX = (u16)(min<u64>((u64)(posX) + count, right - 1));
     lastCol = false;
 }
@@ -5244,14 +5496,14 @@ void VtermImpl::csi_VPA(u32 row) {
         row = max<u32>(1, min<u32>(row, marginBottom - marginTop));
         posY = marginTop + row - 1;
     } else {
-        row = max<u32>(1, min<u32>(row, geometry.rows));
+        row = max<u32>(1, min<u32>(row, pane_.rows));
         posY = row - 1;
     }
     lastCol = false;
 }
 
 void VtermImpl::csi_VPR(u32 count) {
-    const u16 bottom = originMode == OriginMode::ScrollingRegion ? marginBottom : geometry.rows;
+    const u16 bottom = originMode == OriginMode::ScrollingRegion ? marginBottom : pane_.rows;
     posY = (u16)(min<u64>((u64)(posY) + count, bottom - 1));
     lastCol = false;
 }
@@ -5259,8 +5511,8 @@ void VtermImpl::csi_VPR(u32 count) {
 void VtermImpl::csi_CUP(u32 row, u32 column) {
     switch (originMode) {
         case OriginMode::Absolute:
-            row = max<u32>(1, min<u32>(row, geometry.rows)) - 1;
-            column = max<u32>(1, min<u32>(column, geometry.columns)) - 1;
+            row = max<u32>(1, min<u32>(row, pane_.rows)) - 1;
+            column = max<u32>(1, min<u32>(column, pane_.columns)) - 1;
             break;
         case OriginMode::ScrollingRegion:
             row = marginTop + max<u32>(1, min<u32>(row, marginBottom - marginTop)) - 1;
@@ -5306,7 +5558,7 @@ void VtermImpl::csi_SD(u32 count) {
 }
 
 void VtermImpl::csi_CHT(u32 count) {
-    count = min<u32>(count, geometry.columns);
+    count = min<u32>(count, pane_.columns);
     if (count == 1) {
         inp_HT();
     } else {
@@ -5317,7 +5569,7 @@ void VtermImpl::csi_CHT(u32 count) {
 }
 
 void VtermImpl::csi_CBT(u32 count) {
-    count = min<u32>(count, geometry.columns);
+    count = min<u32>(count, pane_.columns);
     for (u32 k = 0; k < count; ++k) {
         const u16 left = originMode == OriginMode::ScrollingRegion ? hMargin : 0;
         if (!tabStopsCustomized) {
@@ -5349,9 +5601,9 @@ void VtermImpl::csi_REP(u32 count) {
     if (width == 0) {
         return;
     }
-    const u64 observableCells = ((u64)(config().saveLines) + geometry.rows + 1) * geometry.columns;
+    const u64 observableCells = ((u64)(config().saveLines) + pane_.rows + 1) * pane_.columns;
     if (count > observableCells) {
-        count = (u32)(observableCells + (count - observableCells) % geometry.columns);
+        count = (u32)(observableCells + (count - observableCells) % pane_.columns);
     }
     if ((data & 0x04) == 0 || insertMode) {
         for (u32 k = 0; k < count; ++k) {
@@ -5394,8 +5646,8 @@ void VtermImpl::csi_REP(u32 count) {
 
 void VtermImpl::eraseDisplayAfter() {
     normalizeCursorPos();
-    eraseEcmaRangeInRow(posY, posX, geometry.columns - posX);
-    for (u16 row = posY + 1; row < geometry.rows; ++row) {
+    eraseEcmaRangeInRow(posY, posX, pane_.columns - posX);
+    for (u16 row = posY + 1; row < pane_.rows; ++row) {
         eraseEcmaRow(row);
     }
 }
@@ -5410,7 +5662,7 @@ void VtermImpl::eraseDisplayBefore() {
 
 void VtermImpl::eraseDisplayAll() {
     normalizeCursorPos();
-    for (u16 row = 0; row < geometry.rows; ++row) {
+    for (u16 row = 0; row < pane_.rows; ++row) {
         eraseEcmaRow(row);
     }
 }
@@ -5421,7 +5673,7 @@ void VtermImpl::eraseScrollback() {
 
 void VtermImpl::eraseLineAfter() {
     normalizeCursorPos();
-    eraseEcmaRangeInRow(posY, posX, geometry.columns - posX);
+    eraseEcmaRangeInRow(posY, posX, pane_.columns - posX);
 }
 
 void VtermImpl::eraseLineBefore() {
@@ -5431,35 +5683,35 @@ void VtermImpl::eraseLineBefore() {
 
 void VtermImpl::eraseLineAll() {
     normalizeCursorPos();
-    eraseEcmaRangeInRow(posY, 0, geometry.columns);
+    eraseEcmaRangeInRow(posY, 0, pane_.columns);
 }
 
 void VtermImpl::selectiveEraseDisplayAfter() {
     normalizeCursorPos();
-    selectiveEraseRangeInRow(posY, posX, geometry.columns - posX);
-    for (u16 row = posY + 1; row < geometry.rows; ++row) {
-        selectiveEraseRangeInRow(row, 0, geometry.columns);
+    selectiveEraseRangeInRow(posY, posX, pane_.columns - posX);
+    for (u16 row = posY + 1; row < pane_.rows; ++row) {
+        selectiveEraseRangeInRow(row, 0, pane_.columns);
     }
 }
 
 void VtermImpl::selectiveEraseDisplayBefore() {
     normalizeCursorPos();
     for (u16 row = 0; row < posY; ++row) {
-        selectiveEraseRangeInRow(row, 0, geometry.columns);
+        selectiveEraseRangeInRow(row, 0, pane_.columns);
     }
     selectiveEraseRangeInRow(posY, 0, posX + 1);
 }
 
 void VtermImpl::selectiveEraseDisplayAll() {
     normalizeCursorPos();
-    for (u16 row = 0; row < geometry.rows; ++row) {
-        selectiveEraseRangeInRow(row, 0, geometry.columns);
+    for (u16 row = 0; row < pane_.rows; ++row) {
+        selectiveEraseRangeInRow(row, 0, pane_.columns);
     }
 }
 
 void VtermImpl::selectiveEraseLineAfter() {
     normalizeCursorPos();
-    selectiveEraseRangeInRow(posY, posX, geometry.columns - posX);
+    selectiveEraseRangeInRow(posY, posX, pane_.columns - posX);
 }
 
 void VtermImpl::selectiveEraseLineBefore() {
@@ -5469,7 +5721,7 @@ void VtermImpl::selectiveEraseLineBefore() {
 
 void VtermImpl::selectiveEraseLineAll() {
     normalizeCursorPos();
-    selectiveEraseRangeInRow(posY, 0, geometry.columns);
+    selectiveEraseRangeInRow(posY, 0, pane_.columns);
 }
 
 void VtermImpl::setDecProtection(bool enabled) {
@@ -5589,7 +5841,7 @@ void VtermImpl::csi_DCH(u32 count) {
 }
 
 void VtermImpl::csi_ECH(u32 count) {
-    const u32 len = geometry.columns - posX;
+    const u32 len = pane_.columns - posX;
     count = min(count, len);
     eraseEcmaRangeInRow(posY, posX, count);
     lastCol = false;
@@ -5597,8 +5849,8 @@ void VtermImpl::csi_ECH(u32 count) {
 
 void VtermImpl::csi_STBM(u32 top, u32 bottom, bool valid) {
     const u32 newMarginTop = top > 0 ? top - 1 : 0;
-    const u32 newMarginBottom = bottom == 0 ? geometry.rows : min<u32>(bottom, geometry.rows);
-    const bool illegal = newMarginTop >= geometry.rows || newMarginBottom <= newMarginTop + 1;
+    const u32 newMarginBottom = bottom == 0 ? pane_.rows : min<u32>(bottom, pane_.rows);
+    const bool illegal = newMarginTop >= pane_.rows || newMarginBottom <= newMarginTop + 1;
     if (!valid || illegal) {
         // A rejected region is a complete no-op, the cursor stays.
         return;
@@ -5618,8 +5870,8 @@ void VtermImpl::csi_STBM(u32 top, u32 bottom, bool valid) {
 
 void VtermImpl::csi_SLRM(u32 left, u32 right, bool valid) {
     const u32 newMarginLeft = left > 0 ? left - 1 : 0;
-    const u32 newMarginRight = right == 0 ? geometry.columns : right;
-    const bool illegal = newMarginLeft >= geometry.columns || newMarginRight > geometry.columns || newMarginRight <= newMarginLeft + 1;
+    const u32 newMarginRight = right == 0 ? pane_.columns : right;
+    const bool illegal = newMarginLeft >= pane_.columns || newMarginRight > pane_.columns || newMarginRight <= newMarginLeft + 1;
     if (!valid || illegal) {
         // xterm: a rejected region is a complete no-op, the cursor stays.
         return;
@@ -5639,7 +5891,7 @@ void VtermImpl::csi_SLRM(u32 left, u32 right, bool valid) {
 
 void VtermImpl::clearTabStop() {
     if (!tabStopsCustomized) {
-        for (unsigned column = 8; column < geometry.columns; column += 8) {
+        for (unsigned column = 8; column < pane_.columns; column += 8) {
             tabStops.pushBack((u16)(column));
         }
         tabStopsCustomized = true;
@@ -5823,7 +6075,7 @@ void VtermImpl::setHorizontalMargins(bool enabled) {
     if (compatLevel >= CompatibilityLevel::VT400) {
         horizMarginMode = enabled;
         hMargin = 0;
-        nColsEff = geometry.columns;
+        nColsEff = pane_.columns;
     }
 }
 
@@ -5966,7 +6218,7 @@ void VtermImpl::csi_terDA() {
 
 void VtermImpl::csi_DECRQDE() {
     StringBuilder response;
-    response << geometry.rows << StringView(u8";") << geometry.columns << StringView(u8";1;1;1\"w");
+    response << pane_.rows << StringView(u8";") << pane_.columns << StringView(u8";1;1;1\"w");
     writeCsiResponse(StringView(response));
 }
 
@@ -5987,7 +6239,7 @@ void VtermImpl::csi_XTSMGRAPHICS(u32 item, u32 action, u32 value) {
     } else if (item == 1) {
         response << StringView(u8"?1;0;") << (u32)(SixelPatch::paletteEntries) << StringView(u8"S");
     } else {
-        response << StringView(u8"?2;0;") << (u32)(geometry.columns) * SixelPatch::width << StringView(u8";") << (u32)(geometry.rows) * SixelPatch::height << StringView(u8"S");
+        response << StringView(u8"?2;0;") << (u32)(pane_.columns) * SixelPatch::width << StringView(u8";") << (u32)(pane_.rows) * SixelPatch::height << StringView(u8"S");
     }
     writeCsiResponse(StringView(response));
 }
@@ -6125,7 +6377,7 @@ void VtermImpl::csi_DECRQPSR_TABS() {
     bool first = true;
     if (tabStopsCustomized) {
         for (u16 column : tabStops) {
-            if (column >= geometry.columns) {
+            if (column >= pane_.columns) {
                 break;
             }
             if (!first) {
@@ -6135,7 +6387,7 @@ void VtermImpl::csi_DECRQPSR_TABS() {
             first = false;
         }
     } else {
-        for (u32 column = 8; column < geometry.columns; column += 8) {
+        for (u32 column = 8; column < pane_.columns; column += 8) {
             if (!first) {
                 response << StringView(u8"/");
             }
@@ -6193,9 +6445,9 @@ void VtermImpl::csi_DECRQUPSS() {
 void VtermImpl::esch_DECALN() {
     originMode = OriginMode::Absolute;
     marginTop = 0;
-    marginBottom = geometry.rows;
+    marginBottom = pane_.rows;
     hMargin = 0;
-    nColsEff = geometry.columns;
+    nColsEff = pane_.columns;
     posX = 0;
     posY = 0;
     lastCol = false;
@@ -6215,7 +6467,7 @@ void VtermImpl::esch_DECALN() {
 void VtermImpl::setLineAttribute(u8 attribute) {
     cf->setLineAttribute(posY, attribute);
     if (attribute) {
-        posX = min<u16>(posX, max(1, geometry.columns / 2) - 1);
+        posX = min<u16>(posX, max(1, pane_.columns / 2) - 1);
     }
     lastCol = false;
 }
@@ -6233,9 +6485,9 @@ void VtermImpl::csi_DECSTR() {
     activeHyperlink = 0;
     horizMarginMode = false;
     marginTop = 0;
-    marginBottom = geometry.rows;
+    marginBottom = pane_.rows;
     hMargin = 0;
-    nColsEff = geometry.columns;
+    nColsEff = pane_.columns;
     savedCursor->posX = 0;
     savedCursor->posY = 0;
     savedCursor->lastCol = false;
@@ -6336,8 +6588,8 @@ void VtermImpl::dcs_DECRSTS_CURSOR(u32 row, u32 column, u8 rendition, u8 protect
         charsetState.ids[index] = charsetIds[index];
     }
 
-    posY = (u16)(min<u32>(row, geometry.rows) - 1);
-    posX = (u16)(min<u32>(column, geometry.columns) - 1);
+    posY = (u16)(min<u32>(row, pane_.rows) - 1);
+    posX = (u16)(min<u32>(column, pane_.columns) - 1);
     lastCol = flags & 8;
     changePresentation();
 }
@@ -6469,8 +6721,13 @@ void VtermImpl::dcs_DECRQSS_DECSLRM() {
 }
 
 void VtermImpl::dcs_DECRQSS_DECSLPP() {
+    // A5-3: the page length a DECRQSS answers with is this terminal's own
+    // row count, not the window's. The two were the same number until A8
+    // gave the terminal its own grid; the path here runs through
+    // windowInfo() rather than the window grid, which is why A8's grep did
+    // not catch it.
     StringBuilder value;
-    value << windowRows() << StringView(u8"t");
+    value << pane_.rows << StringView(u8"t");
     writeDecrqssResponse(StringView(value));
 }
 
@@ -6640,24 +6897,53 @@ plt::WindowInfo VtermImpl::windowInfo() const {
     return host.info();
 }
 
+// T5.1 SS2.7, T5.5: these two, and the two grid* calls in
+// windowOperation() below, are the *window's* questions - how much grid
+// fits in a given number of the window's pixels. They divide
+// windowInfo().width, and the insets they take out of it are the
+// window's content insets, which include whatever chrome reserved. This
+// pane's insets are the border alone (A10), so substituting them here
+// would answer with more columns than the window has and CSI 18t /
+// CSI 19t would tell the application to draw wider than the pane.
+// Nothing crashes; the report is simply wrong. The fallback is the
+// window's grid for the same reason: it answers the same question with
+// the cell size still unknown.
+//
+// The substitution got cheaper the day the insets started arriving
+// through VtHost: host.contentInsets() and pane_.insets are now both in
+// reach of one method, where they used to sit on different objects. It
+// is guarded by
+// TheWindowReportsCountTheWindowsOwnReserveAndNotThePanesBorder in
+// lib/shitty/vt_headless_ut.cpp, which is the one fixture where the
+// window's reserve is not zero.
+u32 VtermImpl::columnsForPixelWidth(u32 width) const {
+    if (windowGeometry_.cellPixelWidth == 0) {
+        return windowGeometry_.columns;
+    }
+    return vtGridColumns(width, host.contentInsets(), windowGeometry_.cellPixelWidth);
+}
+
+u32 VtermImpl::rowsForPixelHeight(u32 height) const {
+    if (windowGeometry_.cellPixelHeight == 0) {
+        return windowGeometry_.rows;
+    }
+    return vtGridRows(height, host.contentInsets(), windowGeometry_.cellPixelHeight);
+}
+
 u32 VtermImpl::windowColumns() const {
-    const auto info = windowInfo();
-    return host.gridSize(info.width, info.height).columns;
+    return columnsForPixelWidth(windowInfo().width);
 }
 
 u32 VtermImpl::windowRows() const {
-    const auto info = windowInfo();
-    return host.gridSize(info.width, info.height).rows;
+    return rowsForPixelHeight(windowInfo().height);
 }
 
 u32 VtermImpl::screenColumns() const {
-    const auto info = windowInfo();
-    return host.gridSize(info.screenPixelWidth, info.screenPixelHeight).columns;
+    return columnsForPixelWidth(windowInfo().screenPixelWidth);
 }
 
 u32 VtermImpl::screenRows() const {
-    const auto info = windowInfo();
-    return host.gridSize(info.screenPixelWidth, info.screenPixelHeight).rows;
+    return rowsForPixelHeight(windowInfo().screenPixelHeight);
 }
 
 void VtermImpl::windowOperation(u32 operation, u32 first, u32 second) {
@@ -6670,6 +6956,7 @@ void VtermImpl::windowOperation(u32 operation, u32 first, u32 second) {
             return;
         }
         window->requestResize(pixelWidth, pixelHeight);
+        window->surfaceResized(pixelWidth, pixelHeight);
     };
     switch (operation) {
         case 1:
@@ -6711,8 +6998,9 @@ void VtermImpl::windowOperation(u32 operation, u32 first, u32 second) {
         pixelWidth = second;
         pixelHeight = first;
     } else if (operation == 8 && first != 0 && second != 0) {
-        window->requestResizeCells(second, first);
-        return;
+        const VtInsets insets = host.contentInsets();
+        pixelWidth = vtGridPixelWidth(second, insets, windowGeometry_.cellPixelWidth);
+        pixelHeight = vtGridPixelHeight(first, insets, windowGeometry_.cellPixelHeight);
     } else {
         return;
     }
@@ -7172,6 +7460,7 @@ void VtermImpl::osc_SHELL_A(StringView payload) {
     // marker keeps the majority reading and stays put.
     recordOsc(133, payload);
     startSemanticPrompt(payload);
+    promptReported = false;
     semanticClick = SemanticClick::None;
     const StringView clickEvents = semanticOption(payload, StringView(u8"click_events"));
     if (clickEvents == StringView(u8"1")) {
@@ -7195,6 +7484,8 @@ void VtermImpl::osc_SHELL_A(StringView payload) {
 void VtermImpl::osc_SHELL_B(StringView payload) {
     currentSemantic = 2;
     semanticUntilEndOfLine = false;
+    promptColumn = posX;
+    promptReported = false;
     recordOsc(133, payload);
 }
 
@@ -7209,6 +7500,7 @@ void VtermImpl::osc_SHELL_C(StringView payload) {
 
 void VtermImpl::osc_SHELL_D(StringView payload) {
     currentSemantic = 0;
+    promptReported = false;
     semanticUntilEndOfLine = false;
     recordOsc(133, payload);
 }
@@ -7251,6 +7543,20 @@ void VtermImpl::osc_SHELL_UNKNOWN(StringView payload) {
 
 void VtermImpl::osc_UNKNOWN(u32 command, StringView payload) {
     recordOsc(command, payload);
+    if (command == promptReportOsc) {
+        // Only between the prompt's start and the command's: a report from
+        // anywhere else names no line on this screen.
+        if (promptAtInput() && decodePromptReport(payload, promptLine)) {
+            if (!promptReported && config().verbose) {
+                // Once a prompt, so the log says the integration is heard.
+                fprintf(stderr, "%.*s: prompt editor: line reported, input at column %u, cursor at %u,%u\n", (int)(config().brandName.length()), (const char*)(config().brandName.data()), (unsigned)(promptColumn), (unsigned)(posX), (unsigned)(posY));
+            }
+            promptReported = true;
+        } else if (config().verbose) {
+            fprintf(stderr, "%.*s: prompt editor: report refused, semantic=%u, %zu bytes\n", (int)(config().brandName.length()), (const char*)(config().brandName.data()), (unsigned)(currentSemantic), (size_t)(payload.length()));
+        }
+        return;
+    }
     if (command == 1337 && payload == StringView(u8"Capabilities")) {
         // iTerm2 feature reporting: the same string children get in
         // TERM_FEATURES, for applications that ask instead.
@@ -7397,7 +7703,7 @@ void VtermImpl::applyNotificationPart(StringView id, StringView payload, bool en
 
 void VtermImpl::reportInBandResize() {
     StringBuilder response;
-    response << StringView(u8"48;") << geometry.rows << StringView(u8";") << geometry.columns << StringView(u8";") << geometry.pixelHeight << StringView(u8";") << geometry.pixelWidth << StringView(u8"t");
+    response << StringView(u8"48;") << pane_.rows << StringView(u8";") << pane_.columns << StringView(u8";") << pane_.rows * windowGeometry_.cellPixelHeight << StringView(u8";") << pane_.columns * windowGeometry_.cellPixelWidth << StringView(u8"t");
     writeCsiResponse(StringView(response));
 }
 
@@ -7484,10 +7790,9 @@ void VtermImpl::xtReportWindowPosition() {
 void VtermImpl::xtReportWindowPixelSize(bool compositorSize) {
     StringBuilder response;
     if (compositorSize) {
-        const auto info = windowInfo();
-        response << StringView(u8"4;") << info.height << StringView(u8";") << info.width << StringView(u8"t");
+        response << StringView(u8"4;") << windowGeometry_.pixelHeight << StringView(u8";") << windowGeometry_.pixelWidth << StringView(u8"t");
     } else {
-        response << StringView(u8"4;") << geometry.pixelHeight << StringView(u8";") << geometry.pixelWidth << StringView(u8"t");
+        response << StringView(u8"4;") << pane_.rows * windowGeometry_.cellPixelHeight << StringView(u8";") << pane_.columns * windowGeometry_.cellPixelWidth << StringView(u8"t");
     }
     writeCsiResponse(StringView(response));
 }
@@ -7501,13 +7806,13 @@ void VtermImpl::xtReportScreenPixelSize() {
 
 void VtermImpl::xtReportCellSize() {
     StringBuilder response;
-    response << StringView(u8"6;") << geometry.cellPixelHeight << StringView(u8";") << geometry.cellPixelWidth << StringView(u8"t");
+    response << StringView(u8"6;") << windowGeometry_.cellPixelHeight << StringView(u8";") << windowGeometry_.cellPixelWidth << StringView(u8"t");
     writeCsiResponse(StringView(response));
 }
 
 void VtermImpl::xtReportGridSize() {
     StringBuilder response;
-    response << StringView(u8"8;") << geometry.rows << StringView(u8";") << geometry.columns << StringView(u8"t");
+    response << StringView(u8"8;") << pane_.rows << StringView(u8";") << pane_.columns << StringView(u8"t");
     writeCsiResponse(StringView(response));
 }
 
@@ -8925,8 +9230,24 @@ u32 VtermImpl::translateCharset(Charset charset, unsigned char ch) const {
 #undef LOOKUP
 }
 
-void VtermImpl::windowResized() {
+void VtermImpl::paneResized(const VtGeometry& geometry) {
+    pane_ = geometry;
+    // Both, unconditionally, exactly as the window resize did: resizeGrid
+    // decides for itself whether the grid actually moved, and a caller
+    // that tried to decide that here would need its own copy of the
+    // comparison - and would get the CSI 48 report wrong, which
+    // resizeGrid owes the child even when the grid did not change.
     resizeGrid();
+    // T10/A6-4: and every row on top, whether the grid moved or not.
+    // A tab is laid out as a whole, so this arrives at every pane of it
+    // the moment any one of them is divided, closed or dragged - and the
+    // renderer keys its retained cells on the shape of the *frame*, not
+    // of one pane. It refuses a reshaped frame that arrives with a
+    // partial grid, so the pane whose own grid happened not to change
+    // would send nothing, the frame would be refused, and the window
+    // would ask for it again forever. Screen::expose, not Vterm::expose:
+    // the latter only redraws, which marks no rows (see show()).
+    cf->expose();
     redraw();
 }
 
@@ -8934,15 +9255,18 @@ const VtConfig& VtermImpl::config() const {
     return *configSlot_.config;
 }
 
-VtermImpl::VtermImpl(ObjPool& owner, VtGeometry& geometry_, const VtConfigSlot& configSlot, VtCellExtras& extras, SmallObjAllocator& smallObjects, plt::Scheduler& scheduler, VtHost& host_, PtyHandle& pty, VtermTraceFactory* traceFactory_, Output* dump_)
+VtermImpl::VtermImpl(ObjPool& owner, VtGeometry& windowGeometry, const VtConfigSlot& configSlot, VtCellExtras& extras, SmallObjAllocator& smallObjects, plt::Scheduler& scheduler, VtHost& host_, const VtGeometry& geometry, PtyHandle& pty, VtermTraceFactory* traceFactory_, Output* dump_)
     : input(this)
     , owner_(owner)
-    , geometry(geometry_)
+    , windowGeometry_(windowGeometry)
     , configSlot_(configSlot)
     , extras_(extras)
     , smallObjects_(smallObjects)
     , scheduler_(scheduler)
     , host(host_)
+    // A8: the first screen is built from the geometry the owner handed
+    // over, not from the window - see Vterm::create.
+    , pane_(geometry)
     , ptyStream_(pty)
     , ptyOutput_(&ptyStream_)
     , ptyMutex_(scheduler.createMutex(owner))
@@ -8953,7 +9277,7 @@ VtermImpl::VtermImpl(ObjPool& owner, VtGeometry& geometry_, const VtConfigSlot& 
     , notifications(&owner)
     , savedPrivModes(&owner)
     , userDefinedKeys(&owner)
-    , nColsEff(geometry.columns)
+    , nColsEff(pane_.columns)
     , hMargin(0)
 {
     try {
@@ -8965,7 +9289,7 @@ VtermImpl::VtermImpl(ObjPool& owner, VtGeometry& geometry_, const VtConfigSlot& 
         throw;
     }
     cf = frame_pri;
-    outputRows.grow((size_t)(geometry.rows));
+    outputRows.grow((size_t)(pane_.rows));
     makePalette256(config(), colors.palette);
     memcpy(originalPalette256, colors.palette, sizeof(originalPalette256));
     colors.defaultForeground = config().fg;
@@ -8997,6 +9321,15 @@ VtermImpl::VtermImpl(ObjPool& owner, VtGeometry& geometry_, const VtConfigSlot& 
     defaultBgPalIx = -1;
     fgPalIx = defaultFgPalIx;
     bgPalIx = defaultBgPalIx;
+    extras_.changedListeners.pushBack(owner.make<CallVtermCollectExtras>(this));
+}
+
+CallVtermCollectExtras::CallVtermCollectExtras(VtermImpl* terminal_)
+    : terminal(terminal_) {
+}
+
+void CallVtermCollectExtras::collectExtras(Vector<TerminalCell*>& cells, Vector<u32*>& roots) {
+    terminal->collectExtras(cells, roots);
 }
 
 void VtermImpl::configChanged() {
@@ -9048,7 +9381,7 @@ void VtermImpl::presentationInvalidated() {
     redraw();
 }
 
-void VtermImpl::activate() {
+void VtermImpl::show() {
     // Screen::expose, not Vterm::expose: the latter only redraws, which
     // marks no rows, and the renderer needs every row back to shed the
     // outgoing terminal's retained cells.
@@ -9062,7 +9395,7 @@ void VtermImpl::activate() {
     notifyTitleChanged(stringView(presentedTitle));
 }
 
-void VtermImpl::deactivate() {
+void VtermImpl::hide() {
     // Losing the window is the same event as losing focus, and focus
     // already knows every piece of pointer state that must not survive
     // it: held buttons, an open selection, the autoscroll timer that
@@ -9079,7 +9412,7 @@ void VtermImpl::resizeGrid() {
     // The history capacity is part of what makes a screen current: a
     // configuration that only changed saveLines still needs the rebuild.
     const bool historyCurrent = cf == frame_alt || info.saveLines == config().saveLines;
-    if (previousColumns == geometry.columns && previousRows == geometry.rows && historyCurrent) {
+    if (previousColumns == pane_.columns && previousRows == pane_.rows && historyCurrent) {
         if (synchronizedOutputMode) {
             setSynchronizedOutput(false);
         }
@@ -9112,16 +9445,16 @@ void VtermImpl::resizeGrid() {
     // horizontal region to the resized page as well; retaining a clipped
     // right edge made subsequent growth keep a stale narrow region.
     marginTop = 0;
-    marginBottom = geometry.rows;
-    nColsEff = geometry.columns;
+    marginBottom = pane_.rows;
+    nColsEff = pane_.columns;
     hMargin = 0;
     if (tabStopsCustomized && !tabStopsRestored) {
-        while (!tabStops.empty() && tabStops.back() >= geometry.columns) {
+        while (!tabStops.empty() && tabStops.back() >= pane_.columns) {
             tabStops.popBack();
         }
-        if (geometry.columns > previousColumns) {
+        if (pane_.columns > previousColumns) {
             unsigned column = ((unsigned)(previousColumns) + 7) & ~7u;
-            for (; column < geometry.columns; column += 8) {
+            for (; column < pane_.columns; column += 8) {
                 tabStops.pushBack((u16)(column));
             }
         }
@@ -9131,7 +9464,7 @@ void VtermImpl::resizeGrid() {
     lastCol = pendingWrap;
     showCursor();
 
-    outputRows.grow((size_t)(geometry.rows));
+    outputRows.grow((size_t)(pane_.rows));
     updateExtraCellCount();
     refreshBlinkingText();
     if (inBandResizeMode) {
@@ -9756,7 +10089,7 @@ namespace {
 }
 
 size_t VtermImpl::placeAsciiLines(const u8* input, size_t size) {
-    if (insertMode || posX != 0 || lastCol || inputGraphemeScreen != nullptr || horizMarginMode || hMargin != 0 || nColsEff != geometry.columns || marginTop != 0 || marginBottom != geometry.rows || semanticUntilEndOfLine) {
+    if (insertMode || posX != 0 || lastCol || inputGraphemeScreen != nullptr || horizMarginMode || hMargin != 0 || nColsEff != pane_.columns || marginTop != 0 || marginBottom != pane_.rows || semanticUntilEndOfLine) {
         return 0;
     }
 
@@ -9773,7 +10106,7 @@ size_t VtermImpl::placeAsciiLines(const u8* input, size_t size) {
             break;
         }
         const u32 row = (u32)(posY) + lineCount;
-        if (row < geometry.rows && cf->lineAttribute(row) != 0) {
+        if (row < pane_.rows && cf->lineAttribute(row) != 0) {
             break;
         }
         if (length != 0) {
@@ -9792,7 +10125,7 @@ size_t VtermImpl::placeAsciiLines(const u8* input, size_t size) {
     if (havePreceding) {
         utf8dec.setUnicode(preceding);
     }
-    posY = min<u32>((u32)(posY) + lineCount, geometry.rows - 1);
+    posY = min<u32>((u32)(posY) + lineCount, pane_.rows - 1);
     posX = 0;
     lastCol = false;
     if (attrs.blink) {
@@ -9843,11 +10176,7 @@ void VtermImpl::getHyperlink(int pX, int pY, Buffer& out) const {
 }
 
 Point VtermImpl::selectionPoint(int pX, int pY) const {
-    const int contentWidth = (int)(min<u32>(geometry.pixelWidth, INT_MAX));
-    const int contentHeight = max(1, (int)(min<u32>(geometry.pixelHeight, INT_MAX)));
-    pX = min(max(0, pX), contentWidth);
-    pY = min(max(0, pY), contentHeight - 1);
-    return cf->logicalPoint(Point(min(pX / geometry.cellPixelWidth, (int)geometry.columns), min(pY / geometry.cellPixelHeight, (int)geometry.rows - 1)));
+    return cf->logicalPoint(mouseSelectionCell(pX, pY, mouseGeometry(pane_, windowGeometry_), pane_.columns, pane_.rows));
 }
 
 void VtermImpl::selectStart(int pX, int pY, bool cycleSnapTo) {
@@ -9994,7 +10323,7 @@ void VtermImpl::pasteSelection(StringView utf8_selection) {
     }
 }
 
-Vterm* Vterm::create(ObjPool& owner, VtGeometry& geometry, const VtConfigSlot& configSlot, VtCellExtras& extras, SmallObjAllocator& smallObjects, plt::Scheduler& scheduler, VtHost& host, PtyHandle& pty, VtermTraceFactory* traceFactory) {
+Vterm* Vterm::create(ObjPool& owner, VtGeometry& windowGeometry, const VtConfigSlot& configSlot, VtCellExtras& extras, SmallObjAllocator& smallObjects, plt::Scheduler& scheduler, VtHost& host, const VtGeometry& geometry, PtyHandle& pty, VtermTraceFactory* traceFactory) {
     const VtConfig& config = *configSlot.config;
     Output* dump = nullptr;
     if (!config.dump.empty()) {
@@ -10006,13 +10335,18 @@ Vterm* Vterm::create(ObjPool& owner, VtGeometry& geometry, const VtConfigSlot& c
         dump = createOutBuf(&owner, *createFDRegular(&owner, *fd));
     }
 
-    extras.store->setCellCount((size_t)(geometry.columns) * (geometry.rows + config.saveLines));
+    // Nothing sizes the extra store from `geometry` here, and that is the
+    // point (R5-qa, Q2): a pane's grid is the wrong base for a store the
+    // whole window shares, and this seeding was redundant anyway -
+    // resetTerminal() below reaches updateExtraCellCount() before create()
+    // returns, and that is the one place the store's budget comes from.
+    //
     // Resize and invalidation delivery belongs to whoever owns the
     // terminal's lifetime - the session set, or the headless host -
-    // because composer's listener lists have no way out for a
+    // because the embedder's listener lists have no way out for a
     // registration whose session died. The same owner keeps the pointer:
     // a freshly built terminal is nobody's active one.
-    VtermImpl* const vterm = owner.make<VtermImpl>(owner, geometry, configSlot, extras, smallObjects, scheduler, host, pty, traceFactory, dump);
+    VtermImpl* const vterm = owner.make<VtermImpl>(owner, windowGeometry, configSlot, extras, smallObjects, scheduler, host, geometry, pty, traceFactory, dump);
     vterm->resetTerminal();
     vterm->startTimers();
     return vterm;

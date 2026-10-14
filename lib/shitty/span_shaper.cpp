@@ -166,10 +166,14 @@ namespace {
         SpanShaperImpl* shaper;
     };
 
-    struct CallShaperExtrasCollected final: public Listener {
+    // The shaper owns no refs of its own - the cells belong to the
+    // terminals behind the window - so it takes only the second half of
+    // the client interface: the shaping cache keyed by ref is what a
+    // rebuilt store voids.
+    struct CallShaperExtrasCollected final: public CellExtraClient {
         explicit CallShaperExtrasCollected(SpanShaperImpl* shaper_);
 
-        void onListen(void*) override;
+        void extrasCollected() override;
 
         SpanShaperImpl* shaper;
     };
@@ -189,7 +193,7 @@ CallShaperExtrasCollected::CallShaperExtrasCollected(SpanShaperImpl* shaper_)
 {
 }
 
-void CallShaperExtrasCollected::onListen(void*) {
+void CallShaperExtrasCollected::extrasCollected() {
     shaper->onExtrasCollected();
 }
 

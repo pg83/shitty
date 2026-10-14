@@ -422,14 +422,16 @@ def _segment_cmap(mapping):
     return struct.pack(">HHHHI", 0, 1, 3, 1, 12) + subtable
 
 
-def make_box_font(family, advance, codepoints, ascender=800, descender=-200):
+def make_box_font(family, advance, codepoints, ascender=800, descender=-200, boxes=None):
     # Every listed BMP codepoint maps to a solid box filling most of the
-    # cell - unmistakable ink for coverage assertions.
+    # cell - unmistakable ink for coverage assertions. `boxes` puts a
+    # codepoint's box elsewhere: {codepoint: (xmin, ymin, xmax, ymax)}.
+    boxes = boxes or {}
     glyphs = [struct.pack(">hhhhh", 0, 0, 0, 0, 0)]
     mapping = {}
     for code in sorted(codepoints):
         mapping[code] = len(glyphs)
-        glyphs.append(_box_glyph(50, 0, advance - 50, 700))
+        glyphs.append(_box_glyph(*boxes.get(code, (50, 0, advance - 50, 700))))
     glyf = bytearray()
     loca = [0]
     for glyph in glyphs:

@@ -7,9 +7,12 @@ namespace stl {
     struct Embed {
         T t;
 
+        // stl:: on purpose - see the note on ObjPool::makeImpl. Embed is the
+        // other half of that path: ObjPool::make() wraps T in one of these,
+        // so an argument from namespace std reaches ADL here too.
         template <typename... A>
         Embed(A&&... a)
-            : t(forward<A>(a)...)
+            : t(stl::forward<A>(a)...)
         {
         }
     };

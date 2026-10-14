@@ -9,7 +9,7 @@ its own shell would.
 import time
 import unittest
 
-from harness import Shitty
+from harness import ShittyWithTabs as Shitty
 
 
 class TabTest(unittest.TestCase):

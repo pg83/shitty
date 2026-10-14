@@ -17,7 +17,7 @@
 #include "composer.h"
 #include <lib/vterm/num.h>
 #include "options.h"
-#include <lib/vterm/vt_headless.h>
+#include <lib/shitty/vt_headless.h>
 
 #include <std/ios/in_fd.h>
 #include <std/ios/sys.h>
@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
         Options* const options = pool->make<Options>();
         options->vt.saveLines = (u16)(saveLines);
         composer->setOptions(options);
-        VtermHeadless* const host = VtermHeadless::create(*pool, *composer->vtConfig.config, nullptr, nullptr);
+        VtermHeadless* const host = VtermHeadless::create(*composer, nullptr);
 
         const u64 started = monotonicNowUs();
         const u8* input = (const u8*)(corpus.data());

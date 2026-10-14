@@ -30,11 +30,12 @@
 
 #include "options.h"
 #include "composer.h"
+#include "grid_geometry.h"
 
 #include <lib/vterm/vterm.h>
 #include <lib/vterm/vt_test.h>
 #include <lib/vterm/vt_trace.h>
-#include <lib/vterm/vt_headless.h>
+#include <lib/shitty/vt_headless.h>
 #include <lib/vterm/terminal_types.h>
 
 #include <std/ios/sys.h>
@@ -117,7 +118,7 @@ namespace {
             composer = pool->make<Composer>(pool.mutPtr());
             pty = pool->make<CaptureOutput>();
             CaptureTestApi capture;
-            headless = VtermHeadless::create(*composer->pool, *composer->vtConfig.config, &capture, pty);
+            headless = VtermHeadless::create(*composer, &capture, pty);
             term = headless->terminal();
             api = capture.api;
         }
@@ -245,8 +246,9 @@ namespace {
     }
 
     static bool equalHyperlink(const Rig& a, const Rig& b, u16 row, u16 column) {
-        const int x = column * a.headless->geometry().cellPixelWidth;
-        const int y = row * a.headless->geometry().cellPixelHeight;
+        const Insets insets = a.composer->contentInsets();
+        const int x = insets.left + column * a.composer->geometry.cellPixelWidth;
+        const int y = insets.top + row * a.composer->geometry.cellPixelHeight;
         const StringView la = a.api->hyperlinkAt(x, y);
         const StringView lb = b.api->hyperlinkAt(x, y);
         return la.length() == lb.length() && (la.empty() || memcmp(la.data(), lb.data(), la.length()) == 0);
@@ -496,7 +498,8 @@ namespace {
                 if (len >= 2) {
                     const u16 columns = (u16)(1 + payload[0] % 200);
                     const u16 rows = (u16)(1 + payload[1] % 60);
-                    rig.headless->geometry().resizeCells(columns, rows, rig.headless->host());
+                    const Insets insets = rig.composer->contentInsets();
+                    rig.composer->resize((u16)(gridPixelWidth(columns, insets, rig.composer->geometry.cellPixelWidth)), (u16)(gridPixelHeight(rows, insets, rig.composer->geometry.cellPixelHeight)));
                 }
                 break;
             case 218:
@@ -522,12 +525,13 @@ namespace {
                 if (len >= 2) {
                     // Grow, then shrink straight back with no writes in
                     // between: reflow must restore the grid exactly.
-                    const u16 backColumns = rig.headless->geometry().columns;
-                    const u16 backRows = rig.headless->geometry().rows;
-                    const u16 columns = (u16)(rig.headless->geometry().columns + 1 + payload[0] % 80);
-                    const u16 rows = (u16)(rig.headless->geometry().rows + payload[1] % 20);
-                    rig.headless->geometry().resizeCells(columns, rows, rig.headless->host());
-                    rig.headless->geometry().resizeCells(backColumns, backRows, rig.headless->host());
+                    const u16 backWidth = rig.composer->geometry.pixelWidth;
+                    const u16 backHeight = rig.composer->geometry.pixelHeight;
+                    const u16 columns = (u16)(rig.composer->geometry.columns + 1 + payload[0] % 80);
+                    const u16 rows = (u16)(rig.composer->geometry.rows + payload[1] % 20);
+                    const Insets insets = rig.composer->contentInsets();
+                    rig.composer->resize((u16)(gridPixelWidth(columns, insets, rig.composer->geometry.cellPixelWidth)), (u16)(gridPixelHeight(rows, insets, rig.composer->geometry.cellPixelHeight)));
+                    rig.composer->resize(backWidth, backHeight);
                 }
                 break;
             case 222:
@@ -536,8 +540,9 @@ namespace {
                     // adopts the same cell geometry, as fontChanged() does.
                     const u16 glyphWidth = (u16)(1 + payload[0] % 4);
                     const u16 glyphHeight = (u16)(1 + payload[1] % 4);
-                    rig.headless->geometry().setCellPixelSize(glyphWidth, glyphHeight);
-                    rig.headless->geometry().resizeCells(rig.headless->geometry().columns, rig.headless->geometry().rows, rig.headless->host());
+                    rig.composer->geometry.setCellPixelSize(glyphWidth, glyphHeight);
+                    const Insets insets = rig.composer->contentInsets();
+                    rig.composer->resize((u16)(gridPixelWidth(rig.composer->geometry.columns, insets, glyphWidth)), (u16)(gridPixelHeight(rig.composer->geometry.rows, insets, glyphHeight)));
                 }
                 break;
             case 225: {

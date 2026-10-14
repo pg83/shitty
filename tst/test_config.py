@@ -5,15 +5,115 @@
 import os
 import re
 import signal
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
-from harness import ROOT, Shitty, run_startup_failure
+from harness import PRETTY, ROOT, SHITTY, Shitty, run_startup_failure
+
+
+def print_config(binary):
+    """-printConfig, with the developer's real ~/.config kept out.
+
+    The same way harness.py keeps it out of every other run: the option
+    reads the config before it prints, and a key that config holds which
+    the binary does not know lands on stderr as a warning - which is
+    exactly the stderr the tests below assert is empty. Measured on a
+    machine whose ~/.config/shitty/shitty.toml carried such a key.
+    """
+    environment = os.environ.copy()
+    environment["XDG_CONFIG_HOME"] = "/nonexistent"
+    return subprocess.run(
+        [str(binary), "-printConfig"], capture_output=True, env=environment
+    )
 
 
 EXAMPLE_CONFIG = ROOT / "bin" / "st" / "shitty.toml"
+PRETTY_EXAMPLE_CONFIG = ROOT / "bin" / "pt" / "pretty.toml"
+
+
+# The two example configs are the same file under two brands, and the
+# only licensed difference between them is the brand name itself. Every
+# value that differs has to differ by exactly this substitution; a value
+# that differs any other way is the mine this check exists to catch.
+#
+# A rule rather than a list of excused keys, deliberately. A list would
+# have to be extended by hand for every brand-specific option added
+# after it, and the extension is the step that gets forgotten - which is
+# the very failure the check is here to stop. The rule needs no upkeep:
+# it cannot pass a wrong value, because the only pt value it accepts for
+# a differing key is the correctly rebranded one, and a legitimately
+# brand-specific value that is *not* a rename reddens and forces someone
+# to say so out loud instead of diverging in silence.
+BRAND_WORDS = (("Shitty", "Pretty"), ("shitty", "pretty"), ("SHITTY", "PRETTY"))
+
+
+# Documentation divergences excused for now. Empty, and meant to stay
+# that way: it exists so that a divergence too big to fix in the task
+# that finds it can be named out loud instead of the check being
+# switched off.
+#
+# The one entry it was born with is gone. `# CLI: -vulkanBlit ...`
+# reached bin/st/shitty.toml in 92657e71 and never reached
+# bin/pt/pretty.toml; F1 added the line and deleted the entry in the
+# same edit, because either half alone reddens - the line without the
+# deletion trips the staleness check below, and the deletion without the
+# line trips the parity check itself.
+#
+# The shape, should a second one ever be needed: keyed by the file that
+# is missing the name, and by the name, so a substitution is caught and
+# not only growth - an entry excuses exactly one name missing from
+# exactly one file. An entry naming a name that is documented again
+# reddens as stale, so no allowance can outlive its reason.
+DOCUMENTATION_ALLOWANCE = {}
+
+
+def rebrand(value):
+    """The st spelling of a value, rewritten for the pt brand."""
+    for shitty_word, pretty_word in BRAND_WORDS:
+        value = value.replace(shitty_word, pretty_word)
+    return value
+
+
+def read_example_config(path):
+    """Assignments, documented option names and table headers of an
+    example config.
+
+    Assignments are returned as (key, raw value) pairs rather than a
+    dict, so that a key assigned twice is visible to the caller instead
+    of being swallowed by the second write; comparing them by name keeps
+    the comparison blind to line order. Nothing here strips a trailing
+    comment: no assignment in either file carries one, and every `#` in a
+    value is inside a quoted color.
+
+    Documented names come from the two shapes the files use to index an
+    option: `# CLI: -name ...` for anything with a command-line form, and
+    `# name — ...` for the config-only ones. Both are the documentation
+    index rather than prose, and the parity check reads the names only,
+    so rewording a description is not a divergence.
+    """
+    assignments = []
+    documented = set()
+    tables = []
+    for line in path.read_text().splitlines():
+        if line.startswith("# CLI: -"):
+            documented.add(line.removeprefix("# CLI: -").split()[0])
+            continue
+        head, separator, _ = line.partition(" — ")
+        if separator and head.startswith("# ") and head[2:].isidentifier():
+            documented.add(head[2:])
+            continue
+        if line.startswith("["):
+            tables.append(line)
+            continue
+        if line[:1].isalpha() or line[:1] == "_":
+            key, separator, value = line.partition("=")
+            if separator:
+                assignments.append((key.strip(), value.strip()))
+    return assignments, documented, tables
 
 
 def config_home(directory, text):
@@ -34,6 +134,137 @@ def wait_for(expected, read):
         time.sleep(0.01)
 
 
+class ExampleConfigParityTest(unittest.TestCase):
+    """bin/st/shitty.toml and bin/pt/pretty.toml, kept in step.
+
+    Two brands are built from one tree, and each ships its own example
+    config. An option added to one file and forgotten in the other had no
+    observer at all until this class: test_config.py opens only the st
+    file, and production_surface.py only proves the pt binary *accepts*
+    its file - a missing option leaves it perfectly valid. Measured by
+    M8c on 2026-09-05: deleting an option from pretty.toml outright left
+    every suite green.
+    """
+
+    def parsed(self):
+        """Both files, with the premises that make comparing them mean
+        something.
+
+        Asserted before any comparison, because the failure this class is
+        most exposed to is not a wrong answer but a vacuous one: two
+        empty key sets compare equal, and a parser that matched nothing
+        would report perfect parity on a tree that had lost half a file.
+        """
+        for path in (EXAMPLE_CONFIG, PRETTY_EXAMPLE_CONFIG):
+            self.assertTrue(path.is_file(), f"{path} is missing")
+            self.assertTrue(path.read_text().strip(), f"{path} is empty")
+
+        result = {}
+        for path in (EXAMPLE_CONFIG, PRETTY_EXAMPLE_CONFIG):
+            pairs, documented, tables = read_example_config(path)
+            # A key assigned twice would land in the dict once, and the
+            # brand whose duplicate went missing would still compare
+            # equal. Rare, but it is the shape that hides a divergence
+            # from a set comparison, so it is refused outright.
+            keys = [key for key, _ in pairs]
+            duplicates = sorted({key for key in keys if keys.count(key) > 1})
+            self.assertEqual(duplicates, [], f"{path} assigns these keys twice")
+            assignments = dict(pairs)
+            # A live table header scopes every key after it to that
+            # table, and this parser is flat. Both files keep their only
+            # tables commented out; the day one goes live, redden here
+            # and teach the parser about scoping, rather than quietly
+            # comparing keys from different tables as if they were one.
+            self.assertEqual(tables, [], f"{path} grew a live TOML table")
+            # Floors, not counts: the exact numbers are upstream's
+            # business and change with every option. Anything this far
+            # below today's 57 assignments and 79 documented names means
+            # the parse failed, not that the file shrank.
+            self.assertGreaterEqual(len(assignments), 20, f"{path}: parsed too few assignments")
+            self.assertGreaterEqual(len(documented), 20, f"{path}: parsed too few documented options")
+            # Anchors: three names every other test in this file leans
+            # on. They prove the parser read assignments rather than
+            # twenty lines of something else that happened to match.
+            self.assertLessEqual({"fontsize", "title", "border"}, set(assignments), f"{path}")
+            result[path] = (assignments, documented)
+        return result
+
+    def test_both_brands_assign_the_same_option_keys(self):
+        parsed = self.parsed()
+        shitty = set(parsed[EXAMPLE_CONFIG][0])
+        pretty = set(parsed[PRETTY_EXAMPLE_CONFIG][0])
+        self.assertSetEqual(
+            shitty,
+            pretty,
+            "example configs disagree on which options they set; "
+            f"only in bin/st/shitty.toml: {sorted(shitty - pretty)}; "
+            f"only in bin/pt/pretty.toml: {sorted(pretty - shitty)}",
+        )
+
+    def test_both_brands_assign_the_same_values_up_to_the_brand_name(self):
+        parsed = self.parsed()
+        shitty = parsed[EXAMPLE_CONFIG][0]
+        pretty = parsed[PRETTY_EXAMPLE_CONFIG][0]
+        shared = sorted(set(shitty) & set(pretty))
+
+        # The premise the brand rule needs, and the reason it is stated
+        # rather than assumed: if no shared value differed literally, a
+        # plain equality check would pass just as well, rebrand() would
+        # never be exercised, and a rebrand() that had quietly become the
+        # identity - an emptied BRAND_WORDS, a renamed brand - would go on
+        # reporting parity forever. Naming the keys that carry the brand
+        # makes the rule impossible to hollow out in silence.
+        branded = [key for key in shared if shitty[key] != pretty[key]]
+        self.assertTrue(
+            branded,
+            "no shared value differs between the brands, so the brand rule "
+            "below is untested scaffolding; either a value was lost or "
+            "BRAND_WORDS no longer describes how the brands differ",
+        )
+        self.assertTrue(
+            [key for key in branded if rebrand(shitty[key]) != shitty[key]],
+            "no differing value is touched by rebrand(), so BRAND_WORDS says "
+            "nothing about how these two files differ and the check below "
+            "would pass just as well with it emptied",
+        )
+
+        for key in shared:
+            self.assertEqual(
+                rebrand(shitty[key]),
+                pretty[key],
+                f"{key}: bin/pt/pretty.toml has {pretty[key]}, but the brand rule "
+                f"says bin/st/shitty.toml's {shitty[key]} rebrands to "
+                f"{rebrand(shitty[key])}",
+            )
+
+    def test_both_brands_document_the_same_options(self):
+        parsed = self.parsed()
+        documented = {
+            "bin/st/shitty.toml": parsed[EXAMPLE_CONFIG][1],
+            "bin/pt/pretty.toml": parsed[PRETTY_EXAMPLE_CONFIG][1],
+        }
+        everything = set().union(*documented.values())
+
+        missing = {
+            name: sorted(everything - names) for name, names in documented.items()
+        }
+        for name, allowed in DOCUMENTATION_ALLOWANCE.items():
+            stale = sorted(allowed - set(missing[name]))
+            self.assertEqual(
+                stale,
+                [],
+                f"DOCUMENTATION_ALLOWANCE names {stale} as missing from {name}, "
+                "but they are documented there now - delete the entry",
+            )
+        for name, names in missing.items():
+            self.assertEqual(
+                sorted(set(names) - DOCUMENTATION_ALLOWANCE.get(name, set())),
+                [],
+                f"{name} documents fewer options than its counterpart; "
+                f"undocumented there: {sorted(set(names) - DOCUMENTATION_ALLOWANCE.get(name, set()))}",
+            )
+
+
 class ConfigFileTest(unittest.TestCase):
     def test_example_config_is_accepted_by_the_application(self):
         result = run_startup_failure(
@@ -45,9 +276,74 @@ class ConfigFileTest(unittest.TestCase):
         with Shitty(pin_vga=False, extra_arguments=("-config", EXAMPLE_CONFIG)) as terminal:
             options = terminal.options()
             self.assertEqual(options["fontsize"], 15)
-            self.assertEqual(options["fg"], 0xD8DEE9)
-            self.assertEqual(options["bg"], 0x2E3440)
-            self.assertEqual(options["cr"], 0x88C0D0)
+            # T8: the file stopped assigning fg, bg and cr and started
+            # assigning colorScheme instead, so these three now read back
+            # the named scheme's own colors. Asserted anyway, and against
+            # literals: it is the one place the whole path - example
+            # config, colorScheme lookup, palette, dump - is walked end
+            # to end, and a file that had lost the key would answer with
+            # the *other* scheme's colors rather than with nothing.
+            self.assertEqual(options["fg"], 0xCDD6F4)
+            self.assertEqual(options["bg"], 0x1E1E2E)
+            self.assertEqual(options["cr"], 0xCDD6F4)
+
+    def test_print_config_writes_the_brands_own_example_config(self):
+        """-printConfig, both brands, against the file it is embedded from.
+
+        Byte for byte, which is the whole design of the option: the
+        printed file *is* bin/<brand>/<brand>.toml, embedded at build
+        time, so a default edited in one place and forgotten in the other
+        cannot exist. A generator reading optionsTable would need this
+        check to hold it honest; embedding makes it a tautology worth
+        asserting once, because the day someone replaces the embedding
+        with a generator it stops being one.
+        """
+        for binary, example in ((SHITTY, EXAMPLE_CONFIG), (PRETTY, PRETTY_EXAMPLE_CONFIG)):
+            with self.subTest(binary=binary.name):
+                result = print_config(binary)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # The premise: an option that printed nothing would pass
+                # a comparison against an empty file, and Brand::generic()
+                # really does return an empty config.
+                self.assertGreater(len(result.stdout), 4000)
+                self.assertEqual(result.stdout, example.read_bytes())
+
+        # And the pt copy carries no trace of the other brand - the
+        # binary now contains a whole text file that could.
+        printed = print_config(PRETTY).stdout
+        self.assertNotIn(b"shitty", printed.lower())
+
+    def test_print_config_output_starts_the_terminal(self):
+        # The claim the option makes in its own help text: redirect it
+        # into the config path and the terminal comes up on it. Written
+        # to a real file rather than piped, because that is what a user
+        # does with it.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "printed.toml"
+            printed = print_config(SHITTY).stdout
+            path.write_bytes(printed)
+
+            result = run_startup_failure(
+                extra_arguments=("-config", path, "-version")
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, b"")
+
+            # Started, and started on the same values the defaults give:
+            # a config the parser accepted while ignoring every key would
+            # pass the check above.
+            with Shitty(pin_vga=False, extra_arguments=("-config", path)) as terminal:
+                options = terminal.options()
+                self.assertEqual(options["fontsize"], 15)
+                self.assertEqual(options["background_opacity"], 60)
+                self.assertEqual(options["background_blur"], "glass")
+                # The example leaves tabs and panes to the binary's own
+                # default, which for st on Linux is off (bin/st/main.cpp).
+                bare = sys.platform.startswith("linux")
+                self.assertEqual(options["sidebar_tabs"], 0 if bare else 1)
+                self.assertEqual(options["panes"], 0 if bare else 1)
+                self.assertEqual(options["pane_divider_color"], 0x00CD00)
 
     def test_example_config_documents_every_public_cli_option(self):
         listed = set()
@@ -150,6 +446,140 @@ class ConfigFileTest(unittest.TestCase):
             arguments = ("-fontsize", "22")
             with Shitty(extra_environment=environment, extra_arguments=arguments) as terminal:
                 self.assertEqual(terminal.font_state()[0], 22)
+
+    def test_quick_and_transparent_titlebar_take_their_defaults(self):
+        # T8 split the pair: quick is still off, the titlebar is not.
+        # Both are asserted, which is what keeps this from passing on a
+        # dump that answered a constant to every key.
+        with Shitty() as terminal:
+            options = terminal.options()
+            self.assertEqual(options["quick"], 0)
+            self.assertEqual(options["transparent_titlebar"], 1)
+
+    def test_quick_and_transparent_titlebar_come_from_the_config(self):
+        # Exercises the wiring options_ut.cpp cannot: config -> Options ->
+        # application.cpp's WindowOptions -> composer.opts -> the OPTIONS
+        # protocol in test_mode.cpp.
+        with tempfile.TemporaryDirectory() as directory:
+            config_home(directory, "quick = true\ntransparentTitlebar = true\n")
+            environment = {"XDG_CONFIG_HOME": directory}
+            with Shitty(extra_environment=environment) as terminal:
+                options = terminal.options()
+                self.assertEqual(options["quick"], 1)
+                self.assertEqual(options["transparent_titlebar"], 1)
+
+    def test_translucency_defaults_to_glass_over_a_translucent_window(self):
+        # T8 turned this pair around: it used to promise the solid
+        # window upstream draws, and now promises the translucent one
+        # this fork ships. Both halves, for the reason the options_ut
+        # twin gives - an opacity below 100 with no backdrop shows the
+        # desktop raw, and a backdrop at 100 is what the startup warning
+        # exists for, so either half alone is satisfiable by an accident.
+        with Shitty() as terminal:
+            options = terminal.options()
+            self.assertEqual(options["background_opacity"], 60)
+            self.assertEqual(options["background_blur"], "glass")
+
+    def test_translucency_comes_from_the_config(self):
+        # The wiring options_ut.cpp cannot reach: config -> Options ->
+        # composer.opts -> the OPTIONS protocol. Until F10 the protocol
+        # did not carry these two at all, so nothing in the black box
+        # could tell a value that arrived from one that was dropped on
+        # the way - in a wave whose result is otherwise judged by eye,
+        # which is the worst place to have no machine-readable check.
+        with tempfile.TemporaryDirectory() as directory:
+            config_home(directory, "backgroundOpacity = 40\nbackgroundBlur = true\n")
+            environment = {"XDG_CONFIG_HOME": directory}
+            with Shitty(extra_environment=environment) as terminal:
+                options = terminal.options()
+                self.assertEqual(options["background_opacity"], 40)
+                self.assertEqual(options["background_blur"], "blur")
+
+    def test_the_command_line_beats_a_configured_opacity(self):
+        # The other half of the same wiring: a value that arrives late.
+        # Without this, a protocol key wired to a constant would pass the
+        # test above.
+        #
+        # `-backgroundBlur off` and not `+backgroundBlur`: T1 turned the
+        # option into one that takes a value, and the '+' form it used to
+        # accept is now refused outright. The config below spells the key
+        # the old way on purpose - `true` survives as an alias, so this
+        # pair also pins that a config written while it was a flag still
+        # starts, and that the command line still wins over it.
+        with tempfile.TemporaryDirectory() as directory:
+            config_home(directory, "backgroundOpacity = 40\nbackgroundBlur = true\n")
+            environment = {"XDG_CONFIG_HOME": directory}
+            arguments = ("-backgroundOpacity", "70", "-backgroundBlur", "off")
+            with Shitty(extra_environment=environment, extra_arguments=arguments) as terminal:
+                options = terminal.options()
+                self.assertEqual(options["background_opacity"], 70)
+                self.assertEqual(options["background_blur"], "off")
+
+    def test_blur_without_translucency_warns_and_still_starts(self):
+        # F10. Blur over an opaque background draws nothing, on purpose -
+        # but silence left the user with an option that appeared broken.
+        # The line has to name the way out, not merely report the fact.
+        with tempfile.TemporaryDirectory() as directory:
+            # T8: opacity has to be asked for now. The default is 60,
+            # and the warning this test is about is precisely the one
+            # that is *not* due at 60 - so the config states the 100 it
+            # used to inherit.
+            config_home(directory, "backgroundBlur = true\nbackgroundOpacity = 100\n")
+            environment = {"XDG_CONFIG_HOME": directory}
+            with Shitty(extra_environment=environment, capture_stderr=True) as terminal:
+                # A warning and not a refusal: the terminal is up, and it
+                # kept the option it warned about.
+                self.assertEqual(terminal.options()["background_blur"], "blur")
+            stderr = terminal.stderr_text()
+            self.assertIn(b"-backgroundBlur", stderr)
+            # The actionable half: which other option to reach for.
+            self.assertIn(b"-backgroundOpacity", stderr)
+
+    def test_the_backdrop_warning_speaks_of_showing_and_covers_both_modes(self):
+        # R1-test. Two unobserved halves of one line. The wording moved
+        # from "nothing to blur" to "nothing to show" when the option
+        # grew a glass mode - blurring is the wrong verb for glass - and
+        # the only assertions on this message were the two option names,
+        # which survive any rewording, the old one included. And the
+        # warning was proved for one mode only: a gate written
+        # `== BackdropMode::Blur` would leave glass silent and redden
+        # nothing.
+        #
+        # The dump assertion carries a third unobserved place with it.
+        # "glass" is a name backdropModeName() alone decides, and until
+        # now no test asked for it: the mode could have printed back as
+        # "blur" all the way to the eye.
+        for mode in ("blur", "glass"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as directory:
+                    # T8: 100 stated rather than inherited, the same as
+                    # the test above. The premise below - that the
+                    # warning was said at all - is what this line makes
+                    # true again.
+                    config_home(directory, f'backgroundBlur = "{mode}"\nbackgroundOpacity = 100\n')
+                    environment = {"XDG_CONFIG_HOME": directory}
+                    with Shitty(extra_environment=environment, capture_stderr=True) as terminal:
+                        self.assertEqual(terminal.options()["background_blur"], mode)
+                    stderr = terminal.stderr_text()
+                    # The premise. Every assertion below is about the
+                    # shape of a warning, and all of them pass on an
+                    # empty stderr - which is the failure they exist to
+                    # catch. The config above states an opacity of 100,
+                    # so the warning is due; that it was said at all is asserted
+                    # before anything about how it was said.
+                    self.assertIn(b"-backgroundBlur", stderr)
+                    self.assertIn(b"has nothing to show", stderr)
+                    self.assertNotIn(b"to blur", stderr)
+
+    def test_a_translucent_background_leaves_the_blur_warning_unsaid(self):
+        # The control. Without it the assertions above would pass just as
+        # well against a build that warns on every start.
+        with tempfile.TemporaryDirectory() as directory:
+            config_home(directory, "backgroundBlur = true\nbackgroundOpacity = 55\n")
+            environment = {"XDG_CONFIG_HOME": directory}
+            with Shitty(extra_environment=environment, capture_stderr=True) as terminal:
+                self.assertEqual(terminal.options()["background_opacity"], 55)
+            self.assertNotIn(b"-backgroundBlur", terminal.stderr_text())
 
     def test_explicit_config_path_is_honored(self):
         with tempfile.TemporaryDirectory() as directory:

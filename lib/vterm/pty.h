@@ -44,6 +44,13 @@ struct PtyHandle {
         }
     };
 
+    // The child behind this handle, so an owner which reaps it waits for
+    // that child and not for whatever else the process has forked. Handles
+    // with no child of their own - the test doubles - keep the default.
+    virtual pid_t childPid() {
+        return -1;
+    }
+
     virtual void resize(const PtySize& size) = 0;
     virtual void engage() = 0;
 

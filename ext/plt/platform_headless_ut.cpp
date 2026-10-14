@@ -117,4 +117,35 @@ STD_TEST_SUITE(PlatformHeadless) {
         STD_INSIST(second.generation == 2);
         STD_INSIST(second.pixels[0] == 0x22);
     }
+
+    // plt::Window::visible() (F1, window-chrome plan) was added to close
+    // a real bug: T3's toggleQuickWindow() needs to ask the window
+    // whether it is actually showing rather than track a flag of its own
+    // that could drift out of sync with a hide performed elsewhere
+    // (platform_cocoa.mm's hide-on-resign-key). This is the one backend
+    // where the toggle itself is directly observable end to end.
+    STD_TEST(VisibleTogglesOnEveryShowHidePath) {
+        auto pool = ObjPool::fromMemory();
+        Platform* const platform = createHeadlessPlatform(*pool);
+        auto& window = static_cast<WindowHeadless&>(*platform->createWindow(
+            *pool,
+            {
+                .width = 2,
+                .height = 2,
+            }
+        ));
+        STD_INSIST(!window.visible());
+        window.requestShow();
+        STD_INSIST(window.visible());
+        window.requestHide();
+        STD_INSIST(!window.visible());
+        window.requestShowAt(ShowPlacement::Centered);
+        STD_INSIST(window.visible());
+        window.requestHide();
+        STD_INSIST(!window.visible());
+        window.requestShowAt(ShowPlacement::TopOfActiveScreen);
+        STD_INSIST(window.visible());
+        window.requestHide();
+        STD_INSIST(!window.visible());
+    }
 }

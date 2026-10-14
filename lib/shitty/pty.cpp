@@ -40,6 +40,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -270,6 +271,10 @@ namespace {
         PtyHandleImpl(PtyImpl& pty, int fd, pid_t pid);
         ~PtyHandleImpl() noexcept;
 
+        pid_t childPid() override {
+            return pid;
+        }
+
         void resize(const PtySize& size) override;
         void engage() override;
         Chunk* allocate(size_t len) override;
@@ -322,9 +327,9 @@ namespace {
     };
 
     struct PtyImpl final: public Pty, public plt::TimerCallback {
-        PtyImpl(ObjPool& owner, plt::Scheduler& scheduler, plt::Platform* platform);
+        PtyImpl(ObjPool& owner, plt::Scheduler& scheduler, plt::Platform* platform, const char* brand);
 
-        PtyHandle* spawn(ObjPool& owner, const LaunchCommand& command) override;
+        PtyHandle* spawn(ObjPool& owner, const LaunchCommand& command, const PtySize& size, StringView directory) override;
         // The doorbell on the platform thread: a spurious wake is safe by
         // the fiber contract, so it wakes everyone and lets them look.
         void ready() override;
@@ -341,6 +346,7 @@ namespace {
         ObjPool& owner;
         plt::Scheduler& scheduler;
         plt::Platform* platform;
+        const char* brand;
         SmallObjAllocator* mainAllocator_ = nullptr;
         plt::LoopWake* doorbell_ = nullptr;
         PtyHandleImpl* mainHandles_ = nullptr;
@@ -589,10 +595,11 @@ pid_t PtyHandleImpl::foregroundProcessGroup() {
     return group > 0 ? group : 0;
 }
 
-PtyImpl::PtyImpl(ObjPool& owner_, plt::Scheduler& scheduler_, plt::Platform* platform_)
+PtyImpl::PtyImpl(ObjPool& owner_, plt::Scheduler& scheduler_, plt::Platform* platform_, const char* brand_)
     : owner(owner_)
     , scheduler(scheduler_)
     , platform(platform_)
+    , brand(brand_)
 {
     mainAllocator_ = SmallObjAllocator::create(&owner);
 }
@@ -890,16 +897,31 @@ void* PtyImpl::drainThread(void* opaque) {
     return nullptr;
 }
 
-PtyHandle* PtyImpl::spawn(ObjPool& owner, const LaunchCommand& command) {
+PtyHandle* PtyImpl::spawn(ObjPool& owner, const LaunchCommand& command, const PtySize& size, StringView directory) {
     Vector<char*> arguments;
     for (size_t index = 0; index < command.offsets.length(); ++index) {
         arguments.pushBack(const_cast<char*>(command.argument(index)));
     }
     arguments.pushBack(nullptr);
 
+    // NUL-terminated on this side of the fork, so the child does no
+    // allocation between fork and exec. A path the kernel could not
+    // take anyway is not truncated into one it could: the child reports
+    // it as too long instead of entering some prefix of it.
+    char path[PATH_MAX];
+    const bool pathTooLong = directory.length() >= sizeof(path);
+    const size_t pathLength = pathTooLong ? sizeof(path) - 1 : directory.length();
+    if (pathLength != 0) {
+        memcpy(path, directory.data(), pathLength);
+    }
+    path[pathLength] = '\0';
+
     char slaveName[PATH_MAX];
     const int master = openPtyMaster(slaveName, sizeof(slaveName));
-    const int slave = openPtySlave(slaveName, master);
+    const int slave = openPtySlave(slaveName);
+    // Before the fork, so the child's very first TIOCGWINSZ already
+    // answers with the pane it was born into (A8).
+    resizePty(slave, size);
 
     // A child that exits immediately must not outrun the caller's SIGCHLD
     // bookkeeping. The child restores the inherited mask before exec.
@@ -935,6 +957,21 @@ PtyHandle* PtyImpl::spawn(ObjPool& owner, const LaunchCommand& command) {
         if (tcsetattr(STDIN_FILENO, TCSANOW, &term) < 0) {
             childError("Error: tcsetattr");
         }
+        // After the descriptors point at the slave, so the complaint
+        // lands in the terminal the user is looking at rather than in
+        // the launcher's stderr, which under launchd is nobody's. Not
+        // fatal by design: the shell still starts, where it would have
+        // without the option.
+        if (pathTooLong) {
+            errno = ENAMETOOLONG;
+        }
+        if (path[0] != '\0' && (pathTooLong || chdir(path) < 0)) {
+            char line[PATH_MAX + 256];
+            const int length = snprintf(line, sizeof(line), "%s: cannot change directory to %s: %s\n", brand, path, strerror(errno));
+            if (length > 0) {
+                (void)!write(STDERR_FILENO, line, (size_t)(length) < sizeof(line) ? (size_t)(length) : sizeof(line) - 1);
+            }
+        }
         execvp(command.executable(), arguments.mutData());
         childError("Error: execvp");
     }
@@ -943,6 +980,6 @@ PtyHandle* PtyImpl::spawn(ObjPool& owner, const LaunchCommand& command) {
     return owner.make<PtyHandleImpl>(*this, master, pid);
 }
 
-Pty* createPty(ObjPool& owner, plt::Scheduler& scheduler, plt::Platform* platform) {
-    return owner.make<PtyImpl>(owner, scheduler, platform);
+Pty* createPty(ObjPool& owner, plt::Scheduler& scheduler, plt::Platform* platform, const char* brand) {
+    return owner.make<PtyImpl>(owner, scheduler, platform, brand);
 }

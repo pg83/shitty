@@ -16,7 +16,7 @@ class GhosttyResizeTest(unittest.TestCase):
             f"\x1b[?{mode};{state}$y".encode(),
         )
 
-    def test_window_padding_change_preserves_synchronized_output(self):
+    def test_resize_clears_synchronized_output_on_unchanged_grid(self):
         with Shitty(
             columns=80,
             rows=24,
@@ -29,7 +29,7 @@ class GhosttyResizeTest(unittest.TestCase):
             terminal.resize_pixels(725, 437)
 
             self.assertEqual(terminal.winsize_full(), (80, 24, 720, 432))
-            self.assert_private_mode(terminal, 2026, True)
+            self.assert_private_mode(terminal, 2026, False)
 
     def test_resize_rejects_zero_dimensions_before_mutation(self):
         with Shitty(

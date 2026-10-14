@@ -13,18 +13,96 @@
 
 using namespace stl;
 
-MouseProtocolPoint mouseProtocolPoint(MouseTrackingEnc encoding, int pixelX, int pixelY, const MouseGeometry& geometry) {
-    const int contentWidth = max(1, (int)(min<u32>(geometry.textWidth, INT_MAX)));
-    const int contentHeight = max(1, (int)(min<u32>(geometry.textHeight, INT_MAX)));
-    const int x = min(max(pixelX, 0), contentWidth - 1);
-    const int y = min(max(pixelY, 0), contentHeight - 1);
-    if (encoding == MouseTrackingEnc::SGRPixels) {
-        return {x + 1, y + 1};
+int mouseFramebufferCoordinate(double logical, double scale) {
+    if (!isfinite(logical) || !isfinite(scale)) {
+        return 0;
     }
+    const double pixel = logical * max(1.0, scale);
+    return (int)(min(max(round(pixel), (double)(INT_MIN)), (double)(INT_MAX)));
+}
+
+MouseGeometry mouseGeometry(const VtGeometry& pane, const VtGeometry& window) {
+    // Designated, not positional: the origin sits between the insets and
+    // the glyph size, and a positional list would have handed an origin
+    // to glyphWidth the moment the struct grew.
+    //
+    // Every field is read off exactly one of the two, and which one is
+    // the whole content of A10 here: the surface and the glyph are the
+    // window's, and the border, the origin and the extent are the pane's.
+    // Taking the border off the window instead is the one substitution
+    // that still compiles and still answers a plausible cell - the pane
+    // would be charged whatever chrome reserved a second time, on top of
+    // the origin that already carries it.
     return {
-        x / max(1, geometry.glyphWidth) + 1,
-        y / max(1, geometry.glyphHeight) + 1,
+        .framebufferWidth = window.pixelWidth,
+        .framebufferHeight = window.pixelHeight,
+        .insets = pane.insets,
+        .paneOriginX = pane.originX,
+        .paneOriginY = pane.originY,
+        .contentWidth = pane.width,
+        .contentHeight = pane.height,
+        .glyphWidth = window.cellPixelWidth,
+        .glyphHeight = window.cellPixelHeight,
     };
+}
+
+// The four mappings below share one coordinate system and one device:
+// every near end is contentLeft()/contentTop() and every far end is
+// contentRight()/contentBottom(), so an extent is always the difference
+// of two edges of the same surface. Not a tidying: a clamp whose near end
+// counted from the pane and whose far end was the window's *content
+// extent* let the pointer past the window's own trailing inset by exactly
+// paneOriginX, and did it in three of the four mappings while the fourth
+// - mouseCell - already compared surface against surface (R5-qa, Q1).
+//
+// T10 retires the rest of it: the far ends are the pane's own now, taken
+// from the extent the layout hands over beside the origin, so a pane that
+// begins inside the window is no longer told about pixels past its last
+// cell - they belong to its neighbour.
+MouseProtocolPoint mouseProtocolPoint(MouseTrackingEnc encoding, int pixelX, int pixelY, const MouseGeometry& geometry) {
+    const int contentWidth = max(1, geometry.contentRight() - geometry.contentLeft());
+    const int contentHeight = max(1, geometry.contentBottom() - geometry.contentTop());
+    if (encoding == MouseTrackingEnc::SGRPixels) {
+        return {
+            min(max(pixelX - geometry.contentLeft() + 1, 1), contentWidth),
+            min(max(pixelY - geometry.contentTop() + 1, 1), contentHeight),
+        };
+    }
+    const int columns = max(1, contentWidth / max(1, geometry.glyphWidth));
+    const int rows = max(1, contentHeight / max(1, geometry.glyphHeight));
+    return {
+        min(max((pixelX - geometry.contentLeft()) / max(1, geometry.glyphWidth) + 1, 1), columns),
+        min(max((pixelY - geometry.contentTop()) / max(1, geometry.glyphHeight) + 1, 1), rows),
+    };
+}
+
+bool mouseCell(int pixelX, int pixelY, const MouseGeometry& geometry, u16& column, u16& row) {
+    if (pixelX < geometry.contentLeft() || pixelY < geometry.contentTop() || pixelX >= geometry.contentRight() || pixelY >= geometry.contentBottom()) {
+        return false;
+    }
+    column = (u16)((pixelX - geometry.contentLeft()) / max(1, geometry.glyphWidth));
+    row = (u16)((pixelY - geometry.contentTop()) / max(1, geometry.glyphHeight));
+    return true;
+}
+
+Point mouseSelectionCell(int pixelX, int pixelY, const MouseGeometry& geometry, int columns, int rows) {
+    const int contentWidth = max(0, geometry.contentRight() - geometry.contentLeft());
+    const int contentHeight = max(1, geometry.contentBottom() - geometry.contentTop());
+    const int x = min(max(0, pixelX - geometry.contentLeft()), contentWidth);
+    const int y = min(max(0, pixelY - geometry.contentTop()), contentHeight - 1);
+    return Point(min(x / max(1, geometry.glyphWidth), columns), min(y / max(1, geometry.glyphHeight), rows - 1));
+}
+
+int mouseAutoscrollDirection(int pixelY, const MouseGeometry& geometry) {
+    const int top = geometry.contentTop();
+    const int bottom = max(top, geometry.contentBottom() - 1);
+    if (pixelY <= top) {
+        return -1;
+    }
+    if (pixelY >= bottom) {
+        return 1;
+    }
+    return 0;
 }
 
 unsigned mouseProtocolModifiers(unsigned modifiers, bool reportAlt) {

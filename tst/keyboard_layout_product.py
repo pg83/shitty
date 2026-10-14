@@ -285,7 +285,21 @@ def main():
     failures = []
     expected_failures = 0
     total = 0
-    with Shitty(columns=8, rows=2) as terminal:
+    # F-T8-ci. -panes is on by default since T8, and on macOS it arms
+    # the two split chords - cmd+d and cmd+shift+d, gated on that very
+    # option in input_bindings.cpp. The physical key of three of the
+    # four layouts here is D, so the matrix asks what bytes cmd+d makes
+    # and the terminal answers by splitting the tab instead. Pinned off
+    # for the same reason harness.py pins -naturalEditing off: this
+    # suite asks what a chord produces at the pty, and an ambient
+    # default must not be the one answering.
+    #
+    # The damage was not confined to the Super rows. key() clears a
+    # consumed binding on release by chord key alone, ignoring
+    # modifiers, so a swallowed cmd+d press left the flag standing and
+    # ate the release of whatever pressed D next - which is why alt+d
+    # releases went missing too.
+    with Shitty(columns=8, rows=2, extra_arguments=("+panes",)) as terminal:
         for mode, flags in MODES:
             for name, physical, layout, base in LAYOUTS:
                 for mods in range(16):
