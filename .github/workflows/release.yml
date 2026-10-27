@@ -362,14 +362,12 @@ jobs:
           name: darwin-arm64
           path: ${{ runner.temp }}/darwin-arm64
 
-      # Signs the .app BUNDLES, not the loose binaries directly — codesign
-      # on a bundle path signs the bundle container and the executable
-      # inside it together, which is what notarization and Gatekeeper both
-      # expect to see. The loose st/pt staged for Homebrew are then
-      # overwritten with a copy of that now-signed executable, so both
-      # distribution shapes carry the exact same Developer ID signature from
-      # one signing pass rather than two.
-      - name: Sign Darwin app bundles
+      # Sign the app bundles and the loose binaries separately. A bundle
+      # signature binds the executable to Contents/Info.plist; copying that
+      # executable out of the bundle leaves an invalid standalone signature
+      # and macOS kills it on exec. Loose st/pt have their own signatures,
+      # with no bundle Info.plist dependency.
+      - name: Sign Darwin artifacts
         run: |
           chmod +x "$RUNNER_TEMP/darwin-arm64/st" "$RUNNER_TEMP/darwin-arm64/pt" \
             "$RUNNER_TEMP/darwin-arm64/Shitty.app/Contents/MacOS/st" \
@@ -419,9 +417,11 @@ jobs:
               "$RUNNER_TEMP/darwin-arm64/$app"
             codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/darwin-arm64/$app"
           done
-
-          cp -f "$RUNNER_TEMP/darwin-arm64/Shitty.app/Contents/MacOS/st" "$RUNNER_TEMP/darwin-arm64/st"
-          cp -f "$RUNNER_TEMP/darwin-arm64/Pretty.app/Contents/MacOS/pt" "$RUNNER_TEMP/darwin-arm64/pt"
+          for binary in st pt; do
+            codesign --force --options runtime --timestamp --sign "$name" \
+              "$RUNNER_TEMP/darwin-arm64/$binary"
+            codesign --verify --strict --verbose=2 "$RUNNER_TEMP/darwin-arm64/$binary"
+          done
 
           echo "SHITTY_SIGNED=1" >> "$GITHUB_ENV"
         env:
@@ -457,10 +457,13 @@ jobs:
           # `ditto -c` takes exactly ONE source ("Can't archive multiple
           # sources" otherwise, measured here) — --keepParent does not turn
           # it into a multi-source flag the way cp's semantics might
-          # suggest. So this stages both apps under one directory first and
-          # archives that.
+          # suggest. Stage both apps and both independently signed loose
+          # binaries under one directory so one submission notarizes every
+          # distribution shape.
           mkdir -p "$RUNNER_TEMP/darwin-submit"
           cp -R "$RUNNER_TEMP/darwin-arm64/Shitty.app" "$RUNNER_TEMP/darwin-arm64/Pretty.app" \
+            "$RUNNER_TEMP/darwin-submit/"
+          cp "$RUNNER_TEMP/darwin-arm64/st" "$RUNNER_TEMP/darwin-arm64/pt" \
             "$RUNNER_TEMP/darwin-submit/"
           ditto -c -k --keepParent \
             "$RUNNER_TEMP/darwin-submit" \
@@ -486,10 +489,9 @@ jobs:
           fi
 
           # Only a bundle can carry a stapled ticket — stapler has no form
-          # for a loose Mach-O executable, which is why the st/pt copies
-          # made in the Sign step stay staple-free. Gatekeeper still accepts
-          # them offline-first the way it accepts any notarized bundle:
-          # the staple, when present, just skips its online ticket lookup.
+          # for a loose Mach-O executable, so the notarized st/pt stay
+          # staple-free. Gatekeeper still accepts them online by their own
+          # code-signature hashes; a bundle's staple just skips that lookup.
           for app in Shitty.app Pretty.app; do
             xcrun stapler staple "$RUNNER_TEMP/darwin-arm64/$app"
             xcrun stapler validate "$RUNNER_TEMP/darwin-arm64/$app"
@@ -506,7 +508,12 @@ jobs:
         if: env.SHITTY_SIGNED == '1'
         run: |
           for binary in st pt; do
+            # -dv only prints signature metadata; --verify and an actual
+            # exec are what catch a broken standalone signature.
+            codesign --verify --strict --verbose=4 "$RUNNER_TEMP/darwin-arm64/$binary"
             codesign -dv --verbose=4 "$RUNNER_TEMP/darwin-arm64/$binary"
+            "$RUNNER_TEMP/darwin-arm64/$binary" -version
+            spctl -a -vv -t execute "$RUNNER_TEMP/darwin-arm64/$binary" || true
           done
           for app in Shitty.app Pretty.app; do
             codesign -dv --verbose=4 "$RUNNER_TEMP/darwin-arm64/$app"

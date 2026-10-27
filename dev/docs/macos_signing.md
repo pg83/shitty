@@ -23,7 +23,10 @@ wraps the result in a minimal `.app` bundle (`Info.plist`, an `.icns`
 generated from the same SVG the Linux `.desktop` entry uses). The release
 workflow then calls `codesign` and `xcrun notarytool`/`stapler` directly.
 
-Two release artifact shapes exist side by side, from one signing pass:
+Two release artifact shapes exist side by side. They are signed separately:
+a bundle signature binds its executable to `Contents/Info.plist`, so copying
+that executable out of the bundle would leave an invalid standalone
+signature that macOS refuses to execute.
 
 - **`Shitty.app`/`Pretty.app`** (`Shitty-darwin-arm64.tar.gz` /
   `Pretty-darwin-arm64.tar.gz` on the release) — signed, notarized, and
@@ -31,12 +34,13 @@ Two release artifact shapes exist side by side, from one signing pass:
 - **loose `st`/`pt`** (`st-darwin-arm64.tar.gz` / `pt-darwin-arm64.tar.gz`)
   — feeds the Homebrew tap (`pg83/homebrew-tap`, a separate repository this
   workflow cannot update in lockstep), unchanged in shape from every prior
-  release. `sign-notarize-darwin` copies these out of the now-signed bundle
-  after signing, so they carry the same Developer ID signature. A loose
-  Mach-O executable cannot be **stapled** — `stapler` only takes a
-  `.app`/`.pkg`/`.dmg` — so Gatekeeper checks these online against Apple's
-  notary service by the binary's own code signature on first run instead.
-  That needs network access once; everything after is cached.
+  release. `sign-notarize-darwin` signs these directly, with no dependency
+  on a bundle `Info.plist`, verifies each signature, and executes both
+  binaries after signing. They go into the same notarization submission as
+  the apps. A loose Mach-O executable cannot be **stapled** — `stapler` only
+  takes a `.app`/`.pkg`/`.dmg` — so Gatekeeper checks these online against
+  Apple's notary service by the binary's own code signature on first run
+  instead. That needs network access once; everything after is cached.
 
 ## One-time setup
 
@@ -137,7 +141,14 @@ repo shipped before this pipeline existed, not a failed release.
 ```sh
 dev/package_macos_app.sh Shitty com.pg83.shitty st bin/st/shitty.svg .build-darwin/st .build-darwin/Shitty.app
 codesign --force --options runtime --timestamp --sign "Developer ID Application: …" .build-darwin/Shitty.app
-ditto -c -k --keepParent .build-darwin/Shitty.app /tmp/Shitty.zip
+codesign --force --options runtime --timestamp --sign "Developer ID Application: …" .build-darwin/st
+codesign --verify --deep --strict .build-darwin/Shitty.app
+codesign --verify --strict .build-darwin/st
+.build-darwin/st -version
+mkdir -p /tmp/shitty-submit
+cp -R .build-darwin/Shitty.app /tmp/shitty-submit/
+cp .build-darwin/st /tmp/shitty-submit/
+ditto -c -k --keepParent /tmp/shitty-submit /tmp/Shitty.zip
 xcrun notarytool submit /tmp/Shitty.zip --key-id … --issuer … --key … --wait
 xcrun stapler staple .build-darwin/Shitty.app
 spctl -a -vv -t execute .build-darwin/Shitty.app   # expect: accepted, source=Notarized Developer ID
