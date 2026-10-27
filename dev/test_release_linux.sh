@@ -30,7 +30,10 @@ vulkan_log="$logs/vulkan-wayland.log"
 export XDG_RUNTIME_DIR="$runtime"
 export WAYLAND_DISPLAY=wayland-shitty-test
 export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
-export DL_STUB_DEBUG="$logs/dlfcn.log"
+# SoLo 11 uses the ld.so-style debug switches; DL_STUB_DEBUG was the
+# older standalone dlfcn wrapper's variable and is ignored by the new bridge.
+export LD_DEBUG=dlfcn
+export LD_DEBUG_OUTPUT="$logs/dlfcn.log"
 
 test -n "$VK_DRIVER_FILES"
 install -d -m 700 "$runtime"
