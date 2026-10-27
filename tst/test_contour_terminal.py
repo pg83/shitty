@@ -707,7 +707,7 @@ class ContourTerminalTest(unittest.TestCase):
 
     def test_precision_scroll_clears_fraction_at_history_boundary(self):
         with Shitty(
-            columns=8, rows=4, save_lines=32, glyph_px=4, glyph_py=8
+            columns=8, rows=4, save_lines=32, glyph_px=4, glyph_py=10
         ) as terminal:
             write_numbered_history(terminal)
             terminal.scroll(
@@ -765,7 +765,7 @@ class ContourTerminalTest(unittest.TestCase):
             self.assertGreater(terminal.snapshot().view_offset, before)
 
     def test_native_momentum_velocity_advances_the_viewport(self):
-        with Shitty(columns=8, rows=4, save_lines=64) as terminal:
+        with Shitty(columns=8, rows=4, save_lines=64, glyph_py=10) as terminal:
             write_numbered_history(terminal, 32)
             terminal.scroll(
                 0, 2.0, phase="begin", precise=True, momentum=True,
@@ -1030,7 +1030,6 @@ class ContourTerminalTest(unittest.TestCase):
             terminal.write(b"\x1bP$q$~\x1b\\")
             self.assertEqual(terminal.read_input(), b"\x1bP1$r1$~\x1b\\")
 
-    @unittest.expectedFailure
     def test_resize_rejects_stale_native_momentum_packets(self):
         with Shitty(columns=8, rows=4, save_lines=64) as terminal:
             write_numbered_history(terminal, 32)
@@ -1122,7 +1121,7 @@ class ContourTerminalTest(unittest.TestCase):
             self.assertGreater(terminal.snapshot().refresh_count, before)
 
     def test_repeated_native_momentum_gestures_are_independent(self):
-        with Shitty(columns=8, rows=4, save_lines=64) as terminal:
+        with Shitty(columns=8, rows=4, save_lines=64, glyph_py=10) as terminal:
             write_numbered_history(terminal, 32)
             terminal.scroll(
                 0, 1, phase="begin", precise=True, momentum=True,

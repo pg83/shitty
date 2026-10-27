@@ -906,11 +906,11 @@ STD_TEST_SUITE(VtermHeadless) {
         pty.writes = 0;
 
         // Two native units are 20 logical pixels, or 40 backing pixels at
-        // scale two: exactly two 20-pixel rows.
+        // scale two: three rows with the 1.5x sensitivity multiplier.
         terminal->scroll({.y = 2.0, .precise = true, .contentScale = 2.0});
 
         STD_INSIST(pty.writes == 1);
-        STD_INSIST(StringView(pty.bytes) == StringView(u8"\x1b[<64;1;1M\x1b[<64;1;1M"));
+        STD_INSIST(StringView(pty.bytes) == StringView(u8"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M"));
     }
 
     STD_TEST(BulkUtf8DecoderMatchesByteWiseDecoder) {
