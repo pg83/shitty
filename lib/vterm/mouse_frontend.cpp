@@ -100,7 +100,7 @@ MouseWheelSteps MouseWheelAccumulator::consume(double x, double y, bool reportin
         clearRemainders();
         lastTime_ = 0.0;
     } else {
-        lastTime_ = time > 0.0 && isfinite(time) ? time : 0.0;
+        lastTime_ = time > 0.0 && __builtin_isfinite(time) ? time : 0.0;
     }
     return steps;
 }

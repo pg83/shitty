@@ -2156,7 +2156,7 @@ bool VtermInput::scroll(const VtScroll& input) {
         // native points become backing pixels through contentScale, then use
         // the current cell metrics rather than a fixed ten-per-line rule.
         constexpr double nativeUnits = 10.0;
-        const double contentScale = isfinite(input.contentScale) && input.contentScale > 0.0 ? input.contentScale : 1.0;
+        const double contentScale = __builtin_isfinite(input.contentScale) && input.contentScale > 0.0 ? input.contentScale : 1.0;
         x *= nativeUnits * contentScale / max<unsigned>(1, terminal->geometry.cellPixelWidth);
         y *= nativeUnits * contentScale / max<unsigned>(1, terminal->geometry.cellPixelHeight);
     }
