@@ -10,6 +10,8 @@
 
 #include <std/sys/types.h>
 
+#include <plt/input.h>
+
 enum FrontendModifier : unsigned {
     FrontendShift = 1,
     FrontendControl = 2,
@@ -40,15 +42,18 @@ struct MouseWheelSteps {
 
 class MouseWheelAccumulator {
 public:
-    MouseWheelSteps consume(double x, double y, bool reporting);
+    MouseWheelSteps consume(double x, double y, bool reporting, plt::ScrollPhase phase = plt::ScrollPhase::None, bool momentum = false, double time = 0);
     void reset();
 
 private:
     static int consumeAxis(double delta, double& remainder);
+    void clearRemainders();
 
     bool reporting_ = false;
+    bool momentum_ = false;
     double remainderX_ = 0.0;
     double remainderY_ = 0.0;
+    double lastTime_ = 0.0;
 };
 
 class MouseFrontendState {
@@ -84,8 +89,8 @@ public:
     bool reportMotion(int column, int row, MouseTrackingMode mode, MouseTrackingEnc encoding, u32 generation);
     void resetMotion();
 
-    MouseWheelSteps consumeWheel(double x, double y, bool reporting) {
-        return wheel_.consume(x, y, reporting);
+    MouseWheelSteps consumeWheel(double x, double y, bool reporting, plt::ScrollPhase phase = plt::ScrollPhase::None, bool momentum = false, double time = 0) {
+        return wheel_.consume(x, y, reporting, phase, momentum, time);
     }
 
 private:

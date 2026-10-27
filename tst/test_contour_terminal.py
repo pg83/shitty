@@ -705,7 +705,6 @@ class ContourTerminalTest(unittest.TestCase):
         self.assertEqual((whole.view_offset, partial.view_offset), (1, 1))
         self.assertNotEqual(partial_image, whole_image)
 
-    @unittest.expectedFailure
     def test_precision_scroll_clears_fraction_at_history_boundary(self):
         with Shitty(
             columns=8, rows=4, save_lines=32, glyph_px=4, glyph_py=8
@@ -798,7 +797,7 @@ class ContourTerminalTest(unittest.TestCase):
             self.assertEqual(terminal.snapshot().view_offset, 0)
 
     def test_single_native_momentum_sample_is_applied(self):
-        with Shitty(columns=8, rows=4, save_lines=32) as terminal:
+        with Shitty(columns=8, rows=4, save_lines=32, glyph_py=10) as terminal:
             write_numbered_history(terminal)
             terminal.scroll(
                 0, 1.25, phase="begin", precise=True, momentum=True,
@@ -852,7 +851,6 @@ class ContourTerminalTest(unittest.TestCase):
             terminal.blink_tick()
             self.assertEqual(terminal.snapshot().view_offset, stopped)
 
-    @unittest.expectedFailure
     def test_new_physical_gesture_rejects_stale_native_momentum(self):
         with Shitty(columns=8, rows=4, save_lines=64) as terminal:
             write_numbered_history(terminal, 32)
@@ -1086,7 +1084,7 @@ class ContourTerminalTest(unittest.TestCase):
             self.assertEqual(after.refresh_count, immediate.refresh_count)
 
     def test_unphased_precision_input_never_arms_momentum(self):
-        with Shitty(columns=8, rows=4, save_lines=32) as terminal:
+        with Shitty(columns=8, rows=4, save_lines=32, glyph_py=10) as terminal:
             terminal.write(b"\x1b[2 q")
             write_numbered_history(terminal, 16)
             for index in range(3):

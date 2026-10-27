@@ -20,6 +20,7 @@
 #include <plt/fiber.h>
 #include <plt/window.h>
 #include <plt/platform.h>
+#include <plt/platform_headless.h>
 
 using namespace stl;
 
@@ -28,6 +29,7 @@ namespace {
         size_t writeImpl(const void* data, size_t size) override;
 
         Buffer bytes;
+        size_t writes = 0;
     };
 
     static void discardOutput(Vterm& terminal) {
@@ -59,6 +61,7 @@ namespace {
 }
 
 size_t CaptureOutput::writeImpl(const void* data, size_t size) {
+    ++writes;
     bytes.append(data, size);
     return size;
 }
@@ -855,6 +858,59 @@ STD_TEST_SUITE(VtermHeadless) {
         terminal->feedPty(StringView(input, sizeof(input)));
 
         STD_INSIST(!pty.bytes.empty());
+    }
+
+    STD_TEST(FlushSkipsUnchangedFramesButRequestsPendingOutput) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        VtermHeadless* const headless = VtermHeadless::create(*composer.pool, *composer.vtConfig.config, nullptr);
+        Vterm* const terminal = headless->terminal();
+        auto* const window = static_cast<plt::WindowHeadless*>(headless->window());
+        while (window->framePending()) {
+            window->dispatchFrame();
+        }
+
+        terminal->flush();
+        STD_INSIST(!window->framePending());
+
+        terminal->expose();
+        terminal->flush();
+        STD_INSIST(window->framePending());
+    }
+
+    STD_TEST(WheelReportsShareOnePtyWrite) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        CaptureOutput pty;
+        VtermHeadless* const headless = VtermHeadless::create(*composer.pool, *composer.vtConfig.config, nullptr, &pty);
+        Vterm* const terminal = headless->terminal();
+        terminal->feedPty(StringView(u8"\x1b[?1049h\x1b[?1000h\x1b[?1006h"));
+        pty.bytes.reset();
+        pty.writes = 0;
+
+        terminal->scroll({.y = 3.0});
+
+        STD_INSIST(pty.writes == 1);
+        STD_INSIST(StringView(pty.bytes) == StringView(u8"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M"));
+    }
+
+    STD_TEST(PreciseWheelUsesCellMetricsAndContentScale) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        CaptureOutput pty;
+        VtermHeadless* const headless = VtermHeadless::create(*composer.pool, *composer.vtConfig.config, nullptr, &pty);
+        Vterm* const terminal = headless->terminal();
+        headless->geometry().setCellPixelSize(10, 20);
+        terminal->feedPty(StringView(u8"\x1b[?1049h\x1b[?1000h\x1b[?1006h"));
+        pty.bytes.reset();
+        pty.writes = 0;
+
+        // Two native units are 20 logical pixels, or 40 backing pixels at
+        // scale two: exactly two 20-pixel rows.
+        terminal->scroll({.y = 2.0, .precise = true, .contentScale = 2.0});
+
+        STD_INSIST(pty.writes == 1);
+        STD_INSIST(StringView(pty.bytes) == StringView(u8"\x1b[<64;1;1M\x1b[<64;1;1M"));
     }
 
     STD_TEST(BulkUtf8DecoderMatchesByteWiseDecoder) {

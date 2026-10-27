@@ -835,7 +835,17 @@ bool SessionSetImpl::pointerButton(const plt::PointerButtonInput& input) {
 }
 
 bool SessionSetImpl::scroll(const plt::ScrollInput& input) {
-    return activeTerminal()->scroll({pointerPosition(input.pixelX, input.pixelY), input.x, input.y, input.modifiers});
+    return activeTerminal()->scroll({
+        .position = pointerPosition(input.pixelX, input.pixelY),
+        .x = input.x,
+        .y = input.y,
+        .modifiers = input.modifiers,
+        .phase = input.phase,
+        .precise = input.precise,
+        .momentum = input.momentum,
+        .time = input.time,
+        .contentScale = composer.contentScale,
+    });
 }
 
 void SessionSetImpl::focus(bool focused) {

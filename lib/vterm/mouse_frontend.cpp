@@ -63,18 +63,31 @@ int MouseWheelAccumulator::consumeAxis(double delta, double& remainder) {
         remainder = 0.0;
         return 0;
     }
+    // A reversal starts a new direction: an old fraction must not consume
+    // the first step of the new one or produce a step in the old direction.
+    if (remainder * delta < 0.0) {
+        remainder = 0.0;
+    }
     const double total = remainder + min(max(delta, -100.0), 100.0);
     const int steps = (int)(trunc(total));
     remainder = total - steps;
     return steps;
 }
 
-MouseWheelSteps MouseWheelAccumulator::consume(double x, double y, bool reporting) {
-    if (reporting != reporting_) {
-        reporting_ = reporting;
-        remainderX_ = 0.0;
-        remainderY_ = 0.0;
+void MouseWheelAccumulator::clearRemainders() {
+    remainderX_ = 0.0;
+    remainderY_ = 0.0;
+}
+
+MouseWheelSteps MouseWheelAccumulator::consume(double x, double y, bool reporting, plt::ScrollPhase phase, bool momentum, double time) {
+    // Native timestamps are seconds. Unknown timestamps keep the legacy
+    // behavior; a backwards jump or a pause starts a fresh accumulation.
+    const bool timedOut = time > 0.0 && lastTime_ > 0.0 && (time < lastTime_ || time - lastTime_ > 0.1);
+    if (reporting != reporting_ || momentum != momentum_ || phase == plt::ScrollPhase::Begin || timedOut) {
+        clearRemainders();
     }
+    reporting_ = reporting;
+    momentum_ = momentum;
 
     MouseWheelSteps steps;
     steps.y = consumeAxis(y, remainderY_);
@@ -83,13 +96,20 @@ MouseWheelSteps MouseWheelAccumulator::consume(double x, double y, bool reportin
     } else {
         remainderX_ = 0.0;
     }
+    if (phase == plt::ScrollPhase::End || phase == plt::ScrollPhase::Cancel) {
+        clearRemainders();
+        lastTime_ = 0.0;
+    } else {
+        lastTime_ = time > 0.0 && isfinite(time) ? time : 0.0;
+    }
     return steps;
 }
 
 void MouseWheelAccumulator::reset() {
     reporting_ = false;
-    remainderX_ = 0.0;
-    remainderY_ = 0.0;
+    momentum_ = false;
+    lastTime_ = 0.0;
+    clearRemainders();
 }
 
 bool MouseFrontendState::protocolActive(unsigned modifiers, MouseTrackingMode mode) const {

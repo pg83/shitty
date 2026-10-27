@@ -92,6 +92,32 @@ STD_TEST_SUITE(MouseFrontend) {
         STD_INSIST(wheel.consume(0.5, 0.5, true).x == 0);
     }
 
+    STD_TEST(ResetsWheelRemaindersAtGestureBoundaries) {
+        MouseWheelAccumulator wheel;
+        wheel.consume(0.0, 0.75, false);
+        STD_INSIST(wheel.consume(0.0, 0.25, false, plt::ScrollPhase::Begin).y == 0);
+
+        wheel.consume(0.0, 0.75, false);
+        STD_INSIST(wheel.consume(0.0, 0.25, false, plt::ScrollPhase::End).y == 0);
+        STD_INSIST(wheel.consume(0.0, 0.75, false).y == 0);
+
+        wheel.reset();
+        wheel.consume(0.0, 0.75, false, plt::ScrollPhase::None, false, 1.0);
+        STD_INSIST(wheel.consume(0.0, 0.25, false, plt::ScrollPhase::None, false, 1.2).y == 0);
+
+        wheel.reset();
+        wheel.consume(0.0, 0.75, false);
+        STD_INSIST(wheel.consume(0.0, 0.25, false, plt::ScrollPhase::None, true).y == 0);
+    }
+
+    STD_TEST(WheelReversalDoesNotInheritTheOldFraction) {
+        MouseWheelAccumulator wheel;
+        wheel.consume(0.0, 0.9, false);
+
+        STD_INSIST(wheel.consume(0.0, -1.0, false).y == -1);
+        STD_INSIST(wheel.consume(0.0, -0.25, false).y == 0);
+    }
+
     STD_TEST(TracksPressedButtonsAndMotionButtonPriority) {
         MouseFrontendState state;
         state.updateButton(1, true);

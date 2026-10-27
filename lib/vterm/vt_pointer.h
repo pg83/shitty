@@ -39,4 +39,11 @@ struct VtScroll {
     double x = 0;
     double y = 0;
     u16 modifiers = 0;
+    plt::ScrollPhase phase = plt::ScrollPhase::None;
+    bool precise = false;
+    bool momentum = false;
+    double time = 0;
+    // Backing pixels per native logical unit. Smooth deltas are normalized
+    // into cell-sized steps against the current cell metrics.
+    double contentScale = 1.0;
 };

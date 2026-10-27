@@ -20,15 +20,15 @@ class MouseFrontendScrollTest(unittest.TestCase):
             terminal.scroll(0, -1)
             self.assertEqual(terminal.snapshot().view_offset, 0)
 
-    def test_fractional_reporting_scroll_preserves_signed_remainder(self):
+    def test_fractional_reporting_scroll_restarts_after_reversal(self):
         with Shitty(columns=8, rows=2) as terminal:
             terminal.write(b"\x1b[?1000h\x1b[?1006h")
             terminal.scroll(0, 0.75, pixel_x=5, pixel_y=4)
             terminal.scroll(0, -0.5, pixel_x=5, pixel_y=4)
             terminal.scroll(0, 0.75, pixel_x=5, pixel_y=4)
-            self.assertEqual(
-                terminal.read_input(), b"\x1b[<64;4;2M"
-            )
+            self.assertEqual(terminal.read_input(), b"")
+            terminal.scroll(0, 0.25, pixel_x=5, pixel_y=4)
+            self.assertEqual(terminal.read_input(), b"\x1b[<64;4;2M")
 
     def test_vertical_and_horizontal_wheel_buttons_are_distinct(self):
         with Shitty(columns=8, rows=2) as terminal:

@@ -360,8 +360,8 @@ namespace {
         VtModifier legacyModifiers(u16 modifiers) const;
         u16 kittyModifiers(u16 modifiers) const;
         void mouseProtocolCoordinates(MouseTrackingEnc encoding, int pixelX, int pixelY, u16& column, u16& row) const;
-        void sendMouseProtocol(MouseTrackingEnc encoding, MouseEventType type, u16 modifiers, int button, int column, int row);
-        void sendMouseButtonProtocol(MouseEventType type, int button, int pixelX, int pixelY, u16 modifiers, const MouseTrackingState& tracking);
+        void sendMouseProtocol(MouseTrackingEnc encoding, MouseEventType type, u16 modifiers, int button, int column, int row, StringBuilder* batch = nullptr);
+        void sendMouseButtonProtocol(MouseEventType type, int button, int pixelX, int pixelY, u16 modifiers, const MouseTrackingState& tracking, StringBuilder* batch = nullptr);
         bool refreshHyperlink();
         void refreshHyperlinkAndRedraw();
         void updatePointer(int pixelX, int pixelY, u16 modifiers);
@@ -2021,15 +2021,20 @@ void VtermInput::mouseProtocolCoordinates(MouseTrackingEnc encoding, int pixelX,
     row = point.row;
 }
 
-void VtermInput::sendMouseProtocol(MouseTrackingEnc encoding, MouseEventType type, u16 modifiers, int button, int column, int row) {
+void VtermInput::sendMouseProtocol(MouseTrackingEnc encoding, MouseEventType type, u16 modifiers, int button, int column, int row, StringBuilder* batch) {
     const unsigned protocolModifiers = mouseProtocolModifiers(modifiers);
     StringBuilder report;
-    if (encodeMouseProtocol(report, encoding, type, protocolModifiers, mouse.motionButton(), button, column, row)) {
+    if (!encodeMouseProtocol(report, encoding, type, protocolModifiers, mouse.motionButton(), button, column, row)) {
+        return;
+    }
+    if (batch != nullptr) {
+        batch->append(report.data(), report.used());
+    } else {
         terminal->writePty(StringView((const u8*)(report.data()), report.used()));
     }
 }
 
-void VtermInput::sendMouseButtonProtocol(MouseEventType type, int button, int pixelX, int pixelY, u16 modifiers, const MouseTrackingState& tracking) {
+void VtermInput::sendMouseButtonProtocol(MouseEventType type, int button, int pixelX, int pixelY, u16 modifiers, const MouseTrackingState& tracking, StringBuilder* batch) {
     if (!mouseButtonReportAllowed(tracking.mode, type, button)) {
         return;
     }
@@ -2040,7 +2045,7 @@ void VtermInput::sendMouseButtonProtocol(MouseEventType type, int button, int pi
         terminal->mouseHighlightRelease(column, row, column, row);
         return;
     }
-    sendMouseProtocol(tracking.enc, type, tracking.mode == MouseTrackingMode::X10_Compat ? 0 : modifiers, button, column, row);
+    sendMouseProtocol(tracking.enc, type, tracking.mode == MouseTrackingMode::X10_Compat ? 0 : modifiers, button, column, row, batch);
 }
 
 bool VtermInput::pointerButton(const VtPointerButton& input) {
@@ -2143,19 +2148,37 @@ bool VtermInput::scroll(const VtScroll& input) {
     const MouseTrackingState tracking = terminal->mouseTrk;
     const bool reporting = mouse.protocolActive(input.modifiers, tracking.mode);
     const bool alternate = terminal->altScrollMode && terminal->altScreenBufferMode;
-    const MouseWheelSteps steps = mouse.consumeWheel(input.x, input.y, reporting || alternate);
+    double x = input.x;
+    double y = input.y;
+    if (input.precise) {
+        // Both native backends package smooth travel in units of ten before
+        // it reaches the VT core. Turn that travel into cell-sized steps:
+        // native points become backing pixels through contentScale, then use
+        // the current cell metrics rather than a fixed ten-per-line rule.
+        constexpr double nativeUnits = 10.0;
+        const double contentScale = isfinite(input.contentScale) && input.contentScale > 0.0 ? input.contentScale : 1.0;
+        x *= nativeUnits * contentScale / max<unsigned>(1, terminal->geometry.cellPixelWidth);
+        y *= nativeUnits * contentScale / max<unsigned>(1, terminal->geometry.cellPixelHeight);
+    }
+    const MouseWheelSteps steps = mouse.consumeWheel(x, y, reporting || alternate, input.phase, input.momentum, input.time);
     if (reporting) {
+        // Keep the protocol identical but pay for one transaction and one
+        // PTY flush per native event, not per logical wheel step.
+        StringBuilder reports;
         for (int k = 0; k < steps.y; ++k) {
-            sendMouseButtonProtocol(MouseEventType::Press, 4, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+            sendMouseButtonProtocol(MouseEventType::Press, 4, input.position.pixelX, input.position.pixelY, input.modifiers, tracking, &reports);
         }
         for (int k = 0; k < -steps.y; ++k) {
-            sendMouseButtonProtocol(MouseEventType::Press, 5, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+            sendMouseButtonProtocol(MouseEventType::Press, 5, input.position.pixelX, input.position.pixelY, input.modifiers, tracking, &reports);
         }
         for (int k = 0; k < -steps.x; ++k) {
-            sendMouseButtonProtocol(MouseEventType::Press, 6, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+            sendMouseButtonProtocol(MouseEventType::Press, 6, input.position.pixelX, input.position.pixelY, input.modifiers, tracking, &reports);
         }
         for (int k = 0; k < steps.x; ++k) {
-            sendMouseButtonProtocol(MouseEventType::Press, 7, input.position.pixelX, input.position.pixelY, input.modifiers, tracking);
+            sendMouseButtonProtocol(MouseEventType::Press, 7, input.position.pixelX, input.position.pixelY, input.modifiers, tracking, &reports);
+        }
+        if (reports.used() != 0) {
+            terminal->writePty(StringView((const u8*)(reports.data()), reports.used()));
         }
     } else {
         if (steps.y > 0) {
@@ -2368,7 +2391,9 @@ void VtermImpl::pointerRepositioned(const VtPointerPosition& position) {
 
 void VtermImpl::flush() {
     input.flush();
-    host.requestFrame();
+    if (outputPending) {
+        host.requestFrame();
+    }
 }
 
 void VtermImpl::key(InputKey key_, VtModifier modifiers_) {
