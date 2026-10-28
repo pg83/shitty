@@ -9,6 +9,7 @@
 #if defined(HAVE_CORETEXT)
     #include "composer.h"
     #include "font_face.h"
+    #include "glyph_cache.h"
     #include "font_renderer.h"
     #include "font_resolver.h"
     #include <lib/vterm/grapheme.h>
@@ -42,6 +43,9 @@ namespace {
         CTLineRef makeLine(CFStringRef string);
         bool inspectLine(CTLineRef line, bool& color);
         bool drawLine(CTLineRef line, bool color);
+        CGContextRef makeContext(void* buf, size_t width, size_t height, bool color);
+        bool strikeFor(CGGlyph glyph, u32 phaseX, u32 phaseY, GlyphStrike& strike);
+        void drawStrike(const GlyphStrike& strike, u8* out, size_t stride, int destinationX, int destinationY);
         bool drawFittedSymbol(CTFontRef font, CGGlyph glyph, CGFloat x, CGFloat baseline, CGContextRef context);
         void centerFallbackColorCluster(CTFontRef font, const CGGlyph* glyphs, CGPoint* positions, size_t count);
 
@@ -58,6 +62,9 @@ namespace {
         Buffer columns_;
         Buffer fitted_;
         Buffer bitmap_;
+        Buffer strike_;
+        u32 strikeNamespace_ = 0;
+        CFDictionaryRef lineAttributes_ = nullptr;
     };
 
     struct CoreTextFontResolver final: public FontResolver {
@@ -120,6 +127,24 @@ namespace {
         return name.memChr('/') || name.memChr('\\');
     }
 
+    static int maximum(int left, int right) {
+        return left > right ? left : right;
+    }
+
+    static int minimum(int left, int right) {
+        return left < right ? left : right;
+    }
+
+    // Subpixel placement in four phases per axis, like the FreeType
+    // soft path: the floor pixel anchors the blit and the quantized
+    // fraction is rasterized into the strike itself.
+    static void splitPhase(CGFloat position, int& base, u32& phase) {
+        const CGFloat floored = __builtin_floor(position);
+        const u32 quad = (u32)((position - floored) * 4 + 0.5);
+        base = (int)(floored) + (int)(quad >> 2);
+        phase = quad & 3;
+    }
+
     static CFStringRef makeString(StringView value) {
         return CFStringCreateWithBytes(kCFAllocatorDefault, (const UInt8*)(value.data()), value.length(), kCFStringEncodingUTF8, false);
     }
@@ -146,22 +171,23 @@ Font* CoreTextFont::synthesize(ObjPool& owner, FontStyle style) {
 }
 
 CoreTextFont::~CoreTextFont() noexcept {
+    if (lineAttributes_ != nullptr) {
+        CFRelease(lineAttributes_);
+    }
     CFRelease(font_);
 }
 
-void CoreTextFont::render(const u32* codepoints, size_t count, u16 cells, void* buf) {
-    const bool color = colored();
+CGContextRef CoreTextFont::makeContext(void* buf, size_t width, size_t height, bool color) {
     const size_t bytesPerPixel = color ? 4 : 1;
-    const size_t stride = (size_t)(cells)*metrics_.width * bytesPerPixel;
     CGColorSpaceRef colorSpace = color ? CGColorSpaceCreateDeviceRGB() : CGColorSpaceCreateDeviceGray();
     if (colorSpace == nullptr) {
-        return;
+        return nullptr;
     }
     const CGBitmapInfo bitmapInfo = color ? (CGBitmapInfo)kCGImageAlphaPremultipliedLast | (CGBitmapInfo)kCGBitmapByteOrder32Big : (CGBitmapInfo)kCGImageAlphaNone;
-    CGContextRef context = CGBitmapContextCreate(buf, (size_t)(cells)*metrics_.width, metrics_.height, 8, stride, colorSpace, bitmapInfo);
+    CGContextRef context = CGBitmapContextCreate(buf, width, height, 8, width * bytesPerPixel, colorSpace, bitmapInfo);
     CGColorSpaceRelease(colorSpace);
     if (context == nullptr) {
-        return;
+        return nullptr;
     }
     CGContextSetAllowsAntialiasing(context, true);
     CGContextSetShouldAntialias(context, true);
@@ -173,6 +199,7 @@ void CoreTextFont::render(const u32* codepoints, size_t count, u16 cells, void* 
         CGContextSetGrayFillColor(context, 1, 1);
     }
     if (syntheticBold_) {
+        // Fake bold: fill and stroke, the stroke width scaled to the size.
         CGContextSetTextDrawingMode(context, kCGTextFillStroke);
         CGContextSetLineWidth(context, metrics_.height * 0.03);
         if (color) {
@@ -183,9 +210,105 @@ void CoreTextFont::render(const u32* codepoints, size_t count, u16 cells, void* 
     }
     CGAffineTransform matrix = CGAffineTransformIdentity;
     if (syntheticItalic_) {
+        // Fake italic: a horizontal shear of about 14 degrees.
         matrix.c = 0.25;
     }
     CGContextSetTextMatrix(context, matrix);
+    return context;
+}
+
+// The composer memo in front of Core Graphics, the counterpart of the
+// FreeType strikeFor: the key packs this font's namespace - the pixel
+// size and the synthetic style are the font's own - with the subpixel
+// phases and the glyph id. A miss inks the one glyph into a bitmap of
+// its own integral bounds; ligatures and contextual alternates are glyph
+// ids like any other, the line was shaped before the lookup.
+bool CoreTextFont::strikeFor(CGGlyph glyph, u32 phaseX, u32 phaseY, GlyphStrike& strike) {
+    GlyphCache* const cache = composer_.glyphs;
+    u64 key = 0;
+    if (cache != nullptr) {
+        if (strikeNamespace_ == 0) {
+            strikeNamespace_ = cache->makeNamespace();
+        }
+        key = ((u64)(strikeNamespace_) << 40) | ((u64)(phaseX) << 26) | ((u64)(phaseY) << 24) | glyph;
+        if (cache->find(key, strike)) {
+            return true;
+        }
+    }
+    const CGPoint fraction = {phaseX / 4.0, phaseY / 4.0};
+    CGRect bounds = CTFontGetBoundingRectsForGlyphs(font_, kCTFontOrientationHorizontal, &glyph, nullptr, 1);
+    strike.data = (const u8*)(strike_.data());
+    strike.width = 0;
+    strike.height = 0;
+    strike.left = 0;
+    strike.top = 0;
+    if (!CGRectIsNull(bounds) && !CGRectIsEmpty(bounds)) {
+        if (syntheticItalic_) {
+            CGAffineTransform matrix = CGAffineTransformIdentity;
+            matrix.c = 0.25;
+            bounds = CGRectApplyAffineTransform(bounds, matrix);
+        }
+        // The outline bounds are tight: antialiasing and the fake-bold
+        // stroke reach one pixel and one stroke width past them.
+        const CGFloat reach = 1 + (syntheticBold_ ? metrics_.height * 0.03 : 0);
+        bounds = CGRectOffset(bounds, fraction.x, fraction.y);
+        const CGRect ink = CGRectIntegral(CGRectInset(bounds, -reach, -reach));
+        const CGFloat width = ink.size.width;
+        const CGFloat height = ink.size.height;
+        if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+            return false;
+        }
+        const size_t bytes = (size_t)(width) * (size_t)(height);
+        strike_.reset();
+        strike_.grow(bytes);
+        strike_.seekAbsolute(bytes);
+        u8* const rows = (u8*)(strike_.mutData());
+        __builtin_memset(rows, 0, bytes);
+        CGContextRef context = makeContext(rows, (size_t)(width), (size_t)(height), false);
+        if (context == nullptr) {
+            return false;
+        }
+        const CGPoint position = {fraction.x - ink.origin.x, fraction.y - ink.origin.y};
+        CTFontDrawGlyphs(font_, &glyph, &position, 1, context);
+        CGContextRelease(context);
+        strike.data = rows;
+        strike.width = (u16)(width);
+        strike.height = (u16)(height);
+        strike.left = (i16)(ink.origin.x);
+        strike.top = (i16)(ink.origin.y + height);
+    }
+    if (cache != nullptr) {
+        cache->insert(key, strike);
+    }
+    return true;
+}
+
+void CoreTextFont::drawStrike(const GlyphStrike& strike, u8* out, size_t stride, int destinationX, int destinationY) {
+    const int sourceX = maximum(0, -destinationX);
+    const int sourceY = maximum(0, -destinationY);
+    destinationX = maximum(0, destinationX);
+    destinationY = maximum(0, destinationY);
+    const int copyWidth = minimum((int)(strike.width) - sourceX, (int)(stride)-destinationX);
+    const int copyHeight = minimum((int)(strike.height) - sourceY, (int)(metrics_.height) - destinationY);
+    if (copyWidth <= 0 || copyHeight <= 0) {
+        return;
+    }
+    for (int row = 0; row < copyHeight; ++row) {
+        const u8* const source = strike.data + (size_t)(sourceY + row) * strike.width + sourceX;
+        u8* const destination = out + (size_t)(destinationY + row) * stride + destinationX;
+        for (int column = 0; column < copyWidth; ++column) {
+            destination[column] = (u8)(maximum(destination[column], source[column]));
+        }
+    }
+}
+
+void CoreTextFont::render(const u32* codepoints, size_t count, u16 cells, void* buf) {
+    const bool color = colored();
+    const size_t stride = (size_t)(cells)*metrics_.width;
+    // The span context only exists for what the strike memo cannot
+    // serve: color glyphs, fitted symbols and runs Core Text cascaded to
+    // another face.
+    CGContextRef context = nullptr;
 
     // One CTLine over the whole span - Core Text forms the ligatures -
     // but the glyphs draw at cluster-snapped positions: a font advance
@@ -266,6 +389,27 @@ void CoreTextFont::render(const u32* codepoints, size_t count, u16 cells, void* 
                             centerFallbackColorCluster(runFont, glyphs + clusterBegin, adjusted + clusterBegin, (size_t)(index - clusterBegin));
                         }
                         const bool fit = clusterIndex >= 0 && (size_t)(clusterIndex) < utf16Length && utf16Fitted[clusterIndex];
+                        if (!color && !fit && CFEqual(runFont, font_)) {
+                            for (CFIndex glyph = clusterBegin; glyph < index; ++glyph) {
+                                int baseX;
+                                int baseY;
+                                u32 phaseX;
+                                u32 phaseY;
+                                splitPhase(adjusted[glyph].x, baseX, phaseX);
+                                splitPhase(natural[glyph].y, baseY, phaseY);
+                                GlyphStrike strike;
+                                if (strikeFor(glyphs[glyph], phaseX, phaseY, strike)) {
+                                    drawStrike(strike, (u8*)(buf), stride, baseX + strike.left, metrics_.baseline - baseY - strike.top);
+                                }
+                            }
+                            continue;
+                        }
+                        if (context == nullptr) {
+                            context = makeContext(buf, stride, metrics_.height, color);
+                            if (context == nullptr) {
+                                break;
+                            }
+                        }
                         if (fit && index == clusterBegin + 1 && drawFittedSymbol(runFont, glyphs[clusterBegin], target, adjusted[clusterBegin].y, context)) {
                             continue;
                         }
@@ -276,7 +420,9 @@ void CoreTextFont::render(const u32* codepoints, size_t count, u16 cells, void* 
             CFRelease(line);
         }
     }
-    CGContextRelease(context);
+    if (context != nullptr) {
+        CGContextRelease(context);
+    }
 }
 
 bool CoreTextFont::colored() const {
@@ -323,20 +469,23 @@ CTLineRef CoreTextFont::makeLine(CFStringRef string) {
     // The CTFont carries the exact grid policy: liga and dlig are off,
     // calt is on. Do not add kCTLigatureAttributeName here: level 2 means
     // "all ligatures" and overrides that policy on newer Core Text.
-    const void* keys[] = {
-        kCTFontAttributeName,
-        kCTForegroundColorFromContextAttributeName,
-    };
-    const void* values[] = {
-        font_,
-        kCFBooleanTrue,
-    };
-    CFDictionaryRef attributes = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    if (attributes == nullptr) {
-        return nullptr;
+    // The attributes never change for this font: build the dictionary
+    // once and hand the same object to every line.
+    if (lineAttributes_ == nullptr) {
+        const void* keys[] = {
+            kCTFontAttributeName,
+            kCTForegroundColorFromContextAttributeName,
+        };
+        const void* values[] = {
+            font_,
+            kCFBooleanTrue,
+        };
+        lineAttributes_ = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (lineAttributes_ == nullptr) {
+            return nullptr;
+        }
     }
-    CFAttributedStringRef attributed = CFAttributedStringCreate(kCFAllocatorDefault, string, attributes);
-    CFRelease(attributes);
+    CFAttributedStringRef attributed = CFAttributedStringCreate(kCFAllocatorDefault, string, lineAttributes_);
     if (attributed == nullptr) {
         return nullptr;
     }
@@ -684,7 +833,6 @@ FontFace* CoreTextFontResolver::resolve(const FontRequest& request) {
 }
 
 namespace {
-
     // The grid's ligature policy, pinned on the font itself: liga and
     // dlig collapse two cells' codepoints into one narrow glyph, so they
     // go off; coding fonts carry their ligatures in calt, which Core

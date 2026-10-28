@@ -14,11 +14,16 @@ using namespace stl;
 
 namespace {
 
-    // The live set is a few hundred glyphs of one font; the budget only
-    // caps pathological output (a rotating CJK stream). Overflow drops
-    // the whole arena, semi-space style: entries are epoch-checked, never
+    // The memo earns its keep on text that never repeats: every distinct
+    // glyph must rasterize once, so the budget holds the largest set one
+    // script can show at once - the ideographs and Hangul syllables of
+    // the BMP, 32k glyphs - at a typical retina glyph of 32x32 coverage
+    // bytes. Bigger glyphs fit fewer before overflow, which drops the
+    // whole arena, semi-space style: entries are epoch-checked, never
     // removed one by one.
-    constexpr size_t pixelBudget = 4u << 20;
+    constexpr size_t repertoireGlyphs = 32768;
+    constexpr size_t typicalGlyphBytes = 32 * 32;
+    constexpr size_t pixelBudget = repertoireGlyphs * typicalGlyphBytes;
 
     struct Entry {
         u32 offset;

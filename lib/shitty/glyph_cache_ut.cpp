@@ -50,15 +50,15 @@ STD_TEST_SUITE(GlyphCache) {
     STD_TEST(BudgetOverflowRestartsTheArena) {
         ObjPool::Ref pool = ObjPool::fromMemory();
         GlyphCache* const cache = createGlyphCache(*pool);
-        // 64k per strike: 64 of them cross the 4 MiB budget.
+        // 64k per strike: 512 of them cross the 32 MiB budget.
         static u8 pixels[64 * 1024];
         pixels[0] = 17;
-        for (u64 key = 0; key < 65; ++key) {
+        for (u64 key = 0; key < 513; ++key) {
             cache->insert(key, {pixels, 256, 256, 0, 0});
         }
         GlyphStrike strike;
         STD_INSIST(!cache->find(0, strike));
-        STD_INSIST(cache->find(64, strike));
+        STD_INSIST(cache->find(512, strike));
         STD_INSIST(strike.data[0] == 17);
     }
 }
