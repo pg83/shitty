@@ -4054,6 +4054,11 @@ void VtermImpl::resetGraphemeInput() {
 [[gnu::always_inline]] inline u16 VtermImpl::codepointEntry(u32 codepoint) {
     constexpr u16 valid = 0x80;
     constexpr u16 simple = 0x04;
+    // Printable ASCII is one cell wide, never joins and is class Other:
+    // the answer is a constant, not a page walk.
+    if (codepoint - 0x20 < 0x5f) {
+        return valid | 1 | simple;
+    }
     u16& cached = (*unicodeProperties)[codepoint];
     if ((cached & valid) == 0) {
         const CodepointProperties properties = config().widths.codepointProperties(codepoint);
