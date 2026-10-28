@@ -10,6 +10,9 @@
 
 #include <stdint.h>
 
+enum class GraphemeClass : u8;
+enum class IndicConjunctClass : u8;
+
 // Whether the codepoint's default presentation is emoji.
 bool emojiPresentation(u32 codepoint);
 
@@ -67,6 +70,26 @@ public:
         return breakBeforeSlow(codepoint, simple);
     }
 
+    // For callers holding the codepoint's classes from their own cache:
+    // the slow path skips the property table for it.
+    [[gnu::always_inline]] bool breakBefore(u32 codepoint, bool simple, GraphemeClass graphemeClass, IndicConjunctClass indicClass) {
+        if (!hasPrevious_) {
+            hasPrevious_ = true;
+            previous_ = (i32)(codepoint);
+            previousSimple_ = simple;
+            return true;
+        }
+
+        if (previousSimple_ && simple) {
+            previous_ = (i32)(codepoint);
+            previousSimple_ = true;
+            state_ = 0;
+            return true;
+        }
+
+        return breakBeforeSlow(codepoint, simple, graphemeClass, indicClass);
+    }
+
     [[gnu::always_inline]] void setBoundaryAfter(u32 codepoint) {
         setBoundaryAfter(codepoint, codepoint >= 0x20 && codepoint < 0x7f);
     }
@@ -96,6 +119,7 @@ public:
 
 private:
     bool breakBeforeSlow(u32 codepoint, bool simple);
+    bool breakBeforeSlow(u32 codepoint, bool simple, GraphemeClass graphemeClass, IndicConjunctClass indicClass);
 
     bool hasPrevious_ = false;
     bool previousSimple_ = false;

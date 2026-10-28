@@ -53,6 +53,10 @@ bool emojiPresentation(u32 codepoint) {
 
 bool GraphemeBreaker::breakBeforeSlow(u32 codepoint, bool simple) {
     const UnicodeCodepointProperties right = unicodeCodepointProperties(codepoint);
+    return breakBeforeSlow(codepoint, simple, right.graphemeClass, right.indicConjunctClass);
+}
+
+bool GraphemeBreaker::breakBeforeSlow(u32 codepoint, bool simple, GraphemeClass rightClass, IndicConjunctClass rightIndic) {
     GraphemeClass stateClass;
     IndicConjunctClass stateIndic;
     if (state_ == 0) {
@@ -64,33 +68,33 @@ bool GraphemeBreaker::breakBeforeSlow(u32 codepoint, bool simple) {
         stateIndic = (IndicConjunctClass)(state_ >> 8);
     }
 
-    const bool boundary = graphemeBreakSimple(stateClass, right.graphemeClass) && !(stateIndic == IndicConjunctClass::Linker && right.indicConjunctClass == IndicConjunctClass::Consonant);
-    if (right.indicConjunctClass == IndicConjunctClass::Consonant || stateIndic == IndicConjunctClass::Consonant || stateIndic == IndicConjunctClass::Extend) {
-        stateIndic = right.indicConjunctClass;
+    const bool boundary = graphemeBreakSimple(stateClass, rightClass) && !(stateIndic == IndicConjunctClass::Linker && rightIndic == IndicConjunctClass::Consonant);
+    if (rightIndic == IndicConjunctClass::Consonant || stateIndic == IndicConjunctClass::Consonant || stateIndic == IndicConjunctClass::Extend) {
+        stateIndic = rightIndic;
     } else if (stateIndic == IndicConjunctClass::Linker) {
-        stateIndic = right.indicConjunctClass == IndicConjunctClass::Extend ? IndicConjunctClass::Linker : right.indicConjunctClass;
+        stateIndic = rightIndic == IndicConjunctClass::Extend ? IndicConjunctClass::Linker : rightIndic;
     }
 
-    if (stateClass == right.graphemeClass && right.graphemeClass == GraphemeClass::RegionalIndicator) {
+    if (stateClass == rightClass && rightClass == GraphemeClass::RegionalIndicator) {
         stateClass = GraphemeClass::Other;
     } else if (stateClass == GraphemeClass::ExtendedPictographic) {
-        if (right.graphemeClass == GraphemeClass::Extend) {
+        if (rightClass == GraphemeClass::Extend) {
             stateClass = GraphemeClass::ExtendedPictographic;
-        } else if (right.graphemeClass == GraphemeClass::Zwj) {
+        } else if (rightClass == GraphemeClass::Zwj) {
             stateClass = GraphemeClass::EmojiZwj;
         } else {
-            stateClass = right.graphemeClass;
+            stateClass = rightClass;
         }
     } else {
-        stateClass = right.graphemeClass;
+        stateClass = rightClass;
     }
     if (boundary) {
         // The new cluster is this codepoint alone: seed the state exactly
         // as the state_ == 0 branch above would derive it from previous_
         // on the next call, so a run of independent clusters - CJK text -
         // pays one property lookup per codepoint, not two.
-        stateClass = right.graphemeClass;
-        stateIndic = right.indicConjunctClass == IndicConjunctClass::Consonant ? IndicConjunctClass::Consonant : IndicConjunctClass::None;
+        stateClass = rightClass;
+        stateIndic = rightIndic == IndicConjunctClass::Consonant ? IndicConjunctClass::Consonant : IndicConjunctClass::None;
     }
     state_ = ((i32)(stateClass) + 1) | ((i32)(stateIndic) << 8);
     previous_ = (i32)(codepoint);

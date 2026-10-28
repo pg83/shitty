@@ -648,7 +648,10 @@ namespace {
         size_t placeGraphemeRun(const u32* codepoints, size_t count, u64 resetBefore = 0);
         template <bool hasWide>
         void placePreparedRun(const u32* input, const u8* widths, size_t size);
+        u16 codepointEntry(u32 codepoint);
         u8 codepointData(u32 codepoint);
+        static GraphemeClass entryGraphemeClass(u16 entry);
+        static IndicConjunctClass entryIndicClass(u16 entry);
         void resetGraphemeInput();
         void jumpToNextTabStop();
         void setFgFromPalIx();
@@ -986,7 +989,7 @@ namespace {
         plt::FiberMutex* const ptyMutex_;
         VtermTrace* const trace;
         Output* dump;
-        UnicodeMap<u8>* const unicodeProperties;
+        UnicodeMap<u16>* const unicodeProperties;
         Buffer protocolResponseScratch;
         Vector<TerminalRow> outputRows;
         // IME composition preview: overlay cells composed into the frame
@@ -4043,15 +4046,33 @@ void VtermImpl::resetGraphemeInput() {
     inputGraphemeScreen = nullptr;
 }
 
-[[gnu::always_inline]] inline u8 VtermImpl::codepointData(u32 codepoint) {
-    constexpr u8 valid = 0x80;
-    constexpr u8 simple = 0x04;
-    u8& cached = (*unicodeProperties)[codepoint];
+// The per-terminal codepoint cache entry: the low byte is what every
+// placement path reads - valid, the grapheme simplicity, the width -
+// and the high byte carries the grapheme and Indic conjunct classes the
+// breaker would otherwise fetch from the property table again for every
+// codepoint that is not simple.
+[[gnu::always_inline]] inline u16 VtermImpl::codepointEntry(u32 codepoint) {
+    constexpr u16 valid = 0x80;
+    constexpr u16 simple = 0x04;
+    u16& cached = (*unicodeProperties)[codepoint];
     if ((cached & valid) == 0) {
         const CodepointProperties properties = config().widths.codepointProperties(codepoint);
-        cached = valid | properties.width | (properties.simpleGrapheme ? simple : 0);
+        const UnicodeCodepointProperties classes = unicodeCodepointProperties(codepoint);
+        cached = (u16)(valid | properties.width | (properties.simpleGrapheme ? simple : 0) | ((u16)(classes.graphemeClass) << 8) | ((u16)(classes.indicConjunctClass) << 12));
     }
     return cached;
+}
+
+[[gnu::always_inline]] inline u8 VtermImpl::codepointData(u32 codepoint) {
+    return (u8)(codepointEntry(codepoint));
+}
+
+[[gnu::always_inline]] inline GraphemeClass VtermImpl::entryGraphemeClass(u16 entry) {
+    return (GraphemeClass)((entry >> 8) & 0x0f);
+}
+
+[[gnu::always_inline]] inline IndicConjunctClass VtermImpl::entryIndicClass(u16 entry) {
+    return (IndicConjunctClass)((entry >> 12) & 0x03);
 }
 
 void VtermImpl::placeGraphicChar() {
@@ -4472,12 +4493,13 @@ void VtermImpl::placeRepeatedCodepoint(u32 codepoint, u32 count) {
     }
     while (clustered && consumed < count) {
         const u32 codepoint = codepoints[consumed];
-        const u8 data = codepointData(codepoint);
+        const u16 entry = codepointEntry(codepoint);
+        const u8 data = (u8)(entry);
         const GraphemeBreaker before = breaker;
         if ((resetBefore >> consumed) & 1) {
             breaker.reset();
         }
-        if (breaker.breakBefore(codepoint, (data & 0x04) != 0)) {
+        if (breaker.breakBefore(codepoint, (data & 0x04) != 0, entryGraphemeClass(entry), entryIndicClass(entry))) {
             const u8 width = data & 0x03;
             if (width == 0 || cellCount + width > available) {
                 breaker = before;
@@ -8963,7 +8985,7 @@ VtermImpl::VtermImpl(ObjPool& owner, VtGeometry& geometry_, const VtConfigSlot& 
     , ptyMutex_(scheduler.createMutex(owner))
     , trace(traceFactory_ == nullptr ? nullptr : traceFactory_->construct(createTestApi()))
     , dump(dump_)
-    , unicodeProperties(UnicodeMap<u8>::create(owner))
+    , unicodeProperties(UnicodeMap<u16>::create(owner))
     , parser(Parser::create(&owner, *this, trace, config().osc52SelectClipboard))
     , notifications(&owner)
     , savedPrivModes(&owner)
