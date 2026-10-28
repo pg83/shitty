@@ -23,6 +23,7 @@
 
 #include <string>
 #include <fcntl.h>
+#include <stdio.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -477,6 +478,53 @@ STD_TEST_SUITE(Pty) {
         STD_INSIST(WEXITSTATUS(status) == 0);
     }
 
+    STD_TEST(RingWrapDeliversEveryByteInOrder) {
+        // Three megabytes through the one-megabyte read ring: the cursors
+        // lap the ring twice, and every wrap seam must hand the feed its
+        // bytes exactly once and in order. The child turns off ONLCR so
+        // the stream compares byte-for-byte.
+        EngagedPtyFixture fixture;
+        ObjPool* const owner = ObjPool::fromMemoryRaw();
+        char script[] = "stty -onlcr; awk 'BEGIN { for (i = 0; i < 393216; i++) printf \"%07d\\n\", i }'";
+        PtyHandle* const handle = spawnShell(*fixture.pty, *owner, script);
+        handle->engage();
+
+        std::string received;
+        received.reserve(4 * 1024 * 1024);
+        bool done = false;
+        auto feed = makeRunable([&] {
+            for (;;) {
+                PtyHandle::Chunk* const chunks = handle->acquire();
+                if (chunks == nullptr) {
+                    done = true;
+                    return;
+                }
+                for (PtyHandle::Chunk* chunk = chunks; chunk != nullptr; chunk = chunk->next()) {
+                    received.append((const char*)(chunk->data()), chunk->length());
+                }
+                handle->release(chunks);
+            }
+        });
+        fixture.composer.scheduler->create(*owner, feed, 64 * 1024);
+        fixture.driveUntil([&] {
+            return done;
+        });
+
+        std::string expected;
+        expected.reserve(received.size());
+        for (unsigned line = 0; line < 393216; ++line) {
+            char text[16];
+            snprintf(text, sizeof(text), "%07u\n", line);
+            expected.append(text);
+        }
+        STD_INSIST(received == expected);
+
+        delete owner;
+        const int status = reapChild();
+        STD_INSIST(WIFEXITED(status));
+        STD_INSIST(WEXITSTATUS(status) == 0);
+    }
+
     STD_TEST(ResizeReachesChildAsWinch) {
         RealPtyFixture fixture;
         ObjPool* const owner = ObjPool::fromMemoryRaw();
@@ -708,9 +756,9 @@ STD_TEST_SUITE(Pty) {
         PtyHandle* const handle = spawnShell(*fixture.pty, *owner, script);
         handle->engage();
 
-        // The feed keeps its acquired chain and parks; teardown releases
-        // the fiber first, then the destructor's handshake must return
-        // the loan to the drain's ledger itself.
+        // The feed keeps its acquired ring span and parks; teardown
+        // releases the fiber first, then the destructor's handshake must
+        // still detach cleanly with the loan never released.
         bool holding = false;
         auto feed = makeRunable([&] {
             PtyHandle::Chunk* const chunks = handle->acquire();

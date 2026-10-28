@@ -31,12 +31,16 @@
 #include <std/mem/small_obj_allocator.h>
 #include <std/str/view.h>
 #include <std/sys/atomic.h>
+#include <std/sys/crt.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#if defined(__APPLE__)
+    #include <pthread/qos.h>
+#endif
 #include <sched.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -175,13 +179,15 @@ namespace {
     struct PtyHandleImpl;
     struct PtyImpl;
 
-    // The swapchain block: a header and its payload in one variable-size
-    // small-obj allocation, so a keystroke costs a keystroke and only a
-    // flooding read fills the largest class. A read lands straight in the
-    // payload and the parser consumes it in place; a spent block rides a
-    // list back to the side whose allocator made it, because the
-    // allocator's release is not thread safe - the header carries the
-    // allocation size and the owner for exactly that type-erased return.
+    // The write-direction block: a header and its payload in one
+    // variable-size small-obj allocation, so a keystroke costs a
+    // keystroke. The main side fills it, the drain writes it to the pty,
+    // and the spent block rides a list back to the main side whose
+    // allocator made it - the allocator's release is not thread safe, and
+    // the header carries the allocation size for exactly that type-erased
+    // return. Engaged reads do not use blocks: they flow through the
+    // per-handle ring (see PtyHandleImpl). Only the stream-era fallback
+    // read allocates one block per call, on its own thread.
     enum class BlockKind : u8 {
         Data,
         Spent,
@@ -220,10 +226,11 @@ namespace {
         block->owner->deallocate(block, block->allocated);
     }
 
-    // The two directions of the swapchain are two lock-free lists shared
-    // by every session: a producer prepends one block, the consumer takes
-    // the whole list at once and routes blocks by their handle. A grab
-    // comes out newest-first; one pointer reversal restores push order.
+    // The two lock-free lists shared by every session carry write blocks
+    // only - child input toward the drain, spent returns toward the main
+    // side: a producer prepends one block, the consumer takes the whole
+    // list at once and routes blocks by their handle. A grab comes out
+    // newest-first; one pointer reversal restores push order.
     static void stackPush(Block** head, Block* block) {
         Block* expected = stdAtomicFetch(head, MemoryOrder::Relaxed);
         do {
@@ -249,15 +256,26 @@ namespace {
         return out;
     }
 
-    // The drain runs at most this many read blocks ahead of the parser
-    // per session; the bound caps memory and the reply latency under a
-    // flooding child.
-    constexpr size_t readBudget = 448;
     // Queued child input; a paste parks its fiber past this.
     constexpr size_t writeBudget = 64;
-    // One poll round reads at most this many blocks from one session, so
-    // a flooding tab cannot starve its neighbours.
-    constexpr size_t readBurst = 64;
+    // The read ring per session: the drain reads straight into it, the
+    // feed parses out of it in place. The capacity is the whole read-side
+    // backpressure - a full ring stops the drain, the kernel queue fills,
+    // the child blocks in write. A power of two for mask arithmetic.
+    constexpr size_t ringBytes = 1u << 20;
+    constexpr u64 ringMask = ringBytes - 1;
+    // How much ring the feed must consume before nudging a drain that may
+    // have parked on a full ring, and how much the drain produces between
+    // doorbell rings while a slice is running.
+    constexpr size_t ringNudgeBytes = ringBytes / 2;
+    constexpr size_t doorbellBytes = 64 * 1024;
+    // One poll round drains one session for at most this long, so a
+    // flooding tab cannot starve its neighbours. A time slice instead of
+    // a block count: leaving for poll() parks the thread, and on macOS
+    // every park costs the WRITER a selwakeup on the next refill, so the
+    // slice must be long enough to make parks rare under a flood while
+    // staying well under anything a human can feel.
+    constexpr u64 drainSliceUs = 2000;
 
     // A registry node; the freelist recycles them under the registry
     // mutex because nodes cross threads and nothing may free them.
@@ -266,8 +284,21 @@ namespace {
         DrainEntry* next = nullptr;
     };
 
+    // One contiguous ring segment handed to the feed; acquire() builds at
+    // most two of these (the ring wraps once per lap) out of the handle's
+    // own preallocated pair, so a read delivery allocates nothing.
+    struct RingChunk final: public PtyHandle::Chunk {
+        void* data() override;
+        size_t length() override;
+        Chunk* next() override;
+
+        u8* bytes = nullptr;
+        size_t count = 0;
+        RingChunk* tail = nullptr;
+    };
+
     struct PtyHandleImpl final: public PtyHandle {
-        PtyHandleImpl(PtyImpl& pty, int fd, pid_t pid);
+        PtyHandleImpl(PtyImpl& pty, ObjPool& owner, int fd, pid_t pid);
         ~PtyHandleImpl() noexcept;
 
         void resize(const PtySize& size) override;
@@ -278,8 +309,6 @@ namespace {
         void release(Chunk* chunks) override;
         pid_t foregroundProcessGroup() override;
 
-        void returnRead(Block* block);
-
         PtyImpl& pty;
         plt::Scheduler& scheduler;
         int fd;
@@ -288,34 +317,41 @@ namespace {
         bool engaged_ = false;
         bool writeWarned_ = false;
 
-        // Each side keeps an inbox its dispatcher prepends to - a pure
-        // LIFO whatever number of grabs landed; the consumer detaches it
-        // wholesale and reverses once into chronological order. loaned_
-        // remembers the chain acquire handed out, so an owner dying
-        // between acquire and release can still balance the ledger.
-
         // Main side.
-        Block* inbox_ = nullptr;
         Block* loaned_ = nullptr;
         size_t outstandingWrite_ = 0;
-        size_t returnedSinceWake_ = 0;
+        size_t consumedSinceWake_ = 0;
+        u64 ringLoaned_ = 0;
+        bool ringLoanActive_ = false;
+        RingChunk ringChunks_[2];
         plt::Fiber* feedFiber_ = nullptr;
         plt::Fiber* writerFiber_ = nullptr;
         PtyHandleImpl* mainNext_ = nullptr;
 
         // Drain side.
-        size_t outstandingRead_ = 0;
         Block* writeInbox_ = nullptr;
         Block* writeServing_ = nullptr;
         bool readStopped_ = false;
         bool writeBroken_ = false;
 
+        // The read ring. The drain reads from the kernel straight into the
+        // ring and advances written_; the feed parses in place and
+        // advances consumed_. The cursors are monotonic u64 byte counts -
+        // they never wrap, positions are cursor & ringMask - and each is
+        // stored by exactly one side, so the exchange has no
+        // read-modify-write anywhere. Each cursor sits on its own cache
+        // line: they are the only fields both hot threads touch per lap,
+        // and sharing a line would make every advance evict the peer.
+        u8* ring_ = nullptr;
+        alignas(64) u64 ringWritten_ = 0;
+        alignas(64) u64 ringConsumed_ = 0;
+
         // Death is a two-phase handshake: the owner raises dead, the
-        // drain stops producing and answers quiet, the owner returns
-        // every block it holds, and the drain answers detached once the
-        // read ledger balances - from that store on it never touches the
-        // handle again.
-        u32 feedEof_ = 0;
+        // drain stops producing, fails the write queue over and answers
+        // quiet; the owner then collects the spent write blocks, and the
+        // drain answers detached - from that store on it never touches
+        // the handle again.
+        alignas(64) u32 feedEof_ = 0;
         u32 dead_ = 0;
         u32 quiet_ = 0;
         u32 detached_ = 0;
@@ -364,6 +400,18 @@ size_t Block::length() {
 
 PtyHandle::Chunk* Block::next() {
     return link;
+}
+
+void* RingChunk::data() {
+    return bytes;
+}
+
+size_t RingChunk::length() {
+    return count;
+}
+
+PtyHandle::Chunk* RingChunk::next() {
+    return tail;
 }
 
 PtyHandle::Chunk* PtyHandleImpl::allocate(size_t len) {
@@ -427,12 +475,13 @@ void PtyHandleImpl::send(Chunk* chunk, size_t len) {
     releaseBlock(block);
 }
 
-PtyHandleImpl::PtyHandleImpl(PtyImpl& pty_, int fd_, pid_t pid_)
+PtyHandleImpl::PtyHandleImpl(PtyImpl& pty_, ObjPool& owner, int fd_, pid_t pid_)
     : pty(pty_)
     , scheduler(pty_.scheduler)
     , fd(fd_)
     , pid(pid_)
 {
+    ring_ = (u8*)(owner.allocate(ringBytes));
 }
 
 PtyHandleImpl::~PtyHandleImpl() noexcept {
@@ -448,26 +497,15 @@ PtyHandleImpl::~PtyHandleImpl() noexcept {
     if (engaged_) {
         // The detach handshake. The feed and writer fibers are already
         // gone - they live after the handle in the arena, and teardown is
-        // LIFO - so the main side owns every block it ever held. Ask the
-        // drain to stop producing first: only after quiet is the toMain
-        // ring final and every read block accountable from here.
+        // LIFO. Ask the drain to stop first: after quiet it has failed the
+        // write queue over and will never touch the ring again, so the
+        // spent write blocks in toMain are final and collectable here.
         pty.unregisterMain(*this);
         stdAtomicStore(&dead_, 1u, MemoryOrder::Release);
         pty.selfWake();
         while (stdAtomicFetch(&quiet_, MemoryOrder::Acquire) == 0) {
             sched_yield();
         }
-        pty.dispatchToMain();
-        Block* chains[2] = {loaned_, inbox_};
-        loaned_ = inbox_ = nullptr;
-        for (Block* chain : chains) {
-            while (chain != nullptr) {
-                Block* const block = chain;
-                chain = block->link;
-                returnRead(block);
-            }
-        }
-        pty.selfWake();
         while (stdAtomicFetch(&detached_, MemoryOrder::Acquire) == 0) {
             sched_yield();
         }
@@ -521,18 +559,35 @@ PtyHandle::Chunk* PtyHandleImpl::acquire() {
             return nullptr;
         }
     }
+    STD_INSIST(!ringLoanActive_);
     for (;;) {
-        pty.dispatchToMain();
-        if (inbox_ != nullptr) {
-            loaned_ = reverseChain(inbox_);
-            inbox_ = nullptr;
-            return loaned_;
+        const u64 written = stdAtomicFetch(&ringWritten_, MemoryOrder::Acquire);
+        const u64 consumed = ringConsumed_;
+        if (written != consumed) {
+            // The span [consumed, written) as one or two contiguous
+            // segments; the second one exists when the span wraps the
+            // ring's end.
+            const size_t position = (size_t)(consumed & ringMask);
+            const size_t span = (size_t)(written - consumed);
+            const size_t first = span < ringBytes - position ? span : ringBytes - position;
+            ringChunks_[0].bytes = ring_ + position;
+            ringChunks_[0].count = first;
+            ringChunks_[0].tail = nullptr;
+            if (first < span) {
+                ringChunks_[0].tail = &ringChunks_[1];
+                ringChunks_[1].bytes = ring_;
+                ringChunks_[1].count = span - first;
+                ringChunks_[1].tail = nullptr;
+            }
+            ringLoaned_ = written;
+            ringLoanActive_ = true;
+            return &ringChunks_[0];
         }
         if (stdAtomicFetch(&feedEof_, MemoryOrder::Acquire) != 0) {
-            // The eof store follows the final data push; one more look
-            // collects any straggler the first dispatch raced with.
-            pty.dispatchToMain();
-            if (inbox_ == nullptr) {
+            // The eof store follows the final written advance; one more
+            // cursor look collects any straggler the first load raced
+            // with, and the loop above serves it before this returns.
+            if (stdAtomicFetch(&ringWritten_, MemoryOrder::Acquire) == consumed) {
                 return nullptr;
             }
             continue;
@@ -544,10 +599,10 @@ PtyHandle::Chunk* PtyHandleImpl::acquire() {
 }
 
 void PtyHandleImpl::release(Chunk* chunks) {
-    STD_INSIST(chunks == loaned_);
-    loaned_ = nullptr;
-    Block* block = static_cast<Block*>(chunks);
     if (!engaged_) {
+        STD_INSIST(chunks == loaned_);
+        loaned_ = nullptr;
+        Block* block = static_cast<Block*>(chunks);
         while (block != nullptr) {
             Block* const following = block->link;
             releaseBlock(block);
@@ -555,24 +610,17 @@ void PtyHandleImpl::release(Chunk* chunks) {
         }
         return;
     }
-    while (block != nullptr) {
-        Block* const following = block->link;
-        returnRead(block);
-        block = following;
-    }
-    // Returns are freight the drain collects whenever it wakes for its
-    // own reasons; the half-budget nudge only covers a drain that went
-    // to sleep with this fd parked on the read budget.
-    if (returnedSinceWake_ >= readBudget / 2) {
-        returnedSinceWake_ = 0;
+    STD_INSIST(ringLoanActive_ && chunks == &ringChunks_[0]);
+    ringLoanActive_ = false;
+    consumedSinceWake_ += (size_t)(ringLoaned_ - ringConsumed_);
+    stdAtomicStore(&ringConsumed_, ringLoaned_, MemoryOrder::Release);
+    // Freed ring is freight the drain notices whenever it wakes for its
+    // own reasons; the half-ring nudge only covers a drain that went to
+    // sleep with this fd parked on a full ring.
+    if (consumedSinceWake_ >= ringNudgeBytes) {
+        consumedSinceWake_ = 0;
         pty.selfWake();
     }
-}
-
-void PtyHandleImpl::returnRead(Block* block) {
-    block->kind = BlockKind::Spent;
-    stackPush(&pty.toDrain_, block);
-    ++returnedSinceWake_;
 }
 
 void PtyHandleImpl::resize(const PtySize& size) {
@@ -647,22 +695,17 @@ void PtyImpl::selfWake() {
 }
 
 void PtyImpl::dispatchToMain() {
-    // The reversed grab walks oldest-first, so prepending keeps every
-    // inbox newest-first - a pure LIFO whatever number of grabs land
-    // between the consumer's serving refills.
-    Block* block = reverseChain(stackGrab(&toMain_));
+    // Everything coming back is a spent write block: read data travels
+    // through the per-handle ring, never through this stack.
+    Block* block = stackGrab(&toMain_);
     while (block != nullptr) {
         Block* const following = block->link;
         PtyHandleImpl& handle = *block->handle;
-        if (block->kind == BlockKind::Spent) {
-            releaseBlock(block);
-            --handle.outstandingWrite_;
-            if (handle.writerFiber_ != nullptr && handle.outstandingWrite_ < writeBudget) {
-                handle.writerFiber_->wake();
-            }
-        } else {
-            block->link = handle.inbox_;
-            handle.inbox_ = block;
+        STD_INSIST(block->kind == BlockKind::Spent);
+        releaseBlock(block);
+        --handle.outstandingWrite_;
+        if (handle.writerFiber_ != nullptr && handle.outstandingWrite_ < writeBudget) {
+            handle.writerFiber_->wake();
         }
         block = following;
     }
@@ -683,21 +726,18 @@ namespace {
 
     // Everything below runs on the drain thread.
 
-    // Grabs toDrain wholesale and routes it: spent read blocks die in
-    // their allocator, write data lands in the handles' inboxes - the
-    // mirror of dispatchToMain.
+    // Grabs toDrain wholesale: every block is child input, prepended to
+    // its handle's write inbox. The reversed grab walks oldest-first, so
+    // prepending keeps the inbox newest-first; drainWrite reverses once
+    // into write order when it refills its serving chain.
     static void drainDispatch(PtyImpl& pty) {
         Block* block = reverseChain(stackGrab(&pty.toDrain_));
         while (block != nullptr) {
             Block* const following = block->link;
             PtyHandleImpl& handle = *block->handle;
-            if (block->kind == BlockKind::Spent) {
-                releaseBlock(block);
-                --handle.outstandingRead_;
-            } else {
-                block->link = handle.writeInbox_;
-                handle.writeInbox_ = block;
-            }
+            STD_INSIST(block->kind == BlockKind::Data);
+            block->link = handle.writeInbox_;
+            handle.writeInbox_ = block;
             block = following;
         }
     }
@@ -761,43 +801,104 @@ namespace {
         }
     }
 
-    static void drainRead(PtyImpl& pty, PtyHandleImpl& handle, SmallObjAllocator& allocator) {
-        bool pushed = false;
-        for (size_t burst = 0; burst < readBurst && handle.outstandingRead_ < readBudget; ++burst) {
-            Block* const block = makeBlock(allocator, handle, blockPayloadLimit);
-            const ssize_t count = ::read(handle.fd, blockPayload(block), blockPayloadLimit);
+    // On macOS the kernel hands the master at most about 1 KiB per read,
+    // however large the buffer: a full kernel queue therefore reads back
+    // as exactly that chunk. Gathering at least one such chunk in a round
+    // marks the stream as saturated - a writer that filled the queue, not
+    // a keystroke - and only a saturated stream is worth bridging.
+    constexpr size_t saturatedBytes = 1024;
+    // After EAGAIN on a saturated stream the writer refills the drained
+    // queue within a few microseconds, while parking in poll costs the
+    // WRITER a selwakeup on every refill - measured at +13% of the
+    // child's own sys time, on top of this thread's poll syscalls. Keep
+    // re-reading through this much continuous silence before going back
+    // to poll; data resets the clock. A keystroke never enters the spin,
+    // so an interactive terminal pays nothing.
+    constexpr u64 bridgeSilenceUs = 150;
+
+    // Whether the handle's ring can take more; the drain's poll loop asks
+    // this to decide on POLLIN, and drainRead asks it per lap.
+    static size_t drainRingSpace(PtyHandleImpl& handle) {
+        const u64 consumed = stdAtomicFetch(&handle.ringConsumed_, MemoryOrder::Acquire);
+        return ringBytes - (size_t)(handle.ringWritten_ - consumed);
+    }
+
+    static void drainRead(PtyImpl& pty, PtyHandleImpl& handle) {
+        bool produced = false;
+        size_t gathered = 0;
+        size_t sinceSignal = 0;
+        u64 silenceDeadline = 0;
+        const u64 sliceDeadline = monotonicNowUs() + drainSliceUs;
+        u64 written = handle.ringWritten_;
+        for (;;) {
+            const size_t space = drainRingSpace(handle);
+            if (space == 0) {
+                // Full ring is the whole read-side backpressure: stop, let
+                // the kernel queue fill and the child block in write. The
+                // feed nudges the wake pipe once it frees half a ring.
+                break;
+            }
+            // One contiguous lap at most; the next lap continues at the
+            // ring's start.
+            const size_t position = (size_t)(written & ringMask);
+            const size_t room = space < ringBytes - position ? space : ringBytes - position;
+            const ssize_t count = ::read(handle.fd, handle.ring_ + position, room);
             if (count > 0) {
-                block->used = (u32)(count);
-                stackPush(&pty.toMain_, block);
-                ++handle.outstandingRead_;
-                pushed = true;
+                written += (u64)(count);
+                gathered += (size_t)(count);
+                silenceDeadline = 0;
+                stdAtomicStore(&handle.ringWritten_, written, MemoryOrder::Release);
+                // The feed parses in parallel with this slice: ring the
+                // doorbell on the first bytes so a parked fiber starts
+                // immediately, then once per doorbellBytes so it never
+                // starves mid-slice. The doorbell coalesces, so the cost
+                // is one signal per batch.
+                sinceSignal += (size_t)(count);
+                if (!produced || sinceSignal >= doorbellBytes) {
+                    sinceSignal = 0;
+                    pty.doorbell_->signal();
+                }
+                produced = true;
+                if (monotonicNowUs() >= sliceDeadline) {
+                    break;
+                }
                 continue;
             }
-            releaseBlock(block);
             if (count < 0 && errno == EINTR) {
                 continue;
             }
             if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (gathered >= saturatedBytes) {
+                    const u64 now = monotonicNowUs();
+                    if (silenceDeadline == 0) {
+                        silenceDeadline = now + bridgeSilenceUs;
+                    }
+                    if (now < silenceDeadline) {
+                        continue;
+                    }
+                }
                 break;
             }
-            // EOF or EIO: the feed drains what is buffered, then closes.
+            // EOF or EIO: the feed drains what the ring holds, then
+            // closes. The eof store follows the final written advance -
+            // that order is what lets acquire()'s straggler pass trust
+            // the cursor it re-reads.
             handle.readStopped_ = true;
             stdAtomicStore(&handle.feedEof_, 1u, MemoryOrder::Release);
-            pushed = true;
-            break;
+            pty.doorbell_->signal();
+            return;
         }
-        if (pushed) {
+        if (produced) {
             pty.doorbell_->signal();
         }
     }
 
-    // The two-phase goodbye. First sighting of dead: re-grab toDrain -
-    // every write push happened before the dead store - drop the queue,
-    // stop producing for good and answer quiet; the owner then returns
-    // every read block it holds. Once the ledger balances, unregister
-    // and answer detached; from that store on the handle is never
-    // touched. Returns true while the entry must stay registered.
-    static bool drainFarewell(PtyImpl& pty, PtyHandleImpl& handle) {
+    // The goodbye. On sighting dead: re-grab toDrain - every write push
+    // happened before the dead store - fail the queue over to the main
+    // side, stop producing for good and answer quiet, then unregister and
+    // answer detached; from that store on the handle - the ring included
+    // - is never touched.
+    static void drainFarewell(PtyImpl& pty, PtyHandleImpl& handle) {
         // Guarded by quiet itself: the read may have stopped long ago at
         // EOF, and the goodbye still owes the owner its answer.
         if (stdAtomicFetch(&handle.quiet_, MemoryOrder::Relaxed) == 0) {
@@ -805,9 +906,6 @@ namespace {
             drainDispatch(pty);
             drainDropWrites(pty, handle);
             stdAtomicStore(&handle.quiet_, 1u, MemoryOrder::Release);
-        }
-        if (handle.outstandingRead_ != 0) {
-            return true;
         }
         pthread_mutex_lock(&pty.registryMutex_);
         DrainEntry** link = &pty.registry_;
@@ -821,17 +919,19 @@ namespace {
         pty.freeEntries_ = entry;
         pthread_mutex_unlock(&pty.registryMutex_);
         stdAtomicStore(&handle.detached_, 1u, MemoryOrder::Release);
-        return false;
     }
 }
 
-// Runs forever on its own thread with its own arena: the blocks it makes
-// come back to it by list before they are released. There is no teardown,
-// the thread dies with the process.
+// Runs forever on its own thread; it allocates nothing and owns nothing,
+// so there is no teardown - the thread dies with the process.
 void* PtyImpl::drainThread(void* opaque) {
     auto* const pty = (PtyImpl*)(opaque);
-    ObjPool* const pool = ObjPool::fromMemoryRaw();
-    SmallObjAllocator* const allocator = SmallObjAllocator::create(pool);
+#if defined(__APPLE__)
+    // Terminal output is user-facing: without an explicit class the
+    // scheduler ranks this thread below the UI and stretches the very
+    // refill gaps the read bridge exists to hide.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     Vector<PtyHandleImpl*> live;
     Vector<pollfd> polls;
     for (;;) {
@@ -854,7 +954,7 @@ void* PtyImpl::drainThread(void* opaque) {
                 continue;
             }
             short events = 0;
-            if (!handle.readStopped_ && handle.outstandingRead_ < readBudget) {
+            if (!handle.readStopped_ && drainRingSpace(handle) != 0) {
                 events |= POLLIN;
             }
             if (handle.writeInbox_ != nullptr || handle.writeServing_ != nullptr) {
@@ -883,7 +983,7 @@ void* PtyImpl::drainThread(void* opaque) {
                 drainWrite(*pty, handle);
             }
             if (revents & (POLLIN | POLLHUP)) {
-                drainRead(*pty, handle, *allocator);
+                drainRead(*pty, handle);
             }
         }
     }
@@ -940,7 +1040,7 @@ PtyHandle* PtyImpl::spawn(ObjPool& owner, const LaunchCommand& command) {
     }
     sigprocmask(SIG_SETMASK, &previousMask, nullptr);
     close(slave);
-    return owner.make<PtyHandleImpl>(*this, master, pid);
+    return owner.make<PtyHandleImpl>(*this, owner, master, pid);
 }
 
 Pty* createPty(ObjPool& owner, plt::Scheduler& scheduler, plt::Platform* platform) {
