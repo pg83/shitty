@@ -40,7 +40,7 @@ namespace {
     static void configure(Composer& composer, FakeFontpack& fonts, u16 columns, u16 rows, u16 glyphWidth, u16 glyphHeight) {
         composer.fonts = &fonts;
         composer.geometry.setCellPixelSize(glyphWidth, glyphHeight);
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, (size_t)(columns)*rows));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         composer.resizeWindow((u16)(columns * glyphWidth + 2 * composer.layout.borderPixels), (u16)(rows * glyphHeight + 2 * composer.layout.borderPixels));
         composer.shaper = SpanShaper::create(composer, *composer.pool);
     }
@@ -138,7 +138,7 @@ ScreenFixture::ScreenFixture(u16 columns, u16 rows) {
     composer->fontResolvers.pushBack(createEmbeddedFontResolver(*composer));
     composer->fonts = Fontpack::create(*composer, *pool, nullptr, 0, nullptr, 0, 16);
     composer->geometry.setCellPixelSize(composer->fonts->getPx(), composer->fonts->getPy());
-    composer->extras.replace(CellExtraStore::create(composer->extras, *composer->pool, (size_t)(columns)*rows));
+    composer->extras.replace(CellExtraStore::create(composer->extras, *composer->pool));
     composer->resizeWindow((u16)(columns * composer->geometry.cellPixelWidth + 2 * composer->layout.borderPixels), (u16)(rows * composer->geometry.cellPixelHeight + 2 * composer->layout.borderPixels));
     composer->shaper = SpanShaper::create(*composer, *pool);
     screen = Screen::createPrimary(composer->extras, *pool, columns, rows, &colors, 8);

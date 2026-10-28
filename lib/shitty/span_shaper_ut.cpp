@@ -212,7 +212,7 @@ STD_TEST_SUITE(SpanShaper) {
         // Replacing the store voids the raw-bytes cache level. Mutate the
         // row so it reshapes: the strip must come back through the
         // materialized level without growing the arena.
-        fx.composer->extras.replace(CellExtraStore::create(fx.composer->extras, *fx.composer->pool, 64));
+        fx.composer->extras.replace(CellExtraStore::create(fx.composer->extras, *fx.composer->pool));
         fx.writeText(*fx.screen, 0, 0, "abc");
         STD_INSIST(fx.rowSpans(0, spans) == 1);
         STD_INSIST(spans[0].offset == offset);

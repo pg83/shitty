@@ -92,19 +92,29 @@ namespace {
         u8* allocateSlow(size_t bytes);
     };
 
+    // The garbage a space may accumulate per byte of live content before
+    // it collects. A collection copies the live set once, so this is the
+    // one tradeoff a copying collector has: 1 would bound memory at
+    // twice the live set and spend one byte of copying per byte written;
+    // 4 holds five times the live set and spends a quarter of that -
+    // measured as the point where a clustered-text flood stops paying
+    // for its collections.
+    constexpr size_t garbagePerLive = 4;
+
     // One kind of extra content with its own byte budget. Content lives
     // in the current arena; a collection fills a fresh arena with the
     // live part and releases the old one back to the list. The budget
-    // rests on the live set after each turn - base for an empty store,
-    // live plus margin otherwise - and shouldCollect() trips when the
-    // arena passes it; twice the budget is the hard limit a feed may not
-    // ride past a safe point.
+    // is the garbage a collection's cost amortizes - garbagePerLive
+    // times the live set after the last turn - and never less than a
+    // floor, below which no collection is worth its fixed cost. Twice
+    // the budget is the hard limit a feed may not ride past a safe
+    // point.
     struct ExtraSpace {
         explicit ExtraSpace(BufferList& buffers);
 
-        // base and margin follow the cell count; cap keeps the budget
-        // inside an external limit (the ref space for records).
-        void configure(size_t base, size_t margin, size_t cap);
+        // cap keeps the budget inside an external limit (the ref space
+        // for records).
+        void configure(size_t floor, size_t cap);
         u8* allocate(size_t bytes);
         // During a collection: the destination arena, fresh at begin().
         void begin();
@@ -116,14 +126,13 @@ namespace {
 
         Arena current_;
         Arena next_;
-        size_t base_ = 4096;
-        size_t margin_ = 4096;
+        size_t floor_ = 4096;
         size_t cap_ = ~(size_t)(0);
         size_t budget_ = 4096;
     };
 
     struct CellExtraStoreImpl final: public CellExtraStore {
-        CellExtraStoreImpl(VtCellExtras& extras, ObjPool& pool, size_t cellCount);
+        CellExtraStoreImpl(VtCellExtras& extras, ObjPool& pool);
 
         CellExtraView view(const TerminalCell& cell) const noexcept override;
         CellColor underlineColor(const TerminalCell& cell) const noexcept override;
@@ -145,7 +154,6 @@ namespace {
         void clearHyperlink(TerminalCell& cell) override;
         void clearExtra(TerminalCell& cell, CellColor underlineColor) override;
 
-        void setCellCount(size_t cellCount) noexcept override;
         size_t slotBudget() const noexcept override;
         bool shouldCollect() const noexcept override;
         bool hardLimitExceeded() const noexcept override;
@@ -156,7 +164,6 @@ namespace {
         // OSC 8 identity lookup only. This is not a CellExtra content index:
         // append() always creates a new dense ref.
         Vector<u32> hyperlinkBuckets_;
-        size_t cellCount_ = 0;
         size_t hyperlinkCount_ = 0;
         BufferList buffers_;
         // Records and grapheme codepoints churn together, one record per
@@ -296,11 +303,10 @@ ExtraSpace::ExtraSpace(BufferList& buffers)
 {
 }
 
-void ExtraSpace::configure(size_t base, size_t margin, size_t cap) {
-    base_ = base;
-    margin_ = margin;
+void ExtraSpace::configure(size_t floor, size_t cap) {
+    floor_ = floor;
     cap_ = cap;
-    budget_ = min(max(base_, current_.used() + margin_), cap_);
+    budget_ = min(max(floor_, current_.used() * (1 + garbagePerLive)), cap_);
 }
 
 u8* ExtraSpace::allocate(size_t bytes) {
@@ -318,7 +324,7 @@ u8* ExtraSpace::allocateNext(size_t bytes) {
 void ExtraSpace::turn() {
     current_.release();
     current_.xchg(next_);
-    budget_ = min(max(base_, current_.used() + margin_), cap_);
+    budget_ = min(max(floor_, current_.used() * (1 + garbagePerLive)), cap_);
 }
 
 bool ExtraSpace::overBudget() const noexcept {
@@ -333,7 +339,7 @@ size_t ExtraSpace::budget() const noexcept {
     return budget_;
 }
 
-CellExtraStoreImpl::CellExtraStoreImpl(VtCellExtras& extras, ObjPool& pool, size_t cellCount)
+CellExtraStoreImpl::CellExtraStoreImpl(VtCellExtras& extras, ObjPool& pool)
     : extras_(extras)
     , buffers_(pool)
     , text_(buffers_)
@@ -342,7 +348,15 @@ CellExtraStoreImpl::CellExtraStoreImpl(VtCellExtras& extras, ObjPool& pool, size
 {
     slots_.pushBack(nullptr);
     rehashHyperlinks(16);
-    setCellCount(cellCount);
+    // The floors are what an empty store may accumulate before its first
+    // collection: a modest page of clustered text, a few links, one
+    // screenful of sixel patches. Nothing here scales with the grid or
+    // the scrollback - a collection walks only rows that may hold
+    // extras and copies only live content, so its cost, and with it the
+    // garbage worth amortizing it over, follows the live set alone.
+    text_.configure(1024 * 1024, textBudgetCap);
+    links_.configure(256 * 1024, ~(size_t)(0));
+    images_.configure(4 * 1024 * 1024, ~(size_t)(0));
 }
 
 size_t CellExtraStoreImpl::hyperlinkCount() const noexcept {
@@ -647,18 +661,6 @@ void CellExtraStoreImpl::clearExtra(TerminalCell& cell, CellColor underlineColor
     cell.setInlineUnderlineColor(underlineColor_);
 }
 
-void CellExtraStoreImpl::setCellCount(size_t cellCount) noexcept {
-    cellCount_ = max<size_t>(cellCount, 1);
-    // Text: a record and a few codepoints per clustered cell; the margin
-    // lets a flood run a while between collections. Links: a page of
-    // them is a few handles and their URLs. Images: a full screen of
-    // sixel patches plus palettes, so one image never collects back to
-    // back with itself.
-    text_.configure(max<size_t>(4096, cellCount_ * 256), max<size_t>(1024 * 1024, cellCount_ * 64), textBudgetCap);
-    links_.configure(max<size_t>(4096, cellCount_ * 32), max<size_t>(256 * 1024, cellCount_ * 16), ~(size_t)(0));
-    images_.configure(max<size_t>(64 * 1024, cellCount_ * SixelPatch::pixelCount), max<size_t>(256 * 1024, cellCount_ * SixelPatch::pixelCount / 4), ~(size_t)(0));
-}
-
 size_t CellExtraStoreImpl::slotBudget() const noexcept {
     return min(text_.budget() / sizeof(CellExtra), slotBudgetCeiling);
 }
@@ -824,6 +826,6 @@ void VtCellExtras::notifyChanged() {
     }
 }
 
-CellExtraStore* CellExtraStore::create(VtCellExtras& extras, ObjPool& pool, size_t cellCount) {
-    return pool.make<CellExtraStoreImpl>(extras, pool, cellCount);
+CellExtraStore* CellExtraStore::create(VtCellExtras& extras, ObjPool& pool) {
+    return pool.make<CellExtraStoreImpl>(extras, pool);
 }

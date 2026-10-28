@@ -43,6 +43,12 @@ struct RowMetadata {
     u8 protection = 0;
     ScreenSemanticPrompt semanticPrompt = ScreenSemanticPrompt::None;
     bool wide = false;
+    // Whether the row may hold cells with extras: raised by every
+    // mutation - the same three places that issue a fresh identity -
+    // and lowered only by a collection that scanned the row and found
+    // none. Collection walks the raised rows alone, so history that was
+    // proven clean once costs nothing until it is written again.
+    bool extras = false;
 };
 
 // Every value handed out as a row identity comes from this sequence and
@@ -58,7 +64,7 @@ static u64 nextRowIdentity() {
 struct alignas(16) Row {
     RowMetadata metadata;
     // Keeps the identity union 8-aligned; the header stays one cell.
-    u32 reserved = 0;
+    u8 reserved[3] = {};
 
     union {
         // A live row: its identity for render-side caches, fresh from
@@ -1003,6 +1009,7 @@ Row* ScreenBase<Traits>::allocateRow() {
     }
     memset(result, 0, sizeof(Row) + (size_t)(nCols)*cellSize);
     result->id = nextRowIdentity();
+    result->metadata.extras = true;
     return result;
 }
 
@@ -1035,6 +1042,7 @@ TerminalCell* ScreenBase<Traits>::mutableRow(RowSlot& slot) {
         slot = allocateRow();
     }
     slot->id = nextRowIdentity();
+    slot->metadata.extras = true;
     return slot->cells;
 }
 
@@ -1094,15 +1102,17 @@ void ScreenBase<Traits>::dropScrollbackHistoryImpl() {
 template <typename Traits>
 void ScreenBase<Traits>::collectExtraCells(Vector<TerminalCell*>& cells) {
     bool changed = false;
-    const auto collectRow = [&](TerminalCell* first, int visibleRow) {
-        if (first == nullptr) {
+    const auto collectRow = [&](Row* object, int visibleRow) {
+        if (object == nullptr || !object->metadata.extras) {
             return;
         }
 
+        TerminalCell* const first = object->cells;
         STD_ASSERT((size_t)(first) % cellSize == 0);
         u8* const begin = reinterpret_cast<u8*>(first);
         u8* const end = begin + (size_t)(nCols)*cellSize;
         u8* cursor = begin;
+        bool found = false;
         while (cursor != end) {
             auto* hit = static_cast<u8*>(memchr(cursor, TerminalCell::extraRefSentinel, end - cursor));
             if (hit == nullptr) {
@@ -1112,6 +1122,7 @@ void ScreenBase<Traits>::collectExtraCells(Vector<TerminalCell*>& cells) {
             TerminalCell* const cell = reinterpret_cast<TerminalCell*>(begin + offset);
             if (cell->hasExtra()) {
                 cells.pushBack(cell);
+                found = true;
                 if (visibleRow >= 0 && visibleRow < nRows) {
                     damage.addRow((u16)(visibleRow));
                     changed = true;
@@ -1119,9 +1130,12 @@ void ScreenBase<Traits>::collectExtraCells(Vector<TerminalCell*>& cells) {
             }
             cursor = reinterpret_cast<u8*>(cell + 1);
         }
+        // Proven clean: the next collection skips this row unless it
+        // is written again in between.
+        object->metadata.extras = found;
     };
     for (int row = -(int)(historyRows); row < nRows; ++row) {
-        collectRow(rawLogicalRow(row), row + viewOffset);
+        collectRow(rawLogicalRowObject(row), row + viewOffset);
     }
     if (changed) {
         changeContent();
@@ -2186,6 +2200,7 @@ TerminalCell* ScreenBase<Traits>::prepareSpan(RowSlot& slot, u16 row, u16 start,
             invalidateSelection(Rect(start, row, end, row));
         }
         slot->id = nextRowIdentity();
+        slot->metadata.extras = true;
         return slot->cells + start;
     }
     return overwriteWideSpan(row, start, count, eraseAttrs);

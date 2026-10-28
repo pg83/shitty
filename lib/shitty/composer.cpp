@@ -62,7 +62,7 @@ Composer::Composer(ObjPool* pool_, Brand& brand_)
     Options* const defaults = pool->make<Options>();
     defaults->vt.brandName = brand->displayName();
     setOptions(defaults);
-    extras.store = CellExtraStore::create(extras, *pool, 0);
+    extras.store = CellExtraStore::create(extras, *pool);
     smallObjects = SmallObjAllocator::create(pool);
     glyphs = createGlyphCache(*pool);
     input = createInputRouter(*this);

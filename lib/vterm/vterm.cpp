@@ -606,7 +606,6 @@ namespace {
         void fillScreen(u16 ch);
         void collectCellExtrasIfNeeded(bool force = false);
         void collectCellExtras();
-        void updateExtraCellCount();
 
         void normalizeCursorPos();
         bool isCursorInsideMargins() const;
@@ -3299,14 +3298,6 @@ void VtermImpl::redraw() {
     outputPending = true;
 }
 
-void VtermImpl::updateExtraCellCount() {
-    size_t count = frame_pri->info().cellCapacity;
-    if (altScreenInitialized) {
-        count += frame_alt->info().cellCapacity;
-    }
-    extras_.store->setCellCount(count);
-}
-
 void VtermImpl::collectCellExtrasIfNeeded(bool force) {
     CellExtraStore& extras = *extras_.store;
     const bool hardLimit = extras.hardLimitExceeded();
@@ -3764,7 +3755,6 @@ void VtermImpl::switchScreenBufferMode(bool altScreenBufferMode_, bool clearAlte
                 inactiveSemanticClick = SemanticClick::None;
                 altScreenInitialized = false;
             }
-            updateExtraCellCount();
             refreshBlinkingText();
         }
         return;
@@ -3823,7 +3813,6 @@ void VtermImpl::switchScreenBufferMode(bool altScreenBufferMode_, bool clearAlte
         inactiveSemanticUntilEndOfLine = false;
         inactiveSemanticClick = SemanticClick::None;
     }
-    updateExtraCellCount();
     refreshBlinkingText();
     changePresentation();
 }
@@ -9057,7 +9046,6 @@ void VtermImpl::configChanged() {
     presentedTitle.xchg(nextPresentedTitle);
     titleSet = false;
     colors.changed();
-    updateExtraCellCount();
     resizeGrid();
     exposeFrames();
     changePresentation();
@@ -9158,7 +9146,6 @@ void VtermImpl::resizeGrid() {
     showCursor();
 
     outputRows.grow((size_t)(geometry.rows));
-    updateExtraCellCount();
     refreshBlinkingText();
     if (inBandResizeMode) {
         reportInBandResize();
@@ -10032,7 +10019,6 @@ Vterm* Vterm::create(ObjPool& owner, VtGeometry& geometry, const VtConfigSlot& c
         dump = createOutBuf(&owner, *createFDRegular(&owner, *fd));
     }
 
-    extras.store->setCellCount((size_t)(geometry.columns) * (geometry.rows + config.saveLines));
     // Resize and invalidation delivery belongs to whoever owns the
     // terminal's lifetime - the session set, or the headless host -
     // because composer's listener lists have no way out for a

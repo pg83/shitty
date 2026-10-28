@@ -198,7 +198,7 @@ namespace {
     static void verifyDamageGeometry(u16 columns, u16 rows, Setup setup, Operation operation, bool expectsDamage) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, (size_t)(columns)*rows * 2));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *pool, columns, rows, &colors, 8);
@@ -240,7 +240,7 @@ namespace {
         auto sourcePool = ObjPool::fromMemory();
         auto destinationPool = ObjPool::fromMemory();
         Composer& composer = *composerPool->make<Composer>(composerPool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, (size_t)(columns) * 10));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* source = primary ? Screen::createPrimary(composer.extras, *sourcePool, columns, 5, &colors, 8) : Screen::createAlternate(composer.extras, *sourcePool, columns, 5, &colors);
@@ -340,7 +340,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(EmptyRectangleChecksumsToZero) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 4));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 2, 2, &colors);
@@ -353,7 +353,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(InitializesGeometryCapacityAndDamage) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 32));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
 
@@ -374,7 +374,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(WritesSixelCellsWithSharedPalette) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 32));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
 
@@ -406,7 +406,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(RevisionTracksVisibleState) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 32));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
 
@@ -433,7 +433,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(KeepsRequestedScrollbackWithinPowerOfTwoRing) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 32));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
 
@@ -449,7 +449,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(KeepsZeroScrollbackDisabled) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
 
@@ -465,7 +465,7 @@ STD_TEST_SUITE(Screen) {
         auto sourcePool = ObjPool::fromMemory();
         auto destinationPool = ObjPool::fromMemory();
         Composer& composer = *composerPool->make<Composer>(composerPool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *sourcePool, 1, 4, &colors);
@@ -492,7 +492,7 @@ STD_TEST_SUITE(Screen) {
         auto sourcePool = ObjPool::fromMemory();
         auto destinationPool = ObjPool::fromMemory();
         Composer& composer = *composerPool->make<Composer>(composerPool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *sourcePool, 1, 4, &colors, 4);
@@ -516,7 +516,7 @@ STD_TEST_SUITE(Screen) {
         auto sourcePool = ObjPool::fromMemory();
         auto destinationPool = ObjPool::fromMemory();
         Composer& composer = *composerPool->make<Composer>(composerPool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *sourcePool, 2, 3, &colors, 4);
@@ -539,7 +539,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(WritesAsciiAndExposesOnlyDamagedCells) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 4, 2, &colors);
@@ -568,7 +568,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(DamagedRowReportsWholly) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 8, 2, &colors);
@@ -598,7 +598,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(WritesAsciiLinesAndRecyclesFullHistory) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 16));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *pool, 3, 2, &colors, 2);
@@ -621,7 +621,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(WritesAsciiLinesIntoClearedRowsWithEraseAttributes) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 16));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 4, 2, &colors);
@@ -644,7 +644,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(WritesAsciiLinesWithoutTouchingOtherRows) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 16));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 3, 4, &colors);
@@ -670,7 +670,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(StoresLineAttributesInRowMetadata) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 4));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 4, 1, &colors);
@@ -688,7 +688,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(BlankCaptureUsesSparseRows) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 30));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 10, 3, &colors);
@@ -713,7 +713,7 @@ STD_TEST_SUITE(Screen) {
         Composer& composer = *composerPool->make<Composer>(composerPool.mutPtr());
         auto sourcePool = ObjPool::fromMemory();
         auto destinationPool = ObjPool::fromMemory();
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 80 * 24));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *sourcePool, 80, 24, &colors, 50000);
@@ -733,7 +733,7 @@ STD_TEST_SUITE(Screen) {
         Composer& composer = *composerPool->make<Composer>(composerPool.mutPtr());
         auto sourcePool = ObjPool::fromMemory();
         auto destinationPool = ObjPool::fromMemory();
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 6));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *sourcePool, 3, 2, &colors, 4);
@@ -757,7 +757,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(TracksProtectedCellsInRowMetadata) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 4));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 4, 1, &colors);
@@ -776,7 +776,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(ScrollsPartialRectanglesAsOneOperation) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 15));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 5, 3, &colors);
@@ -805,7 +805,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(PartialRectangleScrollPreservesBlankCellAttributes) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 20));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 10, 4, &colors);
@@ -830,7 +830,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(PartialRectangleScrollDownPreservesBlankCellAttributes) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 20));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 10, 4, &colors);
@@ -855,7 +855,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(PartialRectangleScrollKeepsMatchingBlankRowsSparse) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 20));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 10, 4, &colors);
@@ -869,7 +869,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(PartialScrollUpClearsWideGlyphsAtBothBoundaries) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 14));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 7, 2, &colors);
@@ -895,7 +895,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(PartialScrollDownClearsWideGlyphsAtBothBoundaries) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 14));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 7, 2, &colors);
@@ -921,7 +921,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(PartialScrollCarriesProtectionWhileRepairingWideSourceEdges) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 14));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 7, 2, &colors);
@@ -951,7 +951,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(RotatesMultipleRowsInOnePass) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 5));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 1, 5, &colors);
@@ -975,7 +975,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(InsertsAsciiRunsWithOneRowShift) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 5));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 5, 1, &colors);
@@ -995,7 +995,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(OverwritingWideContinuationClearsItsLead) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 4));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 4, 1, &colors);
@@ -1018,7 +1018,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(InsertAndDeleteCellsPreserveWideGlyph) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 16));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 8, 1, &colors);
@@ -1046,7 +1046,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(InsertInsideWideGlyphRemovesBothHalves) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 4, 1, &colors);
@@ -1066,7 +1066,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(ScrollbackRetainsRowsAndChangesView) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *pool, 2, 3, &colors, 1);
@@ -1098,7 +1098,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(FullHistoryRingKeepsNewestRowsAndRestoresThem) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *pool, 2, 2, &colors, 2);
@@ -1134,7 +1134,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(TopAnchoredPartialScrollPreservesRowsBelowRegion) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *pool, 2, 4, &colors, 2);
@@ -1165,7 +1165,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(ReturnsExplicitAndDetectedHyperlinks) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 64));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 32, 2, &colors);
@@ -1191,7 +1191,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(CollectsSentinelEncodedExtraCells) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 16));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 4, 1, &colors);
@@ -1220,7 +1220,7 @@ STD_TEST_SUITE(Screen) {
         auto sourcePool = ObjPool::fromMemory();
         auto destinationPool = ObjPool::fromMemory();
         Composer& composer = *composerPool->make<Composer>(composerPool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 8));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *sourcePool, 4, 2, &colors);
@@ -1239,7 +1239,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(FindsBlinkingTextInVisibleCells) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 4));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *pool, 2, 2, &colors);
@@ -1369,7 +1369,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(ChangeRectangleAttributesAppliesFullSgrState) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 12));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *pool, 4, 3, &colors, 0);
@@ -1409,7 +1409,7 @@ STD_TEST_SUITE(Screen) {
     STD_TEST(ChangeRectangleAttributesCanResetEveryVisualAttribute) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 1));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createPrimary(composer.extras, *pool, 1, 1, &colors, 0);
@@ -1612,7 +1612,7 @@ STD_TEST_SUITE(Screen) {
         auto composerPool = ObjPool::fromMemory();
         ObjPool::Ref screenPool = ObjPool::fromMemory();
         Composer& composer = *composerPool->make<Composer>(composerPool.mutPtr());
-        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool, 4096));
+        composer.extras.replace(CellExtraStore::create(composer.extras, *composer.pool));
         TerminalColors colors;
         configureColors(colors);
         Screen* screen = Screen::createAlternate(composer.extras, *screenPool, 8, 5, &colors);

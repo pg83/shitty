@@ -336,7 +336,7 @@ VtermHeadless* VtermHeadless::create(ObjPool& pool, const VtConfig& config, Vter
     host->geometry = &result->geometry_;
     result->geometry_.setCellPixelSize(cellPixelWidth, cellPixelHeight);
     result->geometry_.resizeCells(columns, rows, host);
-    result->extras_.store = CellExtraStore::create(result->extras_, pool, 0);
+    result->extras_.store = CellExtraStore::create(result->extras_, pool);
     SmallObjAllocator* const smallObjects = SmallObjAllocator::create(&pool);
     plt::Scheduler* const scheduler = platform->scheduler();
     Output* const sink = ptyCapture != nullptr ? ptyCapture : createNullOutput(&pool);

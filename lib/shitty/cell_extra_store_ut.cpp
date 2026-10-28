@@ -31,8 +31,8 @@ namespace {
         return left == right;
     }
 
-    static CellExtraStore* createStore(Composer& composer, size_t cellCount) {
-        CellExtraStore* const store = CellExtraStore::create(composer.extras, *composer.pool, cellCount);
+    static CellExtraStore* createStore(Composer& composer) {
+        CellExtraStore* const store = CellExtraStore::create(composer.extras, *composer.pool);
         composer.extras.replace(store);
         return store;
     }
@@ -53,7 +53,7 @@ STD_TEST_SUITE(CellExtraStore) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
         CellExtraStore* const original = composer.extras.store;
-        CellExtraStore* const store = CellExtraStore::create(composer.extras, *composer.pool, 1);
+        CellExtraStore* const store = CellExtraStore::create(composer.extras, *composer.pool);
 
         STD_INSIST(store != nullptr);
         STD_INSIST(composer.extras.store == original);
@@ -62,7 +62,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(KeepsInlineUnderlineColorWithoutExtra) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore& store = *createStore(composer, 1);
+        CellExtraStore& store = *createStore(composer);
         TerminalCell cell{};
         const CellColor color = CellColor::direct({17, 34, 51});
 
@@ -75,7 +75,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(CombinesAndClearsIndependentExtraValues) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore& store = *createStore(composer, 1);
+        CellExtraStore& store = *createStore(composer);
         TerminalCell cell{};
         const CellColor underline = CellColor::indexed(42);
         const u32 grapheme[] = {'a', 0x0301};
@@ -110,7 +110,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(ReusesHyperlinkIdentity) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore& store = *createStore(composer, 1);
+        CellExtraStore& store = *createStore(composer);
         const u32 first = store.getOrCreateHyperlink(StringView(u8"same"), StringView(u8"first"), 1);
         const u32 second = store.getOrCreateHyperlink(StringView(u8"same"), StringView(u8"second"), 2);
         TerminalCell cell{};
@@ -128,7 +128,7 @@ STD_TEST_SUITE(CellExtraStore) {
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
         ExtraChangeListener listener(composer);
         composer.extras.changedListeners.pushBack(&listener);
-        CellExtraStore* store = createStore(composer, 2);
+        CellExtraStore* store = createStore(composer);
         TerminalCell cell{};
         const u32 grapheme[] = {0x1f469, 0x200d, 0x1f4bb};
         const u32 hyperlink = store->getOrCreateHyperlink(StringView(u8"live"), StringView(u8"https://live.test"), 19);
@@ -154,7 +154,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(CollectionDropsUnreachableHyperlinks) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore* store = createStore(composer, 1);
+        CellExtraStore* store = createStore(composer);
         const u32 live = store->getOrCreateHyperlink(StringView(u8"live"), StringView(u8"https://live.test"), 1);
         store->getOrCreateHyperlink(StringView(u8"dead"), StringView(u8"https://dead.test"), 2);
         TerminalCell cell{};
@@ -173,7 +173,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(CollectionPreservesDistinctRefs) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore* store = createStore(composer, 2);
+        CellExtraStore* store = createStore(composer);
         TerminalCell first{};
         TerminalCell second{};
         const u32 grapheme[] = {'x', 0x0301};
@@ -193,7 +193,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(CollectionRewritesNonCellRoots) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore* store = createStore(composer, 1);
+        CellExtraStore* store = createStore(composer);
         store->getOrCreateHyperlink(StringView(u8"dead"), StringView(u8"https://dead.test"), 1);
         u32 root = store->getOrCreateHyperlink(StringView(u8"live"), StringView(u8"https://live.test"), 2);
         u32* roots[] = {&root};
@@ -213,7 +213,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(SixelPatchSharesPaletteAcrossCells) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore& store = *createStore(composer, 2);
+        CellExtraStore& store = *createStore(composer);
         u8 pixels[SixelPatch::pixelCount];
         u8 palette[SixelPatch::paletteBytes];
         for (size_t index = 0; index < sizeof(pixels); ++index) {
@@ -241,7 +241,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(SixelAndGraphemeDisplaceEachOther) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore& store = *createStore(composer, 1);
+        CellExtraStore& store = *createStore(composer);
         u8 pixels[SixelPatch::pixelCount] = {1};
         u8 palette[SixelPatch::paletteBytes] = {2};
         const u8* interned = store.internSixelPalette(palette);
@@ -261,7 +261,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(ClearHyperlinkKeepsSixel) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore& store = *createStore(composer, 1);
+        CellExtraStore& store = *createStore(composer);
         u8 pixels[SixelPatch::pixelCount] = {3};
         u8 palette[SixelPatch::paletteBytes] = {4};
         const u8* interned = store.internSixelPalette(palette);
@@ -282,7 +282,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(CollectionRelocatesOnePaletteCopyPerImage) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore* store = createStore(composer, 2);
+        CellExtraStore* store = createStore(composer);
         u8 pixels[SixelPatch::pixelCount];
         u8 palette[SixelPatch::paletteBytes];
         for (size_t index = 0; index < sizeof(pixels); ++index) {
@@ -314,16 +314,17 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(SlotBudgetStaysInsideRefSpace) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        // 200 columns x 64k saveLines: the linear x10 budget would pass the
-        // 24-bit extraRef space and append() would throw before collection.
-        CellExtraStore& store = *createStore(composer, (size_t)(200) * 65'536);
+        // Whatever the live set grows to, the record budget stays inside
+        // the 24-bit extraRef space: append() must never throw before a
+        // collection had its chance.
+        CellExtraStore& store = *createStore(composer);
         STD_INSIST(store.slotBudget() * 2 <= (size_t)(TerminalCell::maxExtraRef) + 1);
     }
 
     STD_TEST(ReportsAllocationPressure) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore& store = *createStore(composer, 1);
+        CellExtraStore& store = *createStore(composer);
         TerminalCell cell{};
 
         // Rewriting one cell leaves a trail of dead records: the byte
@@ -361,7 +362,7 @@ STD_TEST_SUITE(CellExtraStore) {
     STD_TEST(TextCollectionLeavesImagesInPlace) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
-        CellExtraStore& store = *createStore(composer, 1);
+        CellExtraStore& store = *createStore(composer);
         u8 pixels[SixelPatch::pixelCount] = {9};
         u8 palette[SixelPatch::paletteBytes] = {8};
         const u8* interned = store.internSixelPalette(palette);

@@ -572,7 +572,7 @@ shitty_vt* shitty_vt_new(uint16_t columns, uint16_t rows, uint16_t save_lines, c
         vt->slot.config = &vt->config;
         vt->geometry.setCellPixelSize(1, 1);
         vt->geometry.resizeCells(columns, rows, nullptr);
-        vt->extras.store = CellExtraStore::create(vt->extras, *pool.ptr, 0);
+        vt->extras.store = CellExtraStore::create(vt->extras, *pool.ptr);
         vt->smallObjects = SmallObjAllocator::create(pool.ptr);
         vt->host = pool->make<EmbedHost>(*vt);
         vt->pty = pool->make<ReplyPty>(*vt->platform->scheduler());
