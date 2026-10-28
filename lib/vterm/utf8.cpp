@@ -127,6 +127,24 @@ size_t Utf8Decoder::decodeText(const u8* input, size_t length, Utf8Text& text) {
             append(byte);
             tracePending = 0;
         } else {
+            // Re-enter the bulk decoder whenever the stream is clean again:
+            // without this, one bad byte near the start of a block demotes
+            // every valid sequence after it to the byte-at-a-time machine,
+            // and a lightly corrupted stream parses almost entirely on the
+            // slow path.
+            if (remaining == 0 && tracePending == 0 && byte >= 0xc2 && byte <= 0xf4 && consumed + 1 < length && (input[consumed + 1] & 0xc0) == 0x80) {
+                size_t runConsumed = 0;
+                const size_t run = decodeRun(input + consumed, length - consumed, text.codepoints + text.count, Utf8Text::capacity - 1 - text.count, runConsumed);
+                if (run != 0) {
+                    text.resetBefore |= (u64)(reset) << text.count;
+                    reset = false;
+                    text.count += run;
+                    unicode = text.codepoints[text.count - 1];
+                    text.simple = false;
+                    consumed += runConsumed;
+                    continue;
+                }
+            }
             if (byte <= 0x9f && tracePending == 0) {
                 if (checkPrematureEOS()) {
                     append(unicode);
