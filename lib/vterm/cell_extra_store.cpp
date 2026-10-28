@@ -10,6 +10,7 @@
 #include <lib/vterm/listener.h>
 
 #include <std/lib/list.h>
+#include <std/str/hash.h>
 #include <std/str/view.h>
 #include <std/sym/i_map.h>
 #include <std/alg/xchg.h>
@@ -42,6 +43,24 @@ namespace {
     };
 
     static_assert(__is_trivially_copyable(CellExtra), "CellExtra must remain trivially copyable");
+
+    // Records are immutable - every change to a cell appends a new one -
+    // so cells holding the same cluster under the same underline color
+    // may share a record. This direct-mapped cache in front of
+    // setGrapheme finds that record by the hash of the cluster: text
+    // repeats its clusters endlessly, and a hit costs neither an append
+    // nor an intern, and leaves the live set one record smaller. A hit
+    // is verified against the record before it is trusted; a text
+    // collection remaps the refs through its relocation, so the cache
+    // stays warm across it.
+    struct GraphemeSlot {
+        u64 hash = 0;
+        u32 ref = 0;
+        u32 epoch = 0;
+    };
+
+    constexpr size_t graphemeSlots = 1024;
+    static_assert(sizeof(CellColor) == sizeof(u32), "the grapheme cache hashes the color's one word");
 
     // Every allocation is rounded to this, so records and handles stay
     // naturally aligned wherever they land in a chunk.
@@ -177,6 +196,8 @@ namespace {
         // append() always creates a new dense ref.
         Vector<u32> hyperlinkBuckets_;
         size_t hyperlinkCount_ = 0;
+        Vector<GraphemeSlot> graphemeCache_;
+        u32 graphemeEpoch_ = 1;
         BufferList buffers_;
         // Records and grapheme codepoints churn together, one record per
         // clustered cell written; hyperlinks and sixel patches live as
@@ -195,6 +216,10 @@ namespace {
 
         u32 append(const CellExtra& extra);
         u32 appendRecord(CellExtra* extra);
+        // The shared record for a cluster under an underline color, or
+        // 0; hash receives the slot key for a later shareGrapheme().
+        u32 findSharedGrapheme(StringView bytes, CellColor underline, u64& hash) const noexcept;
+        void shareGrapheme(u64 hash, u32 ref) noexcept;
         void indexHyperlink(u32 ref);
         void rehashHyperlinks(size_t capacity);
         StringView copyBytes(ExtraSpace& space, StringView value);
@@ -380,6 +405,7 @@ CellExtraStoreImpl::CellExtraStoreImpl(VtCellExtras& extras, ObjPool& pool)
 {
     slots_.pushBack(nullptr);
     rehashHyperlinks(16);
+    graphemeCache_.zero(graphemeSlots);
     // The floors are what an empty store may accumulate before its first
     // collection: a modest page of clustered text, a few links, one
     // screenful of sixel patches. Nothing here scales with the grid or
@@ -486,6 +512,27 @@ u32 CellExtraStoreImpl::appendRecord(CellExtra* extra) {
     const u32 ref = static_cast<u32>(slots_.length());
     slots_.pushBack(extra);
     return ref;
+}
+
+u32 CellExtraStoreImpl::findSharedGrapheme(StringView bytes, CellColor underline, u64& hash) const noexcept {
+    u32 color;
+    memcpy(&color, &underline, sizeof(color));
+    hash = shash64(bytes.data(), bytes.length());
+    hash ^= color;
+    hash *= 0x100000001b3ULL;
+    const GraphemeSlot& slot = graphemeCache_[hash & (graphemeSlots - 1)];
+    if (slot.epoch != graphemeEpoch_ || slot.hash != hash) {
+        return 0;
+    }
+    const CellExtra* const record = get(slot.ref);
+    if (record == nullptr || record->hyperlinks != nullptr || record->sixelPixels != nullptr || !(record->underlineColor == underline) || !equalBytes(record->graphemeBytes, bytes)) {
+        return 0;
+    }
+    return slot.ref;
+}
+
+void CellExtraStoreImpl::shareGrapheme(u64 hash, u32 ref) noexcept {
+    graphemeCache_.mut(hash & (graphemeSlots - 1)) = {hash, ref, graphemeEpoch_};
 }
 
 u32 CellExtraStoreImpl::append(const CellExtra& value) {
@@ -597,10 +644,25 @@ void CellExtraStoreImpl::setGrapheme(TerminalCell& cell, const u32* codepoints, 
     } else {
         copy.underlineColor = cell.inlineUnderlineColor();
     }
-    copy.graphemeBytes = copyBytes(text_, StringView(reinterpret_cast<const u8*>(codepoints), count * sizeof(u32)));
+    const StringView bytes(reinterpret_cast<const u8*>(codepoints), count * sizeof(u32));
+    // A cell that will hold nothing but the cluster and its underline
+    // color can share the record of every other such cell.
+    const bool shareable = copy.hyperlinks == nullptr;
+    u64 hash = 0;
+    if (shareable) {
+        if (const u32 shared = findSharedGrapheme(bytes, copy.underlineColor, hash); shared != 0) {
+            cell.setExtraRef(shared);
+            return;
+        }
+    }
+    copy.graphemeBytes = copyBytes(text_, bytes);
     copy.sixelPixels = nullptr;
     copy.sixelPalette = nullptr;
-    cell.setExtraRef(append(copy));
+    const u32 ref = append(copy);
+    if (shareable) {
+        shareGrapheme(hash, ref);
+    }
+    cell.setExtraRef(ref);
 }
 
 void CellExtraStoreImpl::clearGrapheme(TerminalCell& cell) {
@@ -824,6 +886,16 @@ void CellExtraStoreImpl::collect(Vector<TerminalCell*>& cells, u32* const* roots
         }
         for (size_t index = 0; index < rootCount; ++index) {
             *roots[index] = relocation[*roots[index]];
+        }
+        // Shared records that survived keep their slot under the new
+        // ref; the slots of dead ones go stale with the epoch.
+        ++graphemeEpoch_;
+        for (size_t index = 0; index < graphemeSlots; ++index) {
+            GraphemeSlot& slot = graphemeCache_.mut(index);
+            if (slot.epoch + 1 == graphemeEpoch_ && slot.ref < relocation.length() && relocation[slot.ref] != 0) {
+                slot.ref = relocation[slot.ref];
+                slot.epoch = graphemeEpoch_;
+            }
         }
         text_.turn();
     }

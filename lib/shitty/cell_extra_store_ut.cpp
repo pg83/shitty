@@ -170,24 +170,45 @@ STD_TEST_SUITE(CellExtraStore) {
         STD_INSIST(store->findHyperlink(StringView(u8"dead")) == 0);
     }
 
-    STD_TEST(CollectionPreservesDistinctRefs) {
+    STD_TEST(EqualGraphemesShareOneRecord) {
         auto pool = ObjPool::fromMemory();
         Composer& composer = *pool->make<Composer>(pool.mutPtr());
         CellExtraStore* store = createStore(composer);
         TerminalCell first{};
         TerminalCell second{};
+        TerminalCell third{};
         const u32 grapheme[] = {'x', 0x0301};
         store->setGrapheme(first, grapheme, 2);
         store->setGrapheme(second, grapheme, 2);
+        third.setInlineUnderlineColor(CellColor::indexed(3));
+        store->setGrapheme(third, grapheme, 2);
+
+        // The same cluster under the same underline color is one record;
+        // another underline color is another record.
+        STD_INSIST(first.extraRef() == second.extraRef());
+        STD_INSIST(third.extraRef() != first.extraRef());
+        STD_INSIST(store->underlineColor(third) == CellColor::indexed(3));
+
+        // Records are copy-on-write: changing one cell leaves the other
+        // on the shared record.
+        store->setUnderlineColor(second, CellColor::indexed(5));
+        STD_INSIST(second.extraRef() != first.extraRef());
+        STD_INSIST(store->grapheme(first).size() == 2);
+        STD_INSIST(store->underlineColor(first) == CellColor::defaultForeground());
+        STD_INSIST(store->underlineColor(second) == CellColor::indexed(5));
+
+        // Collection keeps the sharing, and the record found after it is
+        // the relocated one, not a stale ref from before.
         Vector<TerminalCell*> cells;
         cells.pushBack(&first);
         cells.pushBack(&second);
-
-        STD_INSIST(first.extraRef() != second.extraRef());
-
+        cells.pushBack(&third);
         store->collect(cells, nullptr, 0);
-
-        STD_INSIST(first.extraRef() != second.extraRef());
+        TerminalCell fourth{};
+        store->setGrapheme(fourth, grapheme, 2);
+        STD_INSIST(fourth.extraRef() == first.extraRef());
+        STD_INSIST(store->grapheme(fourth).size() == 2);
+        STD_INSIST(store->grapheme(fourth)[1] == 0x0301);
     }
 
     STD_TEST(CollectionRewritesNonCellRoots) {
