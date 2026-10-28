@@ -12,10 +12,13 @@
 #include <std/lib/list.h>
 #include <std/str/view.h>
 #include <std/sym/i_map.h>
+#include <std/alg/xchg.h>
 #include <std/alg/minmax.h>
 #include <std/dbg/assert.h>
+#include <std/lib/buffer.h>
 #include <std/mem/obj_pool.h>
 
+#include <new>
 #include <string.h>
 
 using namespace stl;
@@ -38,18 +41,89 @@ namespace {
         CellColor underlineColor = CellColor::defaultForeground();
     };
 
-    struct CellExtraStoreOwner {
-        ~CellExtraStoreOwner() noexcept;
-
-        ObjPool* pool = nullptr;
-    };
-
     static_assert(__is_trivially_copyable(CellExtra), "CellExtra must remain trivially copyable");
 
-    struct CellExtraStoreImpl final: public CellExtraStore {
-        CellExtraStoreImpl(VtCellExtras& extras, size_t cellCount, CellExtraStoreOwner& owner, ObjPool* pool);
+    // Every allocation is rounded to this, so records and handles stay
+    // naturally aligned wherever they land in a chunk.
+    constexpr size_t extraAlignment = 8;
 
-        static CellExtraStoreImpl* create(VtCellExtras& extras, size_t cellCount, CellExtraStoreOwner& owner);
+    // Every arena is built from buffers of this one size, so a buffer any
+    // arena hands back fits any arena that asks next. Nothing a cell can
+    // hold comes near it - a palette is 768 bytes, a cluster at most 256.
+    constexpr size_t bufferBytes = 128 * 1024;
+
+    // The store's free list of buffers, shared by its three spaces and
+    // every generation of each: an arena takes buffers here and returns
+    // them when it is released, so after warm-up a collection moves no
+    // memory to or from the system at all. Memory peaks once, at the
+    // largest live-plus-garbage moment, and stays at that.
+    struct BufferList {
+        explicit BufferList(ObjPool& pool);
+
+        Buffer* take();
+        void give(Buffer* buffer);
+
+        ObjPool& pool_;
+        Vector<Buffer*> free_;
+    };
+
+    // One generation of one space: a bump allocator over buffers taken
+    // from the list. A hit is a pointer bump; exhausting the window takes
+    // the next buffer. A request larger than a buffer gets one of its own
+    // size, freed rather than pooled on release - it would never fit a
+    // later arena's needs. The byte budget is advisory here: a feed that
+    // cannot reach a safe point keeps writing, and the arena keeps
+    // taking buffers.
+    struct Arena {
+        explicit Arena(BufferList& buffers);
+
+        u8* allocate(size_t bytes);
+        void release() noexcept;
+        void xchg(Arena& other) noexcept;
+        size_t used() const noexcept;
+
+        BufferList& buffers_;
+        Vector<Buffer*> taken_;
+        Vector<Buffer*> oversized_;
+        u8* cursor_ = nullptr;
+        u8* end_ = nullptr;
+        size_t used_ = 0;
+
+        u8* allocateSlow(size_t bytes);
+    };
+
+    // One kind of extra content with its own byte budget. Content lives
+    // in the current arena; a collection fills a fresh arena with the
+    // live part and releases the old one back to the list. The budget
+    // rests on the live set after each turn - base for an empty store,
+    // live plus margin otherwise - and shouldCollect() trips when the
+    // arena passes it; twice the budget is the hard limit a feed may not
+    // ride past a safe point.
+    struct ExtraSpace {
+        explicit ExtraSpace(BufferList& buffers);
+
+        // base and margin follow the cell count; cap keeps the budget
+        // inside an external limit (the ref space for records).
+        void configure(size_t base, size_t margin, size_t cap);
+        u8* allocate(size_t bytes);
+        // During a collection: the destination arena, fresh at begin().
+        void begin();
+        u8* allocateNext(size_t bytes);
+        void turn();
+        bool overBudget() const noexcept;
+        bool overHardLimit() const noexcept;
+        size_t budget() const noexcept;
+
+        Arena current_;
+        Arena next_;
+        size_t base_ = 4096;
+        size_t margin_ = 4096;
+        size_t cap_ = ~(size_t)(0);
+        size_t budget_ = 4096;
+    };
+
+    struct CellExtraStoreImpl final: public CellExtraStore {
+        CellExtraStoreImpl(VtCellExtras& extras, ObjPool& pool, size_t cellCount);
 
         CellExtraView view(const TerminalCell& cell) const noexcept override;
         CellColor underlineColor(const TerminalCell& cell) const noexcept override;
@@ -78,22 +152,22 @@ namespace {
         void collect(Vector<TerminalCell*>& cells, u32* const* roots, size_t rootCount) override;
 
         VtCellExtras& extras_;
-        CellExtraStoreOwner& owner_;
-        ObjPool* pool_;
         Vector<CellExtra*> slots_;
         // OSC 8 identity lookup only. This is not a CellExtra content index:
         // append() always creates a new dense ref.
         Vector<u32> hyperlinkBuckets_;
-        size_t allocatedExtraBytes_ = 256;
-        size_t allocationsSinceGc_ = 0;
         size_t cellCount_ = 0;
-        size_t byteBudget_ = 0;
-        size_t slotBudget_ = 0;
-        size_t allocationBudget_ = 0;
         size_t hyperlinkCount_ = 0;
+        BufferList buffers_;
+        // Records and grapheme codepoints churn together, one record per
+        // clustered cell written; hyperlinks and sixel patches live as
+        // long as their page or image stays on screen. Three spaces, so a
+        // text flood collects its own churn without copying an image.
+        ExtraSpace text_;
+        ExtraSpace links_;
+        ExtraSpace images_;
 
         const CellExtra* get(u32 ref) const noexcept;
-        u32 migrate(const CellExtraStoreImpl& source, u32 sourceRef, IntMap<const u8*>& palettes);
         void finishCollection() noexcept;
 
         static GraphemeView graphemeOf(const CellExtra& extra) noexcept;
@@ -101,47 +175,174 @@ namespace {
         static const HyperlinkHandle* hyperlinkOf(const CellExtra& extra) noexcept;
 
         u32 append(const CellExtra& extra);
+        u32 appendRecord(CellExtra* extra);
+        void indexHyperlink(u32 ref);
         void rehashHyperlinks(size_t capacity);
-        StringView copyBytes(StringView value);
+        StringView copyBytes(ExtraSpace& space, StringView value);
+        StringView copyBytesNext(ExtraSpace& space, StringView value);
+        IntrusiveList* makeHyperlinkList(ExtraSpace& space, bool next);
+        HyperlinkHandle* makeHyperlinkHandle(ExtraSpace& space, bool next, StringView identity, StringView payload, u32 displayId);
     };
 
     static bool equalBytes(StringView left, StringView right) noexcept {
         return left.length() == right.length() && (left.empty() || memcmp(left.data(), right.data(), left.length()) == 0);
     }
-}
 
-CellExtraStoreOwner::~CellExtraStoreOwner() noexcept {
-    delete pool;
+    static size_t alignUp(size_t bytes) noexcept {
+        return (bytes + extraAlignment - 1) & ~(extraAlignment - 1);
+    }
+
+    // The 24-bit extraRef space caps the record budget: every record costs
+    // at least sizeof(CellExtra) of text space, so a text space at its
+    // hard limit - twice the budget - still holds fewer records than
+    // the ref space.
+    static constexpr size_t slotBudgetCeiling = (TerminalCell::maxExtraRef + 1) / 2;
+    static constexpr size_t textBudgetCap = slotBudgetCeiling * sizeof(CellExtra) / 2;
 }
 
 HyperlinkHandle::HyperlinkHandle(StringView identity_, StringView payload_, u32 displayId_) noexcept
     : identity(identity_)
     , payload(payload_)
-    , displayId(displayId_) {
+    , displayId(displayId_)
+{
 }
 
-CellExtraStoreImpl::CellExtraStoreImpl(VtCellExtras& extras, size_t cellCount, CellExtraStoreOwner& owner, ObjPool* pool)
+BufferList::BufferList(ObjPool& pool)
+    : pool_(pool)
+{
+}
+
+Buffer* BufferList::take() {
+    if (free_.length() != 0) {
+        Buffer* const buffer = free_[free_.length() - 1];
+        free_.popBack();
+        return buffer;
+    }
+    Buffer* const buffer = pool_.make<Buffer>();
+    buffer->grow(bufferBytes);
+    return buffer;
+}
+
+void BufferList::give(Buffer* buffer) {
+    free_.pushBack(buffer);
+}
+
+Arena::Arena(BufferList& buffers)
+    : buffers_(buffers)
+{
+}
+
+u8* Arena::allocate(size_t bytes) {
+    bytes = alignUp(bytes);
+    if ((size_t)(end_ - cursor_) < bytes) {
+        return allocateSlow(bytes);
+    }
+    u8* const result = cursor_;
+    cursor_ += bytes;
+    used_ += bytes;
+    return result;
+}
+
+u8* Arena::allocateSlow(size_t bytes) {
+    used_ += bytes;
+    if (bytes > bufferBytes) {
+        Buffer* const buffer = buffers_.pool_.make<Buffer>();
+        buffer->grow(bytes);
+        oversized_.pushBack(buffer);
+        return (u8*)(buffer->mutData());
+    }
+    // A buffer's whole capacity is the window; its own cursor stays at
+    // zero and is never consulted.
+    Buffer* const buffer = buffers_.take();
+    taken_.pushBack(buffer);
+    cursor_ = (u8*)(buffer->mutData());
+    end_ = cursor_ + buffer->capacity();
+    u8* const result = cursor_;
+    cursor_ += bytes;
+    return result;
+}
+
+void Arena::release() noexcept {
+    for (Buffer* buffer : taken_) {
+        buffers_.give(buffer);
+    }
+    taken_.clear();
+    for (Buffer* buffer : oversized_) {
+        // Nothing was ever appended, so this shrinks to an empty buffer
+        // and frees the oversized storage.
+        buffer->shrinkToFit();
+    }
+    oversized_.clear();
+    cursor_ = nullptr;
+    end_ = nullptr;
+    used_ = 0;
+}
+
+void Arena::xchg(Arena& other) noexcept {
+    taken_.xchg(other.taken_);
+    oversized_.xchg(other.oversized_);
+    stl::xchg(cursor_, other.cursor_);
+    stl::xchg(end_, other.end_);
+    stl::xchg(used_, other.used_);
+}
+
+size_t Arena::used() const noexcept {
+    return used_;
+}
+
+ExtraSpace::ExtraSpace(BufferList& buffers)
+    : current_(buffers)
+    , next_(buffers)
+{
+}
+
+void ExtraSpace::configure(size_t base, size_t margin, size_t cap) {
+    base_ = base;
+    margin_ = margin;
+    cap_ = cap;
+    budget_ = min(max(base_, current_.used() + margin_), cap_);
+}
+
+u8* ExtraSpace::allocate(size_t bytes) {
+    return current_.allocate(bytes);
+}
+
+void ExtraSpace::begin() {
+    next_.release();
+}
+
+u8* ExtraSpace::allocateNext(size_t bytes) {
+    return next_.allocate(bytes);
+}
+
+void ExtraSpace::turn() {
+    current_.release();
+    current_.xchg(next_);
+    budget_ = min(max(base_, current_.used() + margin_), cap_);
+}
+
+bool ExtraSpace::overBudget() const noexcept {
+    return current_.used() > budget_;
+}
+
+bool ExtraSpace::overHardLimit() const noexcept {
+    return current_.used() > budget_ * 2;
+}
+
+size_t ExtraSpace::budget() const noexcept {
+    return budget_;
+}
+
+CellExtraStoreImpl::CellExtraStoreImpl(VtCellExtras& extras, ObjPool& pool, size_t cellCount)
     : extras_(extras)
-    , owner_(owner)
-    , pool_(pool)
+    , buffers_(pool)
+    , text_(buffers_)
+    , links_(buffers_)
+    , images_(buffers_)
 {
     slots_.pushBack(nullptr);
     rehashHyperlinks(16);
     setCellCount(cellCount);
-}
-
-CellExtraStoreImpl* CellExtraStoreImpl::create(VtCellExtras& extras, size_t cellCount, CellExtraStoreOwner& owner) {
-    ObjPool* pool = ObjPool::fromMemoryRaw();
-    try {
-        auto* result = pool->make<CellExtraStoreImpl>(extras, cellCount, owner, pool);
-        if (owner.pool == nullptr) {
-            owner.pool = pool;
-        }
-        return result;
-    } catch (...) {
-        delete pool;
-        throw;
-    }
 }
 
 size_t CellExtraStoreImpl::hyperlinkCount() const noexcept {
@@ -176,12 +377,32 @@ HyperlinkHandle* CellExtraStoreImpl::hyperlinkOf(CellExtra& extra) noexcept {
     return static_cast<HyperlinkHandle*>(extra.hyperlinks->mutFront());
 }
 
-StringView CellExtraStoreImpl::copyBytes(StringView value) {
+StringView CellExtraStoreImpl::copyBytes(ExtraSpace& space, StringView value) {
     if (value.empty()) {
         return {};
     }
-    allocatedExtraBytes_ += value.length() + 1;
-    return pool_->intern(value);
+    u8* const bytes = space.allocate(value.length());
+    memcpy(bytes, value.data(), value.length());
+    return StringView(bytes, value.length());
+}
+
+StringView CellExtraStoreImpl::copyBytesNext(ExtraSpace& space, StringView value) {
+    if (value.empty()) {
+        return {};
+    }
+    u8* const bytes = space.allocateNext(value.length());
+    memcpy(bytes, value.data(), value.length());
+    return StringView(bytes, value.length());
+}
+
+IntrusiveList* CellExtraStoreImpl::makeHyperlinkList(ExtraSpace& space, bool next) {
+    u8* const bytes = next ? space.allocateNext(sizeof(IntrusiveList)) : space.allocate(sizeof(IntrusiveList));
+    return new (bytes) IntrusiveList;
+}
+
+HyperlinkHandle* CellExtraStoreImpl::makeHyperlinkHandle(ExtraSpace& space, bool next, StringView identity, StringView payload, u32 displayId) {
+    u8* const bytes = next ? space.allocateNext(sizeof(HyperlinkHandle)) : space.allocate(sizeof(HyperlinkHandle));
+    return new (bytes) HyperlinkHandle(identity, payload, displayId);
 }
 
 void CellExtraStoreImpl::rehashHyperlinks(size_t capacity) {
@@ -201,81 +422,30 @@ void CellExtraStoreImpl::rehashHyperlinks(size_t capacity) {
     hyperlinkBuckets_.xchg(replacement);
 }
 
-u32 CellExtraStoreImpl::append(const CellExtra& value) {
-    STD_ASSERT(!value.graphemeBytes.empty() || hyperlinkOf(value) != nullptr || value.sixelPixels != nullptr);
+void CellExtraStoreImpl::indexHyperlink(u32 ref) {
+    if ((hyperlinkCount_ + 1) * 10 >= hyperlinkBuckets_.length() * 7) {
+        rehashHyperlinks(hyperlinkBuckets_.length() * 2);
+    }
+    ++hyperlinkCount_;
+    HyperlinkHandle* hyperlink = hyperlinkOf(*slots_[ref]);
+    const size_t bucket = hyperlink->identity.hash64() % hyperlinkBuckets_.length();
+    hyperlink->identityNext = hyperlinkBuckets_[bucket];
+    hyperlinkBuckets_.mut(bucket) = ref;
+}
+
+u32 CellExtraStoreImpl::appendRecord(CellExtra* extra) {
     if (slots_.length() > TerminalCell::maxExtraRef) {
         raiseError(StringView(u8"cell extra store slot budget exhausted"));
     }
-
-    auto* extra = pool_->make<CellExtra>(value);
-    allocatedExtraBytes_ += sizeof(CellExtra);
-
     const u32 ref = static_cast<u32>(slots_.length());
     slots_.pushBack(extra);
-    ++allocationsSinceGc_;
     return ref;
 }
 
-u32 CellExtraStoreImpl::migrate(const CellExtraStoreImpl& source, u32 sourceRef, IntMap<const u8*>& palettes) {
-    const CellExtra& sourceExtra = *source.get(sourceRef);
-
-    CellExtra copy = sourceExtra;
-    if (!sourceExtra.graphemeBytes.empty()) {
-        copy.graphemeBytes = copyBytes(sourceExtra.graphemeBytes);
-    }
-
-    if (sourceExtra.sixelPixels != nullptr) {
-        copy.sixelPixels = copyBytes(StringView(sourceExtra.sixelPixels, SixelPatch::pixelCount)).data();
-        // Every cell of one image shares one palette block; relocate
-        // each source block once or collection would clone it per cell.
-        const u64 key = (u64)(uintptr_t)(sourceExtra.sixelPalette);
-        if (const u8** relocated = palettes.find(key); relocated != nullptr) {
-            copy.sixelPalette = *relocated;
-        } else {
-            copy.sixelPalette = copyBytes(StringView(sourceExtra.sixelPalette, SixelPatch::paletteBytes)).data();
-            palettes.insert(key, copy.sixelPalette);
-        }
-    }
-
-    bool indexHyperlink = false;
-    if (const HyperlinkHandle* sourceHyperlink = hyperlinkOf(sourceExtra); sourceHyperlink != nullptr) {
-        if (const u32 known = findHyperlink(sourceHyperlink->identity); known != 0) {
-            const HyperlinkHandle& canonical = *hyperlinkOf(*slots_[known]);
-            STD_ASSERT(equalBytes(canonical.payload, sourceHyperlink->payload));
-            STD_ASSERT(canonical.displayId == sourceHyperlink->displayId);
-            copy.hyperlinks = slots_[known]->hyperlinks;
-        } else {
-            if ((hyperlinkCount_ + 1) * 10 >= hyperlinkBuckets_.length() * 7) {
-                rehashHyperlinks(hyperlinkBuckets_.length() * 2);
-            }
-
-            copy.hyperlinks = pool_->make<IntrusiveList>();
-            allocatedExtraBytes_ += sizeof(IntrusiveList);
-            for (const IntrusiveNode* node = sourceExtra.hyperlinks->front(); node != sourceExtra.hyperlinks->end(); node = node->next) {
-                const auto* sourceHandle = static_cast<const HyperlinkHandle*>(node);
-                const StringView identity = copyBytes(sourceHandle->identity);
-                const StringView payload = copyBytes(sourceHandle->payload);
-                auto* handle = pool_->make<HyperlinkHandle>(identity, payload, sourceHandle->displayId);
-                allocatedExtraBytes_ += sizeof(HyperlinkHandle);
-                copy.hyperlinks->pushBack(handle);
-            }
-            indexHyperlink = true;
-        }
-    } else {
-        copy.hyperlinks = nullptr;
-    }
-
-    // Copying GC preserves ref identity: one destination slot per distinct
-    // live source ref, irrespective of equal payloads in other source slots.
-    const u32 ref = append(copy);
-    if (indexHyperlink) {
-        ++hyperlinkCount_;
-        HyperlinkHandle* hyperlink = hyperlinkOf(*slots_[ref]);
-        const size_t bucket = hyperlink->identity.hash64() % hyperlinkBuckets_.length();
-        hyperlink->identityNext = hyperlinkBuckets_[bucket];
-        hyperlinkBuckets_.mut(bucket) = ref;
-    }
-    return ref;
+u32 CellExtraStoreImpl::append(const CellExtra& value) {
+    STD_ASSERT(!value.graphemeBytes.empty() || hyperlinkOf(value) != nullptr || value.sixelPixels != nullptr);
+    auto* extra = new (text_.allocate(sizeof(CellExtra))) CellExtra(value);
+    return appendRecord(extra);
 }
 
 CellColor CellExtraStoreImpl::underlineColor(const TerminalCell& cell) const noexcept {
@@ -346,24 +516,15 @@ u32 CellExtraStoreImpl::getOrCreateHyperlink(StringView identity, StringView pay
     if (const u32 existing = findHyperlink(identity); existing != 0) {
         return existing;
     }
-    if ((hyperlinkCount_ + 1) * 10 >= hyperlinkBuckets_.length() * 7) {
-        rehashHyperlinks(hyperlinkBuckets_.length() * 2);
-    }
 
     CellExtra extra;
-    extra.hyperlinks = pool_->make<IntrusiveList>();
-    allocatedExtraBytes_ += sizeof(IntrusiveList);
-    const StringView storedIdentity = copyBytes(identity);
-    const StringView storedPayload = copyBytes(payload);
-    auto* hyperlink = pool_->make<HyperlinkHandle>(storedIdentity, storedPayload, displayId);
-    allocatedExtraBytes_ += sizeof(HyperlinkHandle);
-    extra.hyperlinks->pushBack(hyperlink);
+    extra.hyperlinks = makeHyperlinkList(links_, false);
+    const StringView storedIdentity = copyBytes(links_, identity);
+    const StringView storedPayload = copyBytes(links_, payload);
+    extra.hyperlinks->pushBack(makeHyperlinkHandle(links_, false, storedIdentity, storedPayload, displayId));
 
     const u32 ref = append(extra);
-    ++hyperlinkCount_;
-    const size_t bucket = storedIdentity.hash64() % hyperlinkBuckets_.length();
-    hyperlink->identityNext = hyperlinkBuckets_[bucket];
-    hyperlinkBuckets_.mut(bucket) = ref;
+    indexHyperlink(ref);
     return ref;
 }
 
@@ -390,7 +551,7 @@ void CellExtraStoreImpl::setGrapheme(TerminalCell& cell, const u32* codepoints, 
     } else {
         copy.underlineColor = cell.inlineUnderlineColor();
     }
-    copy.graphemeBytes = copyBytes(StringView(reinterpret_cast<const u8*>(codepoints), count * sizeof(u32)));
+    copy.graphemeBytes = copyBytes(text_, StringView(reinterpret_cast<const u8*>(codepoints), count * sizeof(u32)));
     copy.sixelPixels = nullptr;
     copy.sixelPalette = nullptr;
     cell.setExtraRef(append(copy));
@@ -416,7 +577,7 @@ void CellExtraStoreImpl::clearGrapheme(TerminalCell& cell) {
 }
 
 const u8* CellExtraStoreImpl::internSixelPalette(const u8* palette) {
-    return copyBytes(StringView(palette, SixelPatch::paletteBytes)).data();
+    return copyBytes(images_, StringView(palette, SixelPatch::paletteBytes)).data();
 }
 
 void CellExtraStoreImpl::setSixel(TerminalCell& cell, const u8* pixels, const u8* palette) {
@@ -429,7 +590,7 @@ void CellExtraStoreImpl::setSixel(TerminalCell& cell, const u8* pixels, const u8
         copy.underlineColor = cell.inlineUnderlineColor();
     }
     copy.graphemeBytes = {};
-    copy.sixelPixels = copyBytes(StringView(pixels, SixelPatch::pixelCount)).data();
+    copy.sixelPixels = copyBytes(images_, StringView(pixels, SixelPatch::pixelCount)).data();
     copy.sixelPalette = palette;
     cell.setExtraRef(append(copy));
 }
@@ -486,85 +647,165 @@ void CellExtraStoreImpl::clearExtra(TerminalCell& cell, CellColor underlineColor
     cell.setInlineUnderlineColor(underlineColor_);
 }
 
-namespace {
-    // The 24-bit extraRef space caps the slot table: collection has to fire
-    // long before append() runs out of refs, and hardLimitExceeded() doubles
-    // the budget, so keep the doubled value inside the ref space.
-    static constexpr size_t slotBudgetCeiling = (TerminalCell::maxExtraRef + 1) / 2;
-}
-
 void CellExtraStoreImpl::setCellCount(size_t cellCount) noexcept {
     cellCount_ = max<size_t>(cellCount, 1);
-    slotBudget_ = min(max<size_t>(16, cellCount_ * 10), slotBudgetCeiling);
-    allocationBudget_ = max<size_t>(16, cellCount_ * 2);
-    // Sized for the sixel worst case: every cell holding a patch costs
-    // pixelCount bytes plus its CellExtra, so 64 bytes per cell would
-    // make one full-screen image trigger collection back to back.
-    byteBudget_ = max<size_t>(4096, cellCount_ * 256);
+    // Text: a record and a few codepoints per clustered cell; the margin
+    // lets a flood run a while between collections. Links: a page of
+    // them is a few handles and their URLs. Images: a full screen of
+    // sixel patches plus palettes, so one image never collects back to
+    // back with itself.
+    text_.configure(max<size_t>(4096, cellCount_ * 256), max<size_t>(1024 * 1024, cellCount_ * 64), textBudgetCap);
+    links_.configure(max<size_t>(4096, cellCount_ * 32), max<size_t>(256 * 1024, cellCount_ * 16), ~(size_t)(0));
+    images_.configure(max<size_t>(64 * 1024, cellCount_ * SixelPatch::pixelCount), max<size_t>(256 * 1024, cellCount_ * SixelPatch::pixelCount / 4), ~(size_t)(0));
 }
 
 size_t CellExtraStoreImpl::slotBudget() const noexcept {
-    return slotBudget_;
-}
-
-void CellExtraStoreImpl::finishCollection() noexcept {
-    allocationsSinceGc_ = 0;
-    slotBudget_ = min(max(slotBudget_, slots_.length() + cellCount_ * 2), slotBudgetCeiling);
-    // Guarantee progress even when live extras crowd the ceiling.
-    slotBudget_ = max(slotBudget_, slots_.length() + 1024);
-    byteBudget_ = max(byteBudget_, allocatedExtraBytes_ + max<size_t>(1024 * 1024, cellCount_ * 64));
+    return min(text_.budget() / sizeof(CellExtra), slotBudgetCeiling);
 }
 
 bool CellExtraStoreImpl::shouldCollect() const noexcept {
-    return allocatedExtraBytes_ > byteBudget_ || slots_.length() > slotBudget_ || allocationsSinceGc_ > allocationBudget_;
+    return text_.overBudget() || links_.overBudget() || images_.overBudget();
 }
 
 bool CellExtraStoreImpl::hardLimitExceeded() const noexcept {
-    return allocatedExtraBytes_ > byteBudget_ * 2 || slots_.length() > slotBudget_ * 2;
+    return text_.overHardLimit() || links_.overHardLimit() || images_.overHardLimit();
 }
 
 void CellExtraStoreImpl::collect(Vector<TerminalCell*>& cells, u32* const* roots, size_t rootCount) {
     STD_ASSERT(extras_.store == this);
 
-    auto* next = CellExtraStoreImpl::create(extras_, cellCount_, owner_);
-    try {
-        Vector<u32> relocation;
-        relocation.zero(slots_.length());
-        IntMap<const u8*> palettes(next->pool_);
+    // A collection a budget asked for touches the spaces over budget; one
+    // nobody asked for - a forced or explicit one - turns all three.
+    const bool asked = shouldCollect();
+    const bool text = !asked || text_.overBudget();
+    const bool links = !asked || links_.overBudget();
+    const bool images = !asked || images_.overBudget();
 
-        const auto migrateRef = [&](u32 oldRef) {
-            STD_ASSERT(oldRef != 0 && oldRef < slots_.length());
-            if (relocation[oldRef] == 0) {
-                // migrate() always appends. Equal but distinct old refs must
-                // not collapse into one ref in the new store.
-                relocation.mut(oldRef) = next->migrate(*this, oldRef, palettes);
+    // The dedup maps of this pass: one new list per shared hyperlink
+    // list, one new block per shared palette. They die with the pass.
+    ObjPool::Ref scratch = ObjPool::fromMemory();
+    IntMap<IntrusiveList*> lists(scratch.mutPtr());
+    IntMap<const u8*> palettes(scratch.mutPtr());
+
+    // Turning the text space renumbers the refs: the old slot table is
+    // read, a fresh one is built, and relocation maps old to new. The
+    // other spaces patch records in place, and relocation then only
+    // marks a record as done - two cells sharing a ref must not copy its
+    // payload twice.
+    Vector<CellExtra*> oldSlots;
+    Vector<u32> relocation;
+    if (text) {
+        oldSlots.xchg(slots_);
+        slots_.pushBack(nullptr);
+        relocation.zero(oldSlots.length());
+        text_.begin();
+    } else {
+        relocation.zero(slots_.length());
+    }
+    if (links) {
+        links_.begin();
+    }
+    if (text || links) {
+        // The identity index is rebuilt from the live set: the refs or the
+        // handles move, and the dead ones must not be found again.
+        hyperlinkBuckets_.clear();
+        rehashHyperlinks(16);
+        hyperlinkCount_ = 0;
+    }
+    if (images) {
+        images_.begin();
+    }
+
+    const auto relocateList = [&](IntrusiveList* source) -> IntrusiveList* {
+        const u64 key = (u64)(uintptr_t)(source);
+        if (IntrusiveList** known = lists.find(key); known != nullptr) {
+            return *known;
+        }
+        IntrusiveList* const fresh = makeHyperlinkList(links_, true);
+        for (const IntrusiveNode* node = source->front(); node != source->end(); node = node->next) {
+            const auto* handle = static_cast<const HyperlinkHandle*>(node);
+            const StringView identity = copyBytesNext(links_, handle->identity);
+            const StringView payload = copyBytesNext(links_, handle->payload);
+            fresh->pushBack(makeHyperlinkHandle(links_, true, identity, payload, handle->displayId));
+        }
+        lists.insert(key, fresh);
+        return fresh;
+    };
+
+    const auto migrate = [&](u32 oldRef) -> u32 {
+        STD_ASSERT(oldRef != 0 && oldRef < relocation.length());
+        if (relocation[oldRef] != 0) {
+            return relocation[oldRef];
+        }
+        CellExtra* const record = text ? oldSlots[oldRef] : slots_[oldRef];
+        CellExtra copy = *record;
+        if (links && copy.hyperlinks != nullptr) {
+            copy.hyperlinks = relocateList(copy.hyperlinks);
+        }
+        if (images && copy.sixelPixels != nullptr) {
+            copy.sixelPixels = copyBytesNext(images_, StringView(copy.sixelPixels, SixelPatch::pixelCount)).data();
+            const u64 key = (u64)(uintptr_t)(copy.sixelPalette);
+            if (const u8** relocated = palettes.find(key); relocated != nullptr) {
+                copy.sixelPalette = *relocated;
+            } else {
+                copy.sixelPalette = copyBytesNext(images_, StringView(copy.sixelPalette, SixelPatch::paletteBytes)).data();
+                palettes.insert(key, copy.sixelPalette);
             }
-        };
-        for (TerminalCell* cell : cells) {
-            STD_ASSERT(cell->hasExtra());
-            migrateRef(cell->extraRef());
         }
-        for (size_t index = 0; index < rootCount; ++index) {
-            STD_ASSERT(roots[index] != nullptr);
-            migrateRef(*roots[index]);
+        u32 ref = oldRef;
+        if (text) {
+            copy.graphemeBytes = copyBytesNext(text_, copy.graphemeBytes);
+            // Copying preserves ref identity: one destination slot per
+            // distinct live source ref, irrespective of equal payloads
+            // in other source slots.
+            auto* const fresh = new (text_.allocateNext(sizeof(CellExtra))) CellExtra(copy);
+            ref = appendRecord(fresh);
+        } else {
+            *record = copy;
         }
+        if ((text || links) && copy.hyperlinks != nullptr) {
+            const HyperlinkHandle& handle = *hyperlinkOf(copy);
+            if (const u32 known = findHyperlink(handle.identity); known != 0) {
+                STD_ASSERT(equalBytes(hyperlinkOf(*slots_[known])->payload, handle.payload));
+                slots_[ref]->hyperlinks = slots_[known]->hyperlinks;
+            } else {
+                indexHyperlink(ref);
+            }
+        }
+        relocation.mut(oldRef) = ref;
+        return ref;
+    };
+
+    for (TerminalCell* cell : cells) {
+        STD_ASSERT(cell->hasExtra());
+        migrate(cell->extraRef());
+    }
+    for (size_t index = 0; index < rootCount; ++index) {
+        STD_ASSERT(roots[index] != nullptr);
+        migrate(*roots[index]);
+    }
+    if (text) {
         for (TerminalCell* cell : cells) {
             cell->setExtraRef(relocation[cell->extraRef()]);
         }
         for (size_t index = 0; index < rootCount; ++index) {
             *roots[index] = relocation[*roots[index]];
         }
-        next->finishCollection();
-    } catch (...) {
-        delete next->pool_;
-        throw;
+        text_.turn();
     }
+    if (links) {
+        links_.turn();
+    }
+    if (images) {
+        images_.turn();
+    }
+    finishCollection();
+}
 
-    ObjPool* oldPool = owner_.pool;
-    STD_ASSERT(oldPool == pool_);
-    extras_.replace(next);
-    owner_.pool = next->pool_;
-    delete oldPool;
+void CellExtraStoreImpl::finishCollection() noexcept {
+    // The refs and every pointer handed out are void: the caches keyed
+    // on them must hear it even though the store object itself stays.
+    extras_.notifyChanged();
 }
 
 void VtCellExtras::replace(CellExtraStore* next) {
@@ -572,6 +813,10 @@ void VtCellExtras::replace(CellExtraStore* next) {
         return;
     }
     store = next;
+    notifyChanged();
+}
+
+void VtCellExtras::notifyChanged() {
     for (IntrusiveNode* node = changedListeners.mutFront(); node != changedListeners.mutEnd();) {
         Listener* const listener = static_cast<Listener*>(node);
         node = node->next;
@@ -580,6 +825,5 @@ void VtCellExtras::replace(CellExtraStore* next) {
 }
 
 CellExtraStore* CellExtraStore::create(VtCellExtras& extras, ObjPool& pool, size_t cellCount) {
-    auto* owner = pool.make<CellExtraStoreOwner>();
-    return CellExtraStoreImpl::create(extras, cellCount, *owner);
+    return pool.make<CellExtraStoreImpl>(extras, pool, cellCount);
 }

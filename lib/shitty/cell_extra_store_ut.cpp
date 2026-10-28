@@ -136,13 +136,11 @@ STD_TEST_SUITE(CellExtraStore) {
         store->setHyperlink(cell, hyperlink);
         Vector<TerminalCell*> cells;
         cells.pushBack(&cell);
-        CellExtraStore* const previous = store;
         const size_t notificationsBefore = listener.calls;
 
         store->collect(cells, nullptr, 0);
         store = composer.extras.store;
 
-        STD_INSIST(store != previous);
         STD_INSIST(listener.calls == notificationsBefore + 1);
         STD_INSIST(listener.observed == store);
         STD_INSIST(cell.hasExtra());
@@ -328,17 +326,67 @@ STD_TEST_SUITE(CellExtraStore) {
         CellExtraStore& store = *createStore(composer, 1);
         TerminalCell cell{};
 
-        for (u32 codepoint = 1; codepoint <= 17; ++codepoint) {
+        // Rewriting one cell leaves a trail of dead records: the byte
+        // budget asks for a collection first, and only well past it the
+        // hard limit; a collection of the one live cell clears both.
+        u32 codepoint = 1;
+        size_t writes = 0;
+        while (!store.shouldCollect() && writes < 1'000'000) {
             store.setGrapheme(cell, &codepoint, 1);
+            ++codepoint;
+            ++writes;
         }
-
         STD_INSIST(store.shouldCollect());
         STD_INSIST(!store.hardLimitExceeded());
+        const size_t writesToBudget = writes;
 
-        for (u32 codepoint = 18; codepoint <= 33; ++codepoint) {
+        while (!store.hardLimitExceeded() && writes < 1'000'000) {
             store.setGrapheme(cell, &codepoint, 1);
+            ++codepoint;
+            ++writes;
         }
-
         STD_INSIST(store.hardLimitExceeded());
+        STD_INSIST(writes >= writesToBudget * 2 - 1);
+
+        Vector<TerminalCell*> cells;
+        cells.pushBack(&cell);
+        store.collect(cells, nullptr, 0);
+
+        STD_INSIST(!store.shouldCollect());
+        STD_INSIST(!store.hardLimitExceeded());
+        STD_INSIST(store.grapheme(cell).size() == 1);
+        STD_INSIST(store.grapheme(cell)[0] == codepoint - 1);
+    }
+
+    STD_TEST(TextCollectionLeavesImagesInPlace) {
+        auto pool = ObjPool::fromMemory();
+        Composer& composer = *pool->make<Composer>(pool.mutPtr());
+        CellExtraStore& store = *createStore(composer, 1);
+        u8 pixels[SixelPatch::pixelCount] = {9};
+        u8 palette[SixelPatch::paletteBytes] = {8};
+        const u8* interned = store.internSixelPalette(palette);
+        TerminalCell image{};
+        store.setSixel(image, pixels, interned);
+        const u8* const pixelsBefore = store.view(image).sixelPixels;
+        TerminalCell text{};
+        u32 codepoint = 1;
+        while (!store.shouldCollect()) {
+            store.setGrapheme(text, &codepoint, 1);
+            ++codepoint;
+        }
+        Vector<TerminalCell*> cells;
+        cells.pushBack(&image);
+        cells.pushBack(&text);
+
+        // The text space asked for this collection; the image space did
+        // not, so the patch and its palette stay where they are while
+        // the records move.
+        store.collect(cells, nullptr, 0);
+
+        STD_INSIST(!store.shouldCollect());
+        STD_INSIST(store.view(image).sixelPixels == pixelsBefore);
+        STD_INSIST(store.view(image).sixelPalette == interned);
+        STD_INSIST(memcmp(store.view(image).sixelPixels, pixels, sizeof(pixels)) == 0);
+        STD_INSIST(store.grapheme(text).size() == 1);
     }
 }

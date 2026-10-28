@@ -28,10 +28,12 @@ struct CellExtraView {
 struct CellExtraStore;
 
 // The slot a window's shared extras store lives in: the model reads the
-// current store through it, and a collection replaces the store and
-// walks the listeners - the caches keyed on extra refs are void.
+// current store through it. A collection renumbers the refs and moves
+// the content, so it walks the listeners - the caches keyed on extra
+// refs or pointers are void - even though the store object stays.
 struct VtCellExtras {
     void replace(CellExtraStore* next);
+    void notifyChanged();
 
     CellExtraStore* store = nullptr;
     stl::IntrusiveList changedListeners;
