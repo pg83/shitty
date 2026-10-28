@@ -9,7 +9,7 @@
 #include "unicode.h"
 
 namespace {
-    static bool graphemeBreakSimple(GraphemeClass left, GraphemeClass right) {
+    static constexpr bool graphemeBreakSimple(GraphemeClass left, GraphemeClass right) {
         if (left == GraphemeClass::Cr && right == GraphemeClass::Lf) {
             return false;
         }
@@ -39,6 +39,28 @@ namespace {
         }
         return true;
     }
+
+    // The rules above, evaluated once per class pair at compile time:
+    // the hot path answers a boundary with one load instead of walking
+    // the chain of comparisons for every codepoint that is not simple.
+    constexpr size_t graphemeClassCount = 16;
+
+    struct GraphemeBreakTable {
+        bool boundary[graphemeClassCount][graphemeClassCount] = {};
+    };
+
+    static constexpr GraphemeBreakTable buildGraphemeBreakTable() {
+        GraphemeBreakTable table;
+        for (size_t left = 0; left < graphemeClassCount; ++left) {
+            for (size_t right = 0; right < graphemeClassCount; ++right) {
+                table.boundary[left][right] = graphemeBreakSimple((GraphemeClass)(left), (GraphemeClass)(right));
+            }
+        }
+        return table;
+    }
+
+    constexpr GraphemeBreakTable graphemeBreakTable = buildGraphemeBreakTable();
+    static_assert((size_t)(GraphemeClass::EmojiZwj) < graphemeClassCount, "the break table must cover every grapheme class");
 }
 
 bool emojiPresentation(u32 codepoint) {
@@ -68,7 +90,7 @@ bool GraphemeBreaker::breakBeforeSlow(u32 codepoint, bool simple, GraphemeClass 
         stateIndic = (IndicConjunctClass)(state_ >> 8);
     }
 
-    const bool boundary = graphemeBreakSimple(stateClass, rightClass) && !(stateIndic == IndicConjunctClass::Linker && rightIndic == IndicConjunctClass::Consonant);
+    const bool boundary = graphemeBreakTable.boundary[(size_t)(stateClass)][(size_t)(rightClass)] && !(stateIndic == IndicConjunctClass::Linker && rightIndic == IndicConjunctClass::Consonant);
     if (rightIndic == IndicConjunctClass::Consonant || stateIndic == IndicConjunctClass::Consonant || stateIndic == IndicConjunctClass::Extend) {
         stateIndic = rightIndic;
     } else if (stateIndic == IndicConjunctClass::Linker) {
