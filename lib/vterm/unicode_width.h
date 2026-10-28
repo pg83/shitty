@@ -49,6 +49,10 @@ public:
     CodepointProperties codepointProperties(u32 codepoint) const;
     int codepointWidth(u32 codepoint) const;
     GraphemeWidthEffect graphemeWidthEffect(u32 previous, u32 codepoint) const;
+    // As above for a caller that already holds codepointProperties(
+    // codepoint).width from its own cache: skips the width derivation,
+    // the expensive half of the answer, on every combining codepoint.
+    GraphemeWidthEffect graphemeWidthEffect(u32 previous, u32 codepoint, u8 width) const;
     // Iterates the grapheme clusters of a span string with their grid
     // widths, by the same width rules the terminal used to place the
     // cells. position advances past the cluster; returns false at the

@@ -2720,7 +2720,7 @@ void VtermImpl::preedit(StringView text, i32 cursorBegin, i32 cursorEnd) {
         const bool boundary = breaker.breakBefore(codepoint, (data & 0x04) != 0);
         if (!boundary && leadCell >= 0) {
             const u32 previous = cluster.data()[cluster.size() - 1];
-            const GraphemeWidthEffect widthEffect = graphemeClusterMode ? config().widths.graphemeWidthEffect(previous, codepoint) : GraphemeWidthEffect::Unchanged;
+            const GraphemeWidthEffect widthEffect = graphemeClusterMode ? config().widths.graphemeWidthEffect(previous, codepoint, width) : GraphemeWidthEffect::Unchanged;
             // Past the cluster limit the preview keeps what it has, as
             // the grid does.
             if (cluster.pushBack(codepoint)) {
@@ -4107,7 +4107,7 @@ void VtermImpl::placeGraphicChar(bool graphemeBoundary, u8 width) {
 
     if (inputGraphemeScreen == cf && !graphemeBoundary) {
         const u32 previous = inputGrapheme.empty() ? inputGraphemeBase : inputGrapheme.data()[inputGrapheme.size() - 1];
-        const GraphemeWidthEffect widthEffect = graphemeClusterMode ? config().widths.graphemeWidthEffect(previous, pt) : GraphemeWidthEffect::Unchanged;
+        const GraphemeWidthEffect widthEffect = graphemeClusterMode ? config().widths.graphemeWidthEffect(previous, pt, width) : GraphemeWidthEffect::Unchanged;
         if (widthEffect == GraphemeWidthEffect::Wide && !inputGraphemeWide && inputGraphemeX == lineCols - 1 && !autoWrapMode) {
             // A cluster cannot grow into half of a wide cell.  Keep the
             // already displayed narrow cluster and discard this width
@@ -4502,7 +4502,7 @@ void VtermImpl::placeRepeatedCodepoint(u32 codepoint, u32 count) {
                 return 0;
             }
             ScreenGrapheme& grapheme = graphemes[glyphCount - 1];
-            const GraphemeWidthEffect effect = graphemeClusterMode ? config().widths.graphemeWidthEffect(codepoints[consumed - 1], codepoint) : GraphemeWidthEffect::Unchanged;
+            const GraphemeWidthEffect effect = graphemeClusterMode ? config().widths.graphemeWidthEffect(codepoints[consumed - 1], codepoint, data & 0x03) : GraphemeWidthEffect::Unchanged;
             const bool grows = effect == GraphemeWidthEffect::Wide && grapheme.width == 1;
             if (grapheme.count == GraphemeBuffer::capacity || (effect == GraphemeWidthEffect::Narrow && grapheme.width == 2) || (grows && cellCount == available)) {
                 consumed -= grapheme.count;

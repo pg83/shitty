@@ -98,6 +98,10 @@ int UnicodeWidths::codepointWidth(u32 codepoint) const {
 }
 
 GraphemeWidthEffect UnicodeWidths::graphemeWidthEffect(u32 previous, u32 codepoint) const {
+    return graphemeWidthEffect(previous, codepoint, (u8)(codepointProperties(codepoint).width));
+}
+
+GraphemeWidthEffect UnicodeWidths::graphemeWidthEffect(u32 previous, u32 codepoint, u8 width) const {
     if (codepoint == 0xfe0f || codepoint == 0xfe0e) {
         const UnicodeCodepointProperties previousProperties = unicodeCodepointProperties(previous);
         if (codepoint == 0xfe0f && previousProperties.widensWithVs16) {
@@ -113,7 +117,7 @@ GraphemeWidthEffect UnicodeWidths::graphemeWidthEffect(u32 previous, u32 codepoi
     // stackers are the exception: they request conjunct formation and the
     // following consonant is what widens the cluster.
     const UnicodeCodepointProperties properties = unicodeCodepointProperties(codepoint);
-    if (!properties.virama && (codepointProperties(codepoint, properties).width > 0 || properties.category == GeneralCategory::SpacingMark)) {
+    if (!properties.virama && (width > 0 || properties.category == GeneralCategory::SpacingMark)) {
         return GraphemeWidthEffect::Wide;
     }
     return GraphemeWidthEffect::Unchanged;
