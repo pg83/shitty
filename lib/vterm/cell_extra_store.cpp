@@ -62,9 +62,21 @@ namespace {
 
         Buffer* take();
         void give(Buffer* buffer);
+        // Once per collection: hands half of the buffers that stayed free
+        // through the whole cycle since the previous call back to the
+        // system. The working set never shows up there - a flood takes
+        // every buffer it returned before the next collection - so a
+        // steady state frees nothing, and a store shrinking after one
+        // sheds its surplus geometrically.
+        void trim();
 
         ObjPool& pool_;
         Vector<Buffer*> free_;
+        // Emptied Buffer objects awaiting a refill: the objects live in
+        // the pool, so they are reused rather than remade.
+        Vector<Buffer*> spare_;
+        // The fewest buffers the free list held since the last trim.
+        size_t idleLow_ = 0;
     };
 
     // One generation of one space: a bump allocator over buffers taken
@@ -223,15 +235,35 @@ Buffer* BufferList::take() {
     if (free_.length() != 0) {
         Buffer* const buffer = free_[free_.length() - 1];
         free_.popBack();
+        idleLow_ = min(idleLow_, free_.length());
         return buffer;
     }
-    Buffer* const buffer = pool_.make<Buffer>();
+    idleLow_ = 0;
+    Buffer* buffer;
+    if (spare_.length() != 0) {
+        buffer = spare_[spare_.length() - 1];
+        spare_.popBack();
+    } else {
+        buffer = pool_.make<Buffer>();
+    }
     buffer->grow(bufferBytes);
     return buffer;
 }
 
 void BufferList::give(Buffer* buffer) {
     free_.pushBack(buffer);
+}
+
+void BufferList::trim() {
+    for (size_t surplus = idleLow_ / 2; surplus != 0; --surplus) {
+        Buffer* const buffer = free_[free_.length() - 1];
+        free_.popBack();
+        // Nothing was ever appended, so this shrinks to an empty buffer
+        // and frees the storage.
+        buffer->shrinkToFit();
+        spare_.pushBack(buffer);
+    }
+    idleLow_ = free_.length();
 }
 
 Arena::Arena(BufferList& buffers)
@@ -805,6 +837,7 @@ void CellExtraStoreImpl::collect(Vector<TerminalCell*>& cells, u32* const* roots
 }
 
 void CellExtraStoreImpl::finishCollection() noexcept {
+    buffers_.trim();
     // The refs and every pointer handed out are void: the caches keyed
     // on them must hear it even though the store object itself stays.
     extras_.notifyChanged();
