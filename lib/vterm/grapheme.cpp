@@ -84,11 +84,16 @@ bool GraphemeBreaker::breakBeforeSlow(u32 codepoint, bool simple) {
     } else {
         stateClass = right.graphemeClass;
     }
+    if (boundary) {
+        // The new cluster is this codepoint alone: seed the state exactly
+        // as the state_ == 0 branch above would derive it from previous_
+        // on the next call, so a run of independent clusters - CJK text -
+        // pays one property lookup per codepoint, not two.
+        stateClass = right.graphemeClass;
+        stateIndic = right.indicConjunctClass == IndicConjunctClass::Consonant ? IndicConjunctClass::Consonant : IndicConjunctClass::None;
+    }
     state_ = ((i32)(stateClass) + 1) | ((i32)(stateIndic) << 8);
     previous_ = (i32)(codepoint);
     previousSimple_ = simple;
-    if (boundary) {
-        state_ = 0;
-    }
     return boundary;
 }
