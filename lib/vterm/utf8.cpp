@@ -66,6 +66,54 @@ size_t Utf8Decoder::decodeOne(const u8* input, size_t length, u32& codepoint) {
 size_t Utf8Decoder::decodeRun(const u8* input, size_t length, u32* codepoints, size_t capacity, size_t& consumed) {
     consumed = 0;
     size_t count = 0;
+    // While four bytes remain every sequence length can be read without a
+    // bounds check, so each length gets its own straight-line path with
+    // the well-formedness constraints folded into the second byte's range
+    // (overlongs, surrogates, the 0x10ffff ceiling) the way the Unicode
+    // table of well-formed byte sequences states them. The tail falls
+    // back to the general decoder.
+    while (count < capacity && length - consumed >= 4) {
+        const u8* const at = input + consumed;
+        const u8 lead = at[0];
+        if (lead < 0x80) {
+            if (lead < 0x20 || lead == 0x7f) {
+                return count;
+            }
+            codepoints[count++] = lead;
+            consumed += 1;
+            continue;
+        }
+        const u8 second = at[1];
+        if ((second & 0xc0) != 0x80) {
+            return count;
+        }
+        if (lead < 0xe0) {
+            if (lead < 0xc2) {
+                return count;
+            }
+            codepoints[count++] = ((u32)(lead & 0x1f) << 6) | (second & 0x3f);
+            consumed += 2;
+            continue;
+        }
+        const u8 third = at[2];
+        if ((third & 0xc0) != 0x80) {
+            return count;
+        }
+        if (lead < 0xf0) {
+            if ((lead == 0xe0 && second < 0xa0) || (lead == 0xed && second >= 0xa0)) {
+                return count;
+            }
+            codepoints[count++] = ((u32)(lead & 0x0f) << 12) | ((u32)(second & 0x3f) << 6) | (third & 0x3f);
+            consumed += 3;
+            continue;
+        }
+        const u8 fourth = at[3];
+        if ((fourth & 0xc0) != 0x80 || lead > 0xf4 || (lead == 0xf0 && second < 0x90) || (lead == 0xf4 && second >= 0x90)) {
+            return count;
+        }
+        codepoints[count++] = ((u32)(lead & 0x07) << 18) | ((u32)(second & 0x3f) << 12) | ((u32)(third & 0x3f) << 6) | (fourth & 0x3f);
+        consumed += 4;
+    }
     while (count < capacity && consumed < length) {
         if (input[consumed] < 0x20 || input[consumed] == 0x7f) {
             break;
