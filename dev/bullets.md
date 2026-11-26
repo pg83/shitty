@@ -1,6 +1,6 @@
 # shitty — шпаргалка докладчика
 
-[Презентация](https://view.homelab.cam/view/aa9ea73b060bdeec7aef0e9e9deb46fafbee2626d42ceed7196ffa9536ed61d7/) · [Полный рассказ](https://view.homelab.cam/view/8f4552e390c80668ff1851a48e3ee8529a8e326bc2149439fd597c658b08c876/)
+[Презентация](https://view.homelab.cam/view/469abe5039a8b368907e0e6c0a1fd23991005e4db6969923e36b0d291c2242d8/) · [Полный рассказ](https://view.homelab.cam/view/8f4552e390c80668ff1851a48e3ee8529a8e326bc2149439fd597c658b08c876/)
 
 Таймкоды от начала выступления, ориентир — 48 минут.
 
